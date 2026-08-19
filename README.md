@@ -423,6 +423,8 @@ agentopsy --project my-project --since 7d --summary
   reports what policy would recommend and never controls a provider session.
 - control modes default to observe; compact/full require every exact-mapping
   and safe-boundary precondition before an adapter can be considered.
+- provider adapters are capability-gated; unverified native actions remain
+  unavailable and Agentopsy never types blindly into a terminal.
 
 ## Claude Code
 

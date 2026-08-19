@@ -287,6 +287,14 @@ class ControlModeTests(unittest.TestCase):
         self.assertEqual(permitted.action, "compact")
 
 
+class ControlAdapterTests(unittest.TestCase):
+    def test_unestablished_adapters_are_explicitly_unavailable(self):
+        adapters = {adapter.provider: adapter for adapter in asa.control_adapters()}
+        self.assertEqual(adapters["codex"].capability("compact"), asa.ProviderCapability.UNAVAILABLE)
+        self.assertEqual(adapters["claude"].capability("safe_idle"), asa.ProviderCapability.UNAVAILABLE)
+        self.assertEqual(adapters["herdr"].harness, "integration")
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
