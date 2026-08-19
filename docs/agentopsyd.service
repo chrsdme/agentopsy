@@ -1,0 +1,11 @@
+[Unit]
+Description=Agentopsy passive session health service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agentopsyd run --foreground --interval 20
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -2,6 +2,21 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.3.0] - Unreleased
+
+### Added
+
+- Provider adapters for the incremental collector while preserving forensic parsers.
+- Versioned local SQLite state with file identity, offsets, partial-line recovery, sessions, health events and bounded occurrence counters.
+- `agentopsyd` / `agentopsy service` passive incremental service commands.
+- `agentopsy health`, `service-status`, `trends`, and handoff validation commands.
+- Deterministic health bands, hysteresis, cooldown-aware notifications, optional desktop notification, and passive Herdr adapter foundation.
+- User-level systemd service example.
+
+### Safety
+
+- No provider transcript writes, network upload, AI calls, telemetry, or automatic session rotation.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
