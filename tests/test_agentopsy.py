@@ -165,6 +165,11 @@ class SeverityPolicyTests(unittest.TestCase):
         self.assertEqual(severities["compound_context_pressure"], asa.Severity.EMERGENCY)
         self.assertEqual(asa.behavioural_severity({})["command_repetition"], asa.Severity.SAFE)
 
+    def test_live_health_does_not_claim_unmeasured_compound_context_pressure(self):
+        row = {"provider": "codex", "peak_context_pct": .7, "peak_context_tokens": 0, "health_state": "HEALTHY", "max_tool_result_chars": 0, "repeated_reads": 0, "repeated_commands": 0, "compactions": 0}
+        _state, events = asa.evaluate_live_health(row, asa.HealthPolicy())
+        self.assertNotIn("COMPOUND_CONTEXT_PRESSURE", [code for _severity, code, _message, _evidence in events])
+
     def test_colour_modes_and_no_color(self):
         class Tty:
             def isatty(self): return True

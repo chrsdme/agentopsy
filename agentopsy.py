@@ -2768,18 +2768,9 @@ def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, l
     if int(row["repeated_reads"] or 0) >= 4: events.append(("medium", "REPEATED_READ", "A read target has repeated.", {"repeats": row["repeated_reads"]}))
     if int(row["repeated_commands"] or 0) >= 5: events.append(("medium", "COMMAND_REPETITION", "A command has repeated.", {"repeats": row["repeated_commands"]}))
     if int(row["compactions"] or 0) >= 3: events.append(("medium", "COMPACTION_THRASH", "Repeated compactions were observed.", {"compactions": row["compactions"]}))
-    behavioural = behavioural_severity({
-        "individual_tool_output": int(row["max_tool_result_chars"] or 0) / 4,
-        "rolling_tool_output": int(row["tool_result_chars"] or 0) / 4,
-        "repeated_reads": int(row["repeated_reads"] or 0),
-        "repeated_path_range_reads": int(row["repeated_reads"] or 0),
-        "command_repetition": int(row["repeated_commands"] or 0),
-        "instruction_overhead": 0, "advisor_subagent_amplification": 0,
-        "stale_resume": 0, "compaction_health": int(row["compactions"] or 0),
-    })
-    compound = behavioural["compound_context_pressure"]
-    if compound == Severity.EMERGENCY:
-        events.append(("critical", "COMPOUND_CONTEXT_PRESSURE", "Multiple context-pressure signals compound into an emergency risk.", {"policy_version": BEHAVIORAL_SEVERITY_POLICY_VERSION}))
+    # The live collector has no truthful context-velocity or dwell samples yet.
+    # Do not emit a compound emergency from fabricated zero-valued lanes; this
+    # rule remains available for callers that actually supply independent facts.
     return state, events
 
 
