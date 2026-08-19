@@ -2067,7 +2067,9 @@ class StateStore:
         ts = str(data.get("timestamp") or "")
         row = self.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, provider)).fetchone()
         if row is None:
-            self.db.execute("INSERT INTO sessions(session_id,provider,project,path,started_at,last_activity_at,health_since) VALUES(?,?,?,?,?,?,?)", (sid, provider, str(data.get("project") or ""), str(path), ts, ts, dt.datetime.now(dt.timezone.utc).isoformat()))
+            # INSERT OR IGNORE: a concurrent scan (daemon + CLI) may race to create
+            # the same session row; the later writer's UPDATE below still applies.
+            self.db.execute("INSERT OR IGNORE INTO sessions(session_id,provider,project,path,started_at,last_activity_at,health_since) VALUES(?,?,?,?,?,?,?)", (sid, provider, str(data.get("project") or ""), str(path), ts, ts, dt.datetime.now(dt.timezone.utc).isoformat()))
         # Codex token snapshots are cumulative; append-only Claude values are additive.
         cumulative = provider == "codex" and data.get("input_tokens") is not None
         set_parts, args = [], []
@@ -2368,8 +2370,13 @@ def service_main(argv: Optional[list[str]] = None) -> int:
     try:
         os.write(fd, str(os.getpid()).encode())
         while running:
-            m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
-            print(f"sessions scan: advanced={m.files_advanced} unchanged={m.files_unchanged} parsed={human_bytes(m.bytes_newly_parsed)}", flush=True)
+            try:
+                m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
+                print(f"sessions scan: advanced={m.files_advanced} unchanged={m.files_unchanged} parsed={human_bytes(m.bytes_newly_parsed)}", flush=True)
+            except Exception as e:
+                # A transient failure (e.g. a concurrent CLI scan racing on the
+                # same state DB) must not take the whole service down.
+                print(f"sessions scan failed: {e}", file=sys.stderr, flush=True)
             for _ in range(args.interval * 10):
                 if not running: break
                 time.sleep(.1)
