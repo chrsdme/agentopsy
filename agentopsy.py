@@ -130,6 +130,13 @@ def classify_compaction(before_context: int, after_context: int, refill_context:
     return {"outcome": outcome, "context_before": before_context, "context_after": after_context, "reduction": reduction, "reduction_pct": ratio, "repeated_after": repeated_after, "compaction_frequency": compaction_count}
 
 
+def rotation_plan(project: str, *, safe_to_act: bool, adapter_capability: ProviderCapability) -> dict[str, Any]:
+    handoff = validate_handoff(project)
+    if not handoff.get("valid") or not safe_to_act or adapter_capability == ProviderCapability.UNAVAILABLE:
+        return {"action_safety": ActionSafety.ACTION_BLOCKED.value, "reason": "Durable valid handoff, safe boundary, and verified native new-session capability are required.", "handoff": handoff, "action": None}
+    return {"action_safety": ActionSafety.SAFE_TO_ACT.value, "reason": "Preconditions passed; preserve handoff until native session identity transition is verified.", "handoff": handoff, "action": "native_new_session"}
+
+
 def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_session: bool, exact_harness: bool, capability: ProviderCapability, safe_idle_boundary: bool, active_critical_operation: bool, integrity_ok: bool) -> ControlDecision:
     """Control is opt-in and capability gated; this function never performs it."""
     if mode == AutoActMode.OBSERVE: return ControlDecision(mode, False, "Observe mode only advises; it never alters a provider session.")

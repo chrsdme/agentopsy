@@ -226,6 +226,12 @@ Observed or provider-verified compactions are classified from pre/post context,
 reduction, subsequent refill, repeated work, and frequency. Automatic compact
 actions remain unavailable until a safe adapter capability is established.
 
+## v0.4 full rotation
+
+Full rotation requires a validated durable handoff, safe boundary, and verified
+native new-session capability. Uncertainty produces `ACTION_BLOCKED`; the
+handoff is preserved until a verifiable session transition succeeds.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

@@ -304,6 +304,14 @@ class CompactionTests(unittest.TestCase):
         self.assertEqual(asa.classify_compaction(100, 70, None, 3, 5)["outcome"], "THRASH")
 
 
+class RotationTests(unittest.TestCase):
+    def test_rotation_blocks_without_verified_handoff_or_adapter(self):
+        with tempfile.TemporaryDirectory() as td:
+            plan = asa.rotation_plan(td, safe_to_act=True, adapter_capability=asa.ProviderCapability.UNAVAILABLE)
+            self.assertEqual(plan["action_safety"], asa.ActionSafety.ACTION_BLOCKED.value)
+            self.assertIsNone(plan["action"])
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
