@@ -1,0 +1,45 @@
+name: Bug report
+description: Report incorrect parsing, crashes, or misleading analysis.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not attach an unreviewed real Claude/Codex transcript.** Session logs can contain source code, prompts, commands, local paths, and secrets. Prefer a minimized synthetic fixture.
+  - type: input
+    id: version
+    attributes:
+      label: Agentopsy version
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - Claude Code
+        - Codex CLI
+        - Both
+        - Other / unknown
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the command used and the unexpected result.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Minimal synthetic reproduction
+      description: Redact/minimize any real transcript material before posting.
