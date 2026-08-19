@@ -114,6 +114,7 @@ compactions
 subagents/delegations
 defects
 score/grade
+versioned marker scorecard
 ```
 
 Provider-specific fields are retained where pretending equivalence would be misleading.
@@ -145,6 +146,22 @@ recommendation
 Rules should be explainable. The report must say **why** a session was flagged.
 
 The score is useful for ranking investigation priority, not for declaring an agent "good" or "bad".
+
+## v0.4 marker scoring
+
+Marker scoring is provisional and versioned (`MARKER_SCORING_VERSION = 1`).
+Each provider-applicable marker receives 5/5 (100%), 4/5 (80%), 3/5 (60%),
+2/5 (40%), or 1/5 (20%) from the existing explainable defect thresholds. A
+provider-unavailable marker is shown as N/A and is excluded from both lane and
+overall denominators. Overall efficiency is the mean marker score expressed as
+`X/100`.
+
+The scorecard also carries an effective severity independent of that average.
+In particular, a critical context-pressure condition has an `EMERGENCY` floor,
+so strong results elsewhere cannot conceal it. Completed transcript summaries
+are snapshots; their trend is deliberately `UNKNOWN` until rolling telemetry
+can establish a direction. Reports include per-marker and lane scores, worst
+indicators, and deduplicated corrective opportunities.
 
 ## Future live architecture
 

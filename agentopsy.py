@@ -138,6 +138,8 @@ class SignalDefinition:
 
 
 SIGNAL_REGISTRY_VERSION = 1
+MARKER_SCORING_VERSION = 1
+MARKER_SCORING_STATUS = "provisional"
 
 
 def _signal(code: str, title: str, lanes: tuple[ImpactLane, ...], measurement: str, claude: ProviderCapability, codex: ProviderCapability, *, impact: str = "Use the measured trend to prioritise a bounded corrective step.", corrective: str = "Reduce the contributing work and re-measure before escalating.", alternative: str = "Record the observation and continue with a smaller, focused next step.", extension: Optional[ExtensionLoadMode] = None) -> SignalDefinition:
@@ -349,6 +351,64 @@ class Defect:
         return dataclasses.asdict(self)
 
 
+class MarkerTrend(str, enum.Enum):
+    """Direction is unknown for a single completed-session snapshot."""
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclasses.dataclass(frozen=True)
+class MarkerDefinition:
+    code: str
+    title: str
+    lane: ImpactLane
+    providers: tuple[str, ...]
+    defect_codes: tuple[str, ...]
+
+
+@dataclasses.dataclass
+class MarkerScore:
+    code: str
+    title: str
+    lane: ImpactLane
+    score: Optional[int]
+    percent: Optional[int]
+    severity: Severity
+    trend: MarkerTrend = MarkerTrend.UNKNOWN
+    corrective_opportunity: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        data = dataclasses.asdict(self)
+        data["lane"] = self.lane.value
+        data["severity"] = self.severity.value
+        data["trend"] = self.trend.value
+        return data
+
+
+# These markers intentionally aggregate only explainable existing defect rules.
+# Their 5..1 thresholds are the corresponding configured rule thresholds above;
+# versioning makes future recalibration explicit rather than changing history.
+MARKER_DEFINITIONS: tuple[MarkerDefinition, ...] = (
+    MarkerDefinition("CONTEXT_PRESSURE", "Context pressure", ImpactLane.CONTEXT_PRESSURE, ("claude", "codex"),
+                     ("CLAUDE_EXTREME_CONTEXT", "CLAUDE_VERY_HIGH_CONTEXT", "CLAUDE_COSTLY_CONTEXT", "CLAUDE_HIGH_CONTEXT_DWELL", "CODEX_CONTEXT_CRITICAL", "CODEX_CONTEXT_HIGH", "CODEX_CONTEXT_PRESSURE", "CODEX_HIGH_CONTEXT_DWELL")),
+    MarkerDefinition("TOOL_OUTPUT", "Tool output discipline", ImpactLane.TOOL_OUTPUT, ("claude", "codex"),
+                     ("GIANT_TOOL_RESULT", "LARGE_TOOL_RESULT", "TOOL_OUTPUT_FLOOD", "HIGH_TOOL_OUTPUT_VOLUME", "UNSCOPED_LARGE_READS", "UNSCOPED_LARGE_READ")),
+    MarkerDefinition("REPETITION", "Repeated work", ImpactLane.REPETITION, ("claude", "codex"),
+                     ("COMMAND_REPETITION", "REPEATED_READ")),
+    MarkerDefinition("SESSION_LIFECYCLE", "Session lifecycle", ImpactLane.SESSION_LIFECYCLE, ("claude", "codex"),
+                     ("LONG_GAP_REUSE", "STALE_SESSION_REUSE", "VERY_LONG_ACTIVE_BURST", "LONG_ACTIVE_BURST")),
+    MarkerDefinition("TOKEN_AMPLIFICATION", "Token amplification", ImpactLane.TOKEN_AMPLIFICATION, ("claude", "codex"),
+                     ("EXCESSIVE_MODEL_TURNS", "MANY_MODEL_TURNS", "ADVISOR_CONTEXT_MULTIPLIER")),
+    MarkerDefinition("INTEGRITY", "Telemetry integrity", ImpactLane.INTEGRITY, ("claude", "codex"),
+                     ("UNREADABLE_SESSION", "MALFORMED_LOG_LINES", "DUPLICATE_TOKEN_EVENTS")),
+    MarkerDefinition("COMPACTION_HEALTH", "Compaction health", ImpactLane.COMPACTION_HEALTH, ("codex",),
+                     ("COMPACTION_THRASH", "POST_COMPACT_REFETCH")),
+    MarkerDefinition("INSTRUCTION_OVERHEAD", "Instruction overhead", ImpactLane.INSTRUCTION_OVERHEAD, ("codex",),
+                     ("HEAVY_STARTUP_INSTRUCTIONS", "LARGE_STARTUP_INSTRUCTIONS")),
+    MarkerDefinition("DELEGATION_ADVISOR", "Delegation/advisor use", ImpactLane.DELEGATION_ADVISOR, ("claude",),
+                     ("ADVISOR_CONTEXT_MULTIPLIER",)),
+)
+
+
 @dataclasses.dataclass
 class Burst:
     start: str
@@ -448,6 +508,13 @@ class SessionSummary:
     defects: list[Defect] = dataclasses.field(default_factory=list)
     score: int = 0
     grade: str = "A"
+    marker_scores: list[MarkerScore] = dataclasses.field(default_factory=list)
+    lane_scores: dict[str, Optional[int]] = dataclasses.field(default_factory=dict)
+    overall_efficiency_score: Optional[int] = None
+    effective_severity: Severity = Severity.SAFE
+    trend: MarkerTrend = MarkerTrend.UNKNOWN
+    worst_indicators: list[str] = dataclasses.field(default_factory=list)
+    corrective_opportunities: list[str] = dataclasses.field(default_factory=list)
     notes: list[str] = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -455,6 +522,9 @@ class SessionSummary:
         d["tool_stats"] = {k: v.to_dict() if isinstance(v, ToolStat) else v for k, v in self.tool_stats.items()}
         d["bursts"] = [b.to_dict() if isinstance(b, Burst) else b for b in self.bursts]
         d["defects"] = [x.to_dict() if isinstance(x, Defect) else x for x in self.defects]
+        d["marker_scores"] = [x.to_dict() if isinstance(x, MarkerScore) else x for x in self.marker_scores]
+        d["effective_severity"] = self.effective_severity.value
+        d["trend"] = self.trend.value
         return d
 
 
@@ -804,6 +874,70 @@ def finalise_grade(summary: SessionSummary) -> None:
         summary.grade = "B"
     else:
         summary.grade = "A"
+    finalise_marker_scorecard(summary)
+
+
+_MARKER_SCORE_BY_DEFECT_SEVERITY = {"low": 4, "medium": 3, "high": 2, "critical": 1}
+_MARKER_SEVERITY_BY_SCORE = {
+    5: Severity.SAFE,
+    4: Severity.LIGHT,
+    3: Severity.HIGH,
+    2: Severity.CRITICAL,
+    1: Severity.SUPER_CRITICAL,
+}
+_SEVERITY_RANK = {severity: index for index, severity in enumerate(Severity)}
+
+
+def finalise_marker_scorecard(summary: SessionSummary) -> None:
+    """Build a provider-aware 5-point scorecard without diluting serious flags.
+
+    A completed transcript is a point-in-time observation, so trend stays
+    explicitly UNKNOWN until rolling observations can establish a direction.
+    """
+    scores: list[MarkerScore] = []
+    for definition in MARKER_DEFINITIONS:
+        if summary.provider not in definition.providers:
+            scores.append(MarkerScore(
+                definition.code, definition.title, definition.lane, None, None,
+                Severity.SAFE,
+            ))
+            continue
+        matching = [d for d in summary.defects if d.code in definition.defect_codes]
+        point_score = min((_MARKER_SCORE_BY_DEFECT_SEVERITY.get(d.severity, 5) for d in matching), default=5)
+        severity = _MARKER_SEVERITY_BY_SCORE[point_score]
+        # Context at the legacy critical threshold is an explicit hard floor:
+        # excellent scores elsewhere cannot reduce this to an average warning.
+        if definition.code == "CONTEXT_PRESSURE" and any(d.severity == "critical" for d in matching):
+            severity = Severity.EMERGENCY
+        recommendation = next((d.recommendation for d in matching if d.recommendation), "")
+        scores.append(MarkerScore(
+            definition.code, definition.title, definition.lane, point_score,
+            point_score * 20, severity, corrective_opportunity=recommendation,
+        ))
+
+    applicable = [marker for marker in scores if marker.score is not None]
+    summary.marker_scores = scores
+    summary.overall_efficiency_score = (
+        round(100 * sum(marker.score or 0 for marker in applicable) / (5 * len(applicable)))
+        if applicable else None
+    )
+    summary.lane_scores = {
+        lane.value: round(100 * sum(marker.score or 0 for marker in lane_markers) / (5 * len(lane_markers)))
+        if lane_markers else None
+        for lane in ImpactLane
+        for lane_markers in [[marker for marker in applicable if marker.lane == lane]]
+    }
+    summary.effective_severity = max(
+        (marker.severity for marker in applicable), key=lambda severity: _SEVERITY_RANK[severity], default=Severity.SAFE,
+    )
+    worst = sorted(
+        (marker for marker in applicable if marker.score is not None and marker.score < 5),
+        key=lambda marker: (marker.score or 0, marker.code),
+    )
+    summary.worst_indicators = [marker.code for marker in worst[:3]]
+    summary.corrective_opportunities = list(dict.fromkeys(
+        marker.corrective_opportunity for marker in worst if marker.corrective_opportunity
+    ))[:3]
 
 
 def extract_plain_user_text(content: Any) -> str:
@@ -1745,6 +1879,18 @@ def render_terminal(sessions: list[SessionSummary], roots: list[tuple[Path, str]
     return "\n".join(lines)
 
 
+def marker_score_text(marker: MarkerScore, include_percent: bool = False) -> str:
+    if marker.score is None:
+        return "N/A"
+    if include_percent:
+        return f"{marker.score}/5 ({marker.percent}%)"
+    return f"{marker.score}/5"
+
+
+def lane_score_text(score: Optional[int]) -> str:
+    return "N/A" if score is None else f"{score}/100"
+
+
 def render_terminal_detail(s: SessionSummary, colour: bool) -> list[str]:
     lines: list[str] = []
     title = s.title or s.session_id
@@ -1772,6 +1918,17 @@ def render_terminal_detail(s: SessionSummary, colour: bool) -> list[str]:
     lines.append(
         f"  tools={s.tool_calls} calls / {s.tool_results} results, tool-output≈{human_int(s.tool_result_tokens_proxy)} tokens/proxy, max≈{human_int(s.max_tool_result_tokens_proxy)}"
     )
+    marker_text = ", ".join(f"{marker.code}={marker_score_text(marker)}" for marker in s.marker_scores)
+    lines.append(
+        f"  scorecard=v{MARKER_SCORING_VERSION} {MARKER_SCORING_STATUS}; efficiency="
+        f"{s.overall_efficiency_score if s.overall_efficiency_score is not None else 'N/A'}/100; "
+        f"effective-severity={s.effective_severity.value}; trend={s.trend.value}"
+    )
+    lines.append(f"  markers: {marker_text}")
+    if s.worst_indicators:
+        lines.append(f"  worst indicators: {', '.join(s.worst_indicators)}")
+    for opportunity in s.corrective_opportunities:
+        lines.append(f"  corrective opportunity: {opportunity}")
     if s.repeated_reads:
         lines.append(f"  top repeated read: {truncate(s.repeated_reads[0][0], 100)} ×{s.repeated_reads[0][1]}")
     if s.repeated_commands:
@@ -1918,6 +2075,19 @@ def render_markdown_detail(s: SessionSummary) -> list[str]:
         lines.append(f"- Top repeated command: `{md_escape(truncate(s.repeated_commands[0][0], 160))}` ×{s.repeated_commands[0][1]}")
     if s.persisted_output_files:
         lines.append(f"- Persisted raw-output sidecars: {s.persisted_output_files} files, {human_bytes(s.persisted_output_bytes)}")
+    lines += [
+        f"- Marker scorecard: provisional v{MARKER_SCORING_VERSION}; overall efficiency **{s.overall_efficiency_score if s.overall_efficiency_score is not None else 'N/A'}/100**; effective severity **{s.effective_severity.value}**; trend `{s.trend.value}`.",
+        "- Marker scores: " + "; ".join(
+            f"`{marker.code}` {marker_score_text(marker, include_percent=True)}" for marker in s.marker_scores
+        ),
+        "- Lane scores: " + "; ".join(
+            f"`{lane}` {lane_score_text(score)}" for lane, score in s.lane_scores.items()
+        ),
+    ]
+    if s.worst_indicators:
+        lines.append("- Worst indicators: " + ", ".join(f"`{code}`" for code in s.worst_indicators))
+    if s.corrective_opportunities:
+        lines.append("- Corrective opportunities: " + " ".join(s.corrective_opportunities))
     lines += ["", "**Flags**", ""]
     if not s.defects:
         lines.append("- None triggered by the current rules.")
