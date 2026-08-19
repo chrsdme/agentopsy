@@ -2791,8 +2791,8 @@ class IngestionMetrics:
 
 
 class IncrementalIngestor:
-    def __init__(self, store: StateStore, roots: Optional[list[tuple[Path, str]]] = None, provider: str = "all"):
-        self.store, self.roots, self.provider = store, roots or discover_live_roots(), provider
+    def __init__(self, store: StateStore, roots: Optional[list[tuple[Path, str]]] = None, provider: str = "all", event_cooldown: int = 900):
+        self.store, self.roots, self.provider, self.event_cooldown = store, roots or discover_live_roots(), provider, event_cooldown
 
     def scan(self) -> IngestionMetrics:
         metrics = IngestionMetrics()
@@ -2858,7 +2858,7 @@ class IncrementalIngestor:
             if row:
                 state, events = evaluate_live_health(row, HealthPolicy.from_environment())
                 self.store.db.execute("UPDATE sessions SET health_state=? WHERE session_id=? AND provider=?", (state, sid, candidate.provider))
-                for severity, code, message, evidence in events: self.store.event(candidate.provider, sid, severity, code, message, evidence)
+                for severity, code, message, evidence in events: self.store.event(candidate.provider, sid, severity, code, message, evidence, cooldown=self.event_cooldown)
 
 
 def run_watch(args: argparse.Namespace) -> int:
@@ -3012,7 +3012,8 @@ def policy_show(store: StateStore) -> dict[str, Any]:
     return json.loads(row[0]) if row else dict(DEFAULT_POLICY)
 def policy_import(store: StateStore, payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("notification"), dict): raise ValueError("Invalid policy schema/version")
-    if not isinstance(payload["notification"].get("enabled"), bool) or payload["notification"].get("minimum_severity") not in SEVERITY_ORDER: raise ValueError("Invalid notification policy")
+    notification = payload["notification"]
+    if not isinstance(notification.get("enabled"), bool) or notification.get("minimum_severity") not in SEVERITY_ORDER or not isinstance(notification.get("cooldown_seconds"), int) or notification["cooldown_seconds"] < 0: raise ValueError("Invalid notification policy")
     store.db.execute("BEGIN IMMEDIATE")
     try: store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('runtime_policy',?)", (json.dumps(payload, sort_keys=True),)); store.db.commit()
     except Exception: store.db.rollback(); raise
@@ -3035,8 +3036,9 @@ def guardian_replay(store: StateStore, provider: str = "all") -> list[dict[str, 
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True, auto_act: AutoActMode = AutoActMode.OBSERVE) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
-        metrics = IncrementalIngestor(store, roots, provider).scan()
-        notifier = Notifier(notify)
+        notification = policy_show(store)["notification"]
+        metrics = IncrementalIngestor(store, roots, provider, event_cooldown=notification["cooldown_seconds"]).scan()
+        notifier = Notifier(notify and notification["enabled"], notification["minimum_severity"])
         # Only notify for sessions touched this tick AND recently active.
         # Without the recency check, a cold start (or any scan that first
         # ingests months of history) would surface a desktop popup for every
