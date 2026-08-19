@@ -87,6 +87,21 @@ class ActionSafety(str, enum.Enum):
     ACTION_BLOCKED = "ACTION_BLOCKED"
 
 
+class ProviderCapability(str, enum.Enum):
+    EXACT = "EXACT"
+    OBSERVED = "OBSERVED"
+    PROXY = "PROXY"
+    PARTIAL = "PARTIAL"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class ExtensionLoadMode(str, enum.Enum):
+    ALWAYS_LOADED = "ALWAYS_LOADED"
+    LAZY_LOADED = "LAZY_LOADED"
+    EVENT_LOADED = "EVENT_LOADED"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclasses.dataclass(frozen=True)
 class GuardianEvent:
     """A compact, transcript-free event spanning one or more impact lanes."""
@@ -105,6 +120,98 @@ class GuardianEvent:
             raise ValueError("Guardian event impact lanes must be unique")
         if any(not isinstance(value, (int, float, bool, type(None))) for value in self.evidence.values()):
             raise ValueError("Guardian evidence must contain only compact numeric or boolean facts")
+
+
+@dataclasses.dataclass(frozen=True)
+class SignalDefinition:
+    code: str
+    title: str
+    lanes: tuple[ImpactLane, ...]
+    measurement: str
+    why_it_matters: str
+    expected_impact: str
+    corrective_action: str
+    alternative_action: str
+    claude: ProviderCapability
+    codex: ProviderCapability
+    extension_load_mode: Optional[ExtensionLoadMode] = None
+
+
+SIGNAL_REGISTRY_VERSION = 1
+
+
+def _signal(code: str, title: str, lanes: tuple[ImpactLane, ...], measurement: str, claude: ProviderCapability, codex: ProviderCapability, *, impact: str = "Use the measured trend to prioritise a bounded corrective step.", corrective: str = "Reduce the contributing work and re-measure before escalating.", alternative: str = "Record the observation and continue with a smaller, focused next step.", extension: Optional[ExtensionLoadMode] = None) -> SignalDefinition:
+    return SignalDefinition(code, title, lanes, measurement, f"{title} helps distinguish a measurable workflow condition from an assumption.", impact, corrective, alternative, claude, codex, extension)
+
+
+SIGNAL_REGISTRY: tuple[SignalDefinition, ...] = (
+    _signal("SESSION_CONTEXT_OCCUPANCY", "Session/context occupancy", (ImpactLane.CONTEXT_PRESSURE,), "Current context divided by a provider-reported window; Claude is a documented absolute-token proxy.", ProviderCapability.PROXY, ProviderCapability.EXACT),
+    _signal("CONTEXT_TOKENS_WINDOW", "Context tokens and window", (ImpactLane.CONTEXT_PRESSURE,), "Logged context tokens and, where exposed, the context-window denominator.", ProviderCapability.PARTIAL, ProviderCapability.EXACT),
+    _signal("MODEL_TURNS", "Model turns", (ImpactLane.TOKEN_AMPLIFICATION,), "Deduplicated assistant usage or token-snapshot iterations.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("WALL_CLOCK_DURATION", "Wall-clock duration", (ImpactLane.SESSION_LIFECYCLE,), "Elapsed time between first and last timestamp.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("ACTIVE_DURATION_BURSTS", "Active duration and bursts", (ImpactLane.SESSION_LIFECYCLE,), "Timestamp clusters separated by configured idle gaps.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("IDLE_GAPS_STALE_RESUME", "Idle gaps and stale resume", (ImpactLane.SESSION_LIFECYCLE,), "Observed timestamp gaps before later activity.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("INPUT_TOKENS", "Input tokens", (ImpactLane.TOKEN_AMPLIFICATION,), "Provider usage input-token counters, with Codex cumulative snapshots.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("OUTPUT_TOKENS", "Output tokens", (ImpactLane.TOKEN_AMPLIFICATION,), "Provider usage output-token counters.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("CACHE_READS", "Cached input/cache reads", (ImpactLane.CACHE_REUSE,), "Provider cache-read input telemetry.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("TOOL_CALLS_RESULTS", "Tool calls and results", (ImpactLane.TOOL_OUTPUT,), "Deduplicated tool calls and aggregate result character counts.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("TOOL_RESULT_SIZE", "Individual tool result size", (ImpactLane.TOOL_OUTPUT,), "Maximum observed result character count, labelled as a token proxy when needed.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("ROLLING_TOOL_OUTPUT", "Rolling tool output", (ImpactLane.TOOL_OUTPUT,), "Aggregate tool-result volume available to the incremental collector; rolling windows begin in Stage 3.", ProviderCapability.PARTIAL, ProviderCapability.PARTIAL),
+    _signal("REPEATED_READS", "Repeated reads", (ImpactLane.REPETITION,), "Hashed repeated read targets.", ProviderCapability.EXACT, ProviderCapability.PARTIAL),
+    _signal("REPEATED_PATH_RANGE_READS", "Repeated path and range reads", (ImpactLane.REPETITION,), "Read target plus range only when the provider record exposes both.", ProviderCapability.PARTIAL, ProviderCapability.PARTIAL),
+    _signal("REPEATED_COMMANDS", "Repeated commands", (ImpactLane.REPETITION,), "Normalised, hashed command repetitions.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("MALFORMED_PROVIDER_RECORDS", "Malformed/provider records", (ImpactLane.INTEGRITY,), "JSON parsing failures and unsupported provider record shapes.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("PARSER_DB_SERVICE_INTEGRITY", "Parser, database, and service integrity", (ImpactLane.INTEGRITY,), "Collector error counters and transactional database outcomes; no transcript content retained.", ProviderCapability.EXACT, ProviderCapability.EXACT),
+    _signal("CLAUDE_CACHE_CREATE", "Claude cache creation", (ImpactLane.CACHE_REUSE,), "Claude cache-creation input tokens.", ProviderCapability.EXACT, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_LOGGED_REQUEST_CONTEXT", "Claude logged request context", (ImpactLane.CONTEXT_PRESSURE,), "Claude input, cache-read, and cache-create tokens per logged request.", ProviderCapability.EXACT, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_HIGH_CONTEXT_DWELL", "Claude high-context dwell", (ImpactLane.CONTEXT_PRESSURE,), "Time above a documented Claude context proxy threshold; implementation begins in Stage 3.", ProviderCapability.PARTIAL, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_ADVISOR_CALLS", "Claude advisor calls", (ImpactLane.DELEGATION_ADVISOR,), "Advisor/tool calls only when an observable record identifies them.", ProviderCapability.OBSERVED, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_ADVISOR_AMPLIFICATION", "Claude advisor amplification", (ImpactLane.DELEGATION_ADVISOR, ImpactLane.TOKEN_AMPLIFICATION), "Advisor input/context contribution when identifiable in records.", ProviderCapability.PARTIAL, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_SUBAGENTS", "Claude subagents", (ImpactLane.DELEGATION_ADVISOR,), "Discovered Claude subagent transcripts and parent association where inferable.", ProviderCapability.OBSERVED, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_SUBAGENT_WORK_RETURN", "Claude subagent work and return size", (ImpactLane.DELEGATION_ADVISOR, ImpactLane.TOOL_OUTPUT), "Subagent work/return volume only when structured records expose it.", ProviderCapability.PARTIAL, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_UNSCOPED_LARGE_READS", "Claude unscoped large reads", (ImpactLane.TOOL_OUTPUT, ImpactLane.REPETITION), "Large Read tool results without an observable range.", ProviderCapability.PARTIAL, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_LIFECYCLE_EVENTS", "Claude lifecycle events", (ImpactLane.SESSION_LIFECYCLE,), "Observed clear/new/compact records where exposed by the installed Claude version.", ProviderCapability.OBSERVED, ProviderCapability.UNAVAILABLE),
+    _signal("CLAUDE_EXTENSION_MATERIAL", "Claude instruction, skill, and hook material", (ImpactLane.INSTRUCTION_OVERHEAD,), "Only observable extension/startup metadata; load classification is conservative.", ProviderCapability.OBSERVED, ProviderCapability.UNAVAILABLE, extension=ExtensionLoadMode.UNKNOWN),
+    _signal("CODEX_TOTAL_LAST_TOKEN_SNAPSHOTS", "Codex total and last token snapshots", (ImpactLane.CONTEXT_PRESSURE, ImpactLane.TOKEN_AMPLIFICATION), "Codex token_count total-session and last-turn usage snapshots.", ProviderCapability.UNAVAILABLE, ProviderCapability.EXACT),
+    _signal("CODEX_REASONING_TOKENS", "Codex reasoning tokens", (ImpactLane.TOKEN_AMPLIFICATION,), "Reasoning-output token counter where Codex emits it.", ProviderCapability.UNAVAILABLE, ProviderCapability.EXACT),
+    _signal("CODEX_COMPACTIONS", "Codex compactions", (ImpactLane.COMPACTION_HEALTH,), "Observed compacted lifecycle records.", ProviderCapability.UNAVAILABLE, ProviderCapability.EXACT),
+    _signal("CODEX_CONTEXT_COMPACTION_DELTA", "Codex context before and after compaction", (ImpactLane.COMPACTION_HEALTH,), "Adjacent context snapshots around observed compaction; implementation begins in Stage 3.", ProviderCapability.UNAVAILABLE, ProviderCapability.PARTIAL),
+    _signal("CODEX_POST_COMPACT_REFILL", "Codex post-compact refill", (ImpactLane.COMPACTION_HEALTH, ImpactLane.CONTEXT_VELOCITY), "Context growth after a known compaction; implementation begins in Stage 3.", ProviderCapability.UNAVAILABLE, ProviderCapability.PARTIAL),
+    _signal("CODEX_POST_COMPACT_REFETCH", "Codex post-compact refetch", (ImpactLane.COMPACTION_HEALTH, ImpactLane.REPETITION), "Repeated reads following known compaction when structured tool arguments expose them.", ProviderCapability.UNAVAILABLE, ProviderCapability.PARTIAL),
+    _signal("CODEX_STARTUP_INSTRUCTION_PAYLOAD", "Codex startup and instruction payload", (ImpactLane.INSTRUCTION_OVERHEAD,), "Observable startup/instruction metadata only; never invent unlogged payloads.", ProviderCapability.UNAVAILABLE, ProviderCapability.OBSERVED, extension=ExtensionLoadMode.UNKNOWN),
+    _signal("CODEX_EXTENSION_MATERIAL", "Codex skills, hooks, plugins, and MCP material", (ImpactLane.INSTRUCTION_OVERHEAD,), "Observable extension metadata only; classify load timing when records state it.", ProviderCapability.UNAVAILABLE, ProviderCapability.OBSERVED, extension=ExtensionLoadMode.UNKNOWN),
+    _signal("CODEX_RATE_LIMIT_TELEMETRY", "Codex rate-limit telemetry", (ImpactLane.INTEGRITY,), "Provider-emitted rate-limit values, retained only as informational data.", ProviderCapability.UNAVAILABLE, ProviderCapability.OBSERVED, impact="Informational only; it must not be scored as context health or action safety."),
+    _signal("CODEX_NATIVE_LIFECYCLE_EVENTS", "Codex native lifecycle events", (ImpactLane.SESSION_LIFECYCLE,), "Observed native lifecycle records.", ProviderCapability.UNAVAILABLE, ProviderCapability.OBSERVED),
+)
+SIGNALS_BY_CODE = {signal.code: signal for signal in SIGNAL_REGISTRY}
+
+
+def signal_capability(code: str, provider: str) -> ProviderCapability:
+    signal = SIGNALS_BY_CODE[code]
+    if provider not in {"claude", "codex"}:
+        raise ValueError("provider must be claude or codex")
+    return getattr(signal, provider)
+
+
+def signal_value_or_unavailable(code: str, provider: str, value: Any) -> Any:
+    """Never turn missing provider telemetry into a zero or a negative signal."""
+    return None if signal_capability(code, provider) is ProviderCapability.UNAVAILABLE else value
+
+
+def render_signals() -> str:
+    lines = [f"Agentopsy signal registry v{SIGNAL_REGISTRY_VERSION}", "code | Claude | Codex | lanes"]
+    lines.extend(f"{s.code} | {s.claude.value} | {s.codex.value} | {','.join(l.value for l in s.lanes)}" for s in SIGNAL_REGISTRY)
+    return "\n".join(lines)
+
+
+def explain_signal(code: str) -> str:
+    signal = SIGNALS_BY_CODE.get(code.upper())
+    if signal is None:
+        raise ValueError(f"Unknown signal code: {code}")
+    limits = "; ".join(f"{provider}: {getattr(signal, provider).value}" for provider in ("claude", "codex"))
+    if signal.extension_load_mode:
+        limits += f"; extension load evidence: {signal.extension_load_mode.value}"
+    return "\n".join((f"{signal.code} — {signal.title}", f"What it means: {signal.title}.", f"How it is measured: {signal.measurement}", f"Why it matters: {signal.why_it_matters}", f"Expected impact: {signal.expected_impact}", f"Corrective action: {signal.corrective_action}", f"Alternative action: {signal.alternative_action}", f"Provider limitations: {limits}. UNAVAILABLE means absent telemetry, never a zero or bad metric."))
 
 # Conservative defaults. They are intentionally configurable from the CLI.
 DEFAULT_GAP_MINUTES = 30.0
@@ -2489,7 +2596,17 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain"}: return None
+    if argv[0] == "signals":
+        if len(argv) != 1:
+            raise ValueError("agentopsy signals takes no arguments")
+        print(render_signals())
+        return 0
+    if argv[0] == "explain":
+        if len(argv) != 2:
+            raise ValueError("usage: agentopsy explain SIGNAL_CODE")
+        print(explain_signal(argv[1]))
+        return 0
     if argv[0] == "service": return service_main(argv[1:])
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
     parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
@@ -2575,7 +2692,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain"}:
         try:
             return live_cli(argv)
         except SystemExit:

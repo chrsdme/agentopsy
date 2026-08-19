@@ -6,6 +6,22 @@ Agentopsy is a local, read-only analyser for **Claude Code** and **OpenAI Codex 
 
 It is not another hosted dashboard and it does not need an API key. Agentopsy parses the session logs already on your machine, produces compact terminal/Markdown/JSON reports, and sends **nothing** to a model or external service.
 
+## Context Guardian signal registry
+
+v0.4 records provider capability explicitly: absent telemetry is never treated
+as zero or as a negative health signal. Inspect the versioned registry and any
+signal's measurement limits locally:
+
+```bash
+agentopsy signals
+agentopsy explain SESSION_CONTEXT_OCCUPANCY
+```
+
+Provider capabilities are `EXACT`, `OBSERVED`, `PROXY`, `PARTIAL`, or
+`UNAVAILABLE`. Extension/startup material is classified conservatively as
+`ALWAYS_LOADED`, `LAZY_LOADED`, `EVENT_LOADED`, or `UNKNOWN` only when evidence
+is actually observable.
+
 ```text
 Claude Code logs ─┐
                   ├──> Agentopsy ──> summaries / session health / defects

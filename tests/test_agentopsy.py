@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import sqlite3
+import contextlib
+import io
 import tempfile
 import unittest
 import sys
@@ -81,6 +83,31 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(event.action_safety, asa.ActionSafety.ADVISE_ONLY)
         with self.assertRaises(ValueError):
             asa.GuardianEvent("BAD", asa.Severity.HIGH, (asa.ImpactLane.INTEGRITY,), asa.ActionSafety.ACTION_BLOCKED, {"transcript": "secret body"})
+
+
+class SignalRegistryTests(unittest.TestCase):
+    def test_registry_is_versioned_and_covers_both_provider_specific_families(self):
+        self.assertEqual(asa.SIGNAL_REGISTRY_VERSION, 1)
+        self.assertEqual(len(asa.SIGNALS_BY_CODE), len(asa.SIGNAL_REGISTRY))
+        self.assertIn("CLAUDE_CACHE_CREATE", asa.SIGNALS_BY_CODE)
+        self.assertIn("CODEX_COMPACTIONS", asa.SIGNALS_BY_CODE)
+        self.assertEqual(asa.signal_capability("SESSION_CONTEXT_OCCUPANCY", "codex"), asa.ProviderCapability.EXACT)
+
+    def test_unavailable_signal_is_absent_not_zero_or_bad(self):
+        self.assertIsNone(asa.signal_value_or_unavailable("CLAUDE_CACHE_CREATE", "codex", 0))
+        self.assertEqual(asa.signal_value_or_unavailable("CLAUDE_CACHE_CREATE", "claude", 0), 0)
+
+    def test_signals_and_explain_cli_are_local_and_descriptive(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(asa.main(["signals"]), 0)
+        self.assertIn("SESSION_CONTEXT_OCCUPANCY | PROXY | EXACT", output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(asa.main(["explain", "SESSION_CONTEXT_OCCUPANCY"]), 0)
+        text = output.getvalue()
+        for heading in ("What it means:", "How it is measured:", "Why it matters:", "Expected impact:", "Corrective action:", "Alternative action:", "Provider limitations:"):
+            self.assertIn(heading, text)
 
 
 class AnalyzerTests(unittest.TestCase):
