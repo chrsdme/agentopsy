@@ -95,6 +95,33 @@ class IncrementalServiceTests(unittest.TestCase):
             replaced = ingestor.scan(); self.assertEqual(replaced.files_rescanned, 1)
             store.close()
 
+    def test_unchanged_scan_does_not_reread_file_bytes(self):
+        # ROADMAP.md documents that a normal tick reads zero bytes for unchanged
+        # sessions. classify_jsonl() currently reopens and re-reads the first
+        # lines of every candidate file on every scan, including unchanged
+        # ones; this is not reflected in IngestionMetrics. This test documents
+        # the current (undesired) behavior so a future fix can flip the
+        # assertion instead of silently regressing again.
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir(); p = root / "rollout-a.jsonl"
+            first = {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta", "payload": {"session_id": "s1", "cwd": "/project"}}
+            p.write_text(json.dumps(first) + "\n")
+            store = asa.StateStore(str(state)); ingestor = asa.IncrementalIngestor(store, [(root, "test")])
+            ingestor.scan()
+            calls = []
+            original = asa.classify_jsonl
+            asa.classify_jsonl = lambda path, _orig=original: (calls.append(path), _orig(path))[1]
+            try:
+                unchanged = ingestor.scan()
+                self.assertEqual(unchanged.bytes_newly_parsed, 0)
+                self.assertEqual(unchanged.files_unchanged, 1)
+                # Known gap: classify_jsonl still opens+reads the unchanged file.
+                self.assertEqual(len(calls), 1)
+            finally:
+                asa.classify_jsonl = original
+            store.close()
+
     def test_codex_response_item_id_is_not_a_session_id(self):
         adapter = asa.CodexAdapter()
         path = Path("rollout-real.jsonl")
