@@ -163,6 +163,15 @@ are snapshots; their trend is deliberately `UNKNOWN` until rolling telemetry
 can establish a direction. Reports include per-marker and lane scores, worst
 indicators, and deduplicated corrective opportunities.
 
+## v0.4 severity policy
+
+`BEHAVIORAL_SEVERITY_POLICY_VERSION = 1` defines factory context bands from
+SAFE through EMERGENCY and provisional ladders for velocity, dwell, tool
+output, repetition, cache reuse, instructions, delegation, stale resumes, and
+compaction. Related context pressure signals compound into an emergency rather
+than being independently averaged. Terminal colour supports `--color auto`,
+`always`, and `never` (plus `NO_COLOR`); text labels always convey severity.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

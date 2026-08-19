@@ -407,6 +407,8 @@ agentopsy --project my-project --since 7d --summary
 - a provisional, versioned 5-point marker scorecard with lane and overall
   efficiency scores; unavailable provider telemetry is N/A rather than a
   penalty, and severe context conditions retain an explicit severity floor.
+- accessible severity bands and compound behavioural-risk policy; use
+  `--color auto`, `--color always`, `--color never`, or `NO_COLOR`.
 
 ## Claude Code
 
