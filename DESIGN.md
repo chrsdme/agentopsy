@@ -149,3 +149,13 @@ The score is useful for ranking investigation priority, not for declaring an age
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.
+
+## v0.3 implementation plan
+
+The live layer keeps the retrospective parsers as the compatibility path. A
+small `ProviderAdapter` boundary normalises only append-safe record facts for
+the collector; it does not duplicate or replace the established report
+reducers. SQLite cursors own file identity, byte offset, and incomplete-line
+recovery. Health policy consumes compact derived counters and bounded evidence,
+never account-quota telemetry. The optional service, notifications, Herdr
+bridge, and handoff validator all operate from that local state.

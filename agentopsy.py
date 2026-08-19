@@ -32,6 +32,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import sqlite3
+import subprocess
 import statistics
 import sys
 import tempfile
@@ -41,7 +44,9 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.2.0"
+VERSION = "0.3.0-dev"
+PARSER_VERSION = 1
+SCHEMA_VERSION = 1
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 SEVERITY_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
@@ -299,6 +304,140 @@ class Candidate:
     source_label: str
     is_subagent: bool = False
     parent_session_id: str = ""
+
+
+class ProviderAdapter:
+    """Small provider boundary used by the incremental collector.
+
+    The mature full-file parsers below remain the source of truth for forensic
+    reports.  Adapters deliberately expose only compact, append-safe facts.
+    """
+    name = ""
+
+    def discover_sessions(self, roots: list[tuple[Path, str]]) -> list[Candidate]:
+        return [c for c in collect_candidates(roots, self.name)]
+
+    def identify_session(self, record: dict[str, Any], path: Path) -> str:
+        return path.stem
+
+    def extract_timestamp(self, record: dict[str, Any]) -> str:
+        return str(record.get("timestamp") or "")
+
+    def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
+        return {"session_id": self.identify_session(record, path), "timestamp": self.extract_timestamp(record)}
+
+
+class ClaudeAdapter(ProviderAdapter):
+    name = "claude"
+
+    def identify_session(self, record: dict[str, Any], path: Path) -> str:
+        return str(record.get("sessionId") or path.stem)
+
+    def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
+        msg = record.get("message") if isinstance(record.get("message"), dict) else {}
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        iterations = usage.get("iterations") if isinstance(usage.get("iterations"), list) else [usage]
+        values = {"input_tokens": 0, "cached_input_tokens": 0, "cache_creation_tokens": 0,
+                  "output_tokens": 0, "reasoning_tokens": 0, "model_turns": 0, "peak_context_tokens": 0}
+        if record.get("type") != "assistant":
+            return values
+        for item in iterations:
+            if not isinstance(item, dict):
+                continue
+            inp = safe_int(item.get("input_tokens")); cached = safe_int(item.get("cache_read_input_tokens"))
+            created = safe_int(item.get("cache_creation_input_tokens")); out = safe_int(item.get("output_tokens"))
+            values["input_tokens"] += inp; values["cached_input_tokens"] += cached
+            values["cache_creation_tokens"] += created; values["output_tokens"] += out
+            values["peak_context_tokens"] = max(values["peak_context_tokens"], inp + cached + created)
+            values["model_turns"] += 1
+        return values
+
+    def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
+        event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
+                 "compactions": 0, "read_key": "", "command_key": ""}
+        msg = record.get("message") if isinstance(record.get("message"), dict) else {}
+        content = msg.get("content")
+        if record.get("type") == "assistant" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    event["tool_calls"] += 1
+                    name, inp = str(block.get("name") or ""), block.get("input") or {}
+                    if name == "Read": event["read_key"] = str(inp.get("file_path") or inp.get("path") or "")
+                    if name == "Bash": event["command_key"] = normalise_command(str(inp.get("command") or ""))
+        if record.get("type") == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    chars = content_len(block.get("content")); event["tool_result_chars"] += chars
+                    event["max_tool_result_chars"] = max(event["max_tool_result_chars"], chars)
+        return event
+
+    def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
+        result = super().parse_record(record, path)
+        result.update(self.extract_usage(record)); result.update(self.extract_tool_event(record))
+        msg = record.get("message") if isinstance(record.get("message"), dict) else {}
+        result.update({"project": str(record.get("cwd") or ""), "model": str(msg.get("model") or ""),
+                       "effort": str(record.get("effort") or ""), "version": str(record.get("version") or "")})
+        return result
+
+
+class CodexAdapter(ProviderAdapter):
+    name = "codex"
+
+    def identify_session(self, record: dict[str, Any], path: Path) -> str:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        return str(payload.get("session_id") or payload.get("id") or path.stem)
+
+    def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
+        values = {"input_tokens": None, "cached_input_tokens": None, "output_tokens": None,
+                  "reasoning_tokens": None, "peak_context_tokens": 0, "context_window_tokens": 0,
+                  "peak_context_pct": 0.0, "model_turns": 0}
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") != "event_msg" or payload.get("type") != "token_count": return values
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+        last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+        window = safe_int(info.get("model_context_window")); current = safe_int(last.get("total_tokens"))
+        values.update({"input_tokens": safe_int(total.get("input_tokens")), "cached_input_tokens": safe_int(total.get("cached_input_tokens")),
+                       "output_tokens": safe_int(total.get("output_tokens")), "reasoning_tokens": safe_int(total.get("reasoning_output_tokens")),
+                       "peak_context_tokens": current, "context_window_tokens": window,
+                       "peak_context_pct": current / window if window else 0.0, "model_turns": 1})
+        return values
+
+    def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
+        event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
+                 "compactions": int(record.get("type") == "compacted"), "read_key": "", "command_key": ""}
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") != "response_item": return event
+        typ = payload.get("type")
+        if typ in {"function_call", "custom_tool_call"}:
+            event["tool_calls"] = 1; name = str(payload.get("name") or "")
+            args = payload.get("arguments") or payload.get("input") or {}
+            if isinstance(args, str):
+                try: args = json.loads(args)
+                except json.JSONDecodeError: args = {}
+            if name == "exec_command" and isinstance(args, dict): event["command_key"] = normalise_command(str(args.get("cmd") or ""))
+        elif typ in {"function_call_output", "custom_tool_call_output"}:
+            chars = len(json_text(payload.get("output") if "output" in payload else payload.get("content")))
+            event["tool_result_chars"] = chars; event["max_tool_result_chars"] = chars
+        return event
+
+    def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
+        result = super().parse_record(record, path)
+        result.update(self.extract_usage(record)); result.update(self.extract_tool_event(record))
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        result.update({"project": str(payload.get("cwd") or ""), "model": str(payload.get("model") or ""),
+                       "effort": str(payload.get("effort") or payload.get("reasoning_effort") or ""),
+                       "version": str(payload.get("cli_version") or "")})
+        return result
+
+
+ADAPTERS: dict[str, ProviderAdapter] = {"claude": ClaudeAdapter(), "codex": CodexAdapter()}
 
 
 class MaterialisedSources:
