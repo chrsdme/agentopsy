@@ -19,6 +19,14 @@ All notable changes to Agentopsy are documented here.
   the real incremental service path.
 - The live collector no longer advertises an unreachable compound-context
   emergency when required independent signals are not measured.
+- Codex compact control can now execute end to end: a Codex lifecycle hook
+  (`agentopsy integration install codex`) registers an exact native
+  session/pane identity with Herdr, `--auto-act compact` requests a
+  Herdr-delivered `/compact`, and the result is only marked `COMPACT_VERIFIED`
+  after independent post-request Codex provider lifecycle evidence and a
+  measured context-token reduction are observed for that same session. A
+  Herdr transport timeout alone is never treated as success. Claude native
+  control remains unavailable.
 
 ## [0.3.0] - Unreleased
 

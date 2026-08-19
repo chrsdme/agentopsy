@@ -578,10 +578,16 @@ down according to the persisted `policy.notification.cooldown_seconds` value
 `AGENTOPSY_NOTIFICATIONS=off`, `AGENTOPSY_NOTIFICATION_MIN_SEVERITY=high`,
 `AGENTOPSY_NOTIFICATION_PROVIDERS=claude`, and
 `AGENTOPSY_NOTIFICATION_SESSIONS=<id,...>`. `--auto-act compact` and `full`
-reach the fail-closed decision layer, but no provider action is currently
-enabled: Agentopsy cannot yet join a transcript identity to an exact live
-native session. Herdr is optional; no automatic `/clear`, `/new`, reset, or
-rotation is performed.
+reach the fail-closed decision layer. For Codex, when Herdr is running and its
+lifecycle hook is installed (`agentopsy integration install codex`), Agentopsy
+can join a transcript to an exact live native session and pane, and `compact`
+requests a Herdr-delivered `/compact` that is only counted as verified after
+independent Codex provider lifecycle evidence and a matching context-token
+reduction are observed for that exact session; any timeout, identity change,
+or missing provider confirmation blocks and does not retry. Claude native
+control remains unavailable: no bridge currently supplies an exact session
+mapping or provider-confirmed delivery for Claude. No automatic `/clear`,
+`/new`, reset, or rotation is performed for either provider.
 
 ## Legacy polling mode
 
