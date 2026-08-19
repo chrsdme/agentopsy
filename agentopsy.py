@@ -2156,6 +2156,7 @@ def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, l
 @dataclasses.dataclass
 class IngestionMetrics:
     bytes_examined: int = 0; bytes_newly_parsed: int = 0; files_unchanged: int = 0; files_advanced: int = 0; files_rescanned: int = 0; parse_errors: int = 0
+    touched_sessions: set = dataclasses.field(default_factory=set)
 
 
 class IncrementalIngestor:
@@ -2221,6 +2222,7 @@ class IncrementalIngestor:
         self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=sid or (old["session_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1
         if sid:
+            metrics.touched_sessions.add((candidate.provider, sid))
             row = self.store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, candidate.provider)).fetchone()
             if row:
                 state, events = evaluate_live_health(row, HealthPolicy.from_environment())
@@ -2331,8 +2333,15 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
     try:
         metrics = IncrementalIngestor(store, roots, provider).scan()
         notifier = Notifier(notify)
-        for row in store.sessions(provider):
-            for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (row["session_id"], row["provider"])).fetchall():
+        # Only notify for sessions touched this tick AND recently active.
+        # Without the recency check, a cold start (or any scan that first
+        # ingests months of history) would surface a desktop popup for every
+        # stale, long-finished session that happens to be over a threshold.
+        recent_cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
+        for prov, sid in metrics.touched_sessions:
+            row = store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, prov)).fetchone()
+            if row is None or not row["last_activity_at"] or row["last_activity_at"] < recent_cutoff: continue
+            for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (sid, prov)).fetchall():
                 if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"], event["severity"], row["provider"], row["session_id"])
         return metrics
     finally: store.close()

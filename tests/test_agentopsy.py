@@ -150,6 +150,26 @@ class IncrementalServiceTests(unittest.TestCase):
             self.assertFalse(asa.Notifier(False).enabled)
             store.close()
 
+    def test_cold_start_does_not_notify_for_stale_sessions(self):
+        # A fresh state DB ingesting months-old transcripts must not fire a
+        # desktop notification for every historical session that happens to
+        # already be over a health threshold -- only sessions active in the
+        # last few minutes should notify.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "sessions"; root.mkdir(); p = root / "rollout-old.jsonl"
+            old_ts = "2020-01-01T00:00:00.000Z"
+            meta = {"type": "session_meta", "timestamp": old_ts, "payload": {"session_id": "old", "cwd": "/x"}}
+            giant = {"type": "response_item", "timestamp": old_ts, "payload": {"type": "function_call_output", "output": "x" * 1_100_000}}
+            p.write_text(json.dumps(meta) + "\n" + json.dumps(giant) + "\n")
+            calls = []
+            original_notify = asa.Notifier.notify
+            asa.Notifier.notify = lambda self, t, msg, sev="medium", prov="", sid="": calls.append((prov, sid, sev))
+            try:
+                asa.service_once(str(Path(td) / "state"), roots=[(root, "test")])
+            finally:
+                asa.Notifier.notify = original_notify
+            self.assertEqual(calls, [])
+
     def test_codex_duplicate_token_snapshots_are_one_model_turn(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "sessions"; root.mkdir(); p = root / "rollout-c.jsonl"
