@@ -110,6 +110,10 @@ class IncrementalServiceTests(unittest.TestCase):
             self.assertEqual((session["model_turns"], session["input_tokens"], session["tool_calls"]), (1, 2, 1))
             store.close()
 
+    def test_claude_usage_iterations_are_one_model_turn(self):
+        value = asa.ClaudeAdapter().extract_usage({"type": "assistant", "message": {"usage": {"iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})
+        self.assertEqual((value["model_turns"], value["input_tokens"]), (1, 3))
+
     def test_malformed_claude_and_health_transition(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
