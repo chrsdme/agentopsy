@@ -391,7 +391,11 @@ class CodexAdapter(ProviderAdapter):
 
     def identify_session(self, record: dict[str, Any], path: Path) -> str:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        return str(payload.get("session_id") or payload.get("id") or path.stem)
+        # `payload.id` on response items is an item/call ID, not a session ID.
+        # Native session identity is carried by the session_meta record.
+        if record.get("type") == "session_meta":
+            return str(payload.get("session_id") or payload.get("id") or path.stem)
+        return path.stem
 
     def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
         values = {"input_tokens": None, "cached_input_tokens": None, "output_tokens": None,
