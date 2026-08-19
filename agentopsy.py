@@ -148,6 +148,7 @@ def _signal(code: str, title: str, lanes: tuple[ImpactLane, ...], measurement: s
 
 
 SIGNAL_REGISTRY: tuple[SignalDefinition, ...] = (
+    _signal("PRE_SUBMIT_PREFLIGHT", "Pre-submit stale-session interception", (ImpactLane.SESSION_LIFECYCLE,), "Provider/harness hook before new user work enters a session.", ProviderCapability.UNAVAILABLE, ProviderCapability.UNAVAILABLE, impact="Current providers expose no safe pre-submit interception hook; advisory checks remain available.", corrective="Run the local preflight before continuing a stale, high-context session."),
     _signal("SESSION_CONTEXT_OCCUPANCY", "Session/context occupancy", (ImpactLane.CONTEXT_PRESSURE,), "Current context divided by a provider-reported window; Claude is a documented absolute-token proxy.", ProviderCapability.PROXY, ProviderCapability.EXACT),
     _signal("CONTEXT_TOKENS_WINDOW", "Context tokens and window", (ImpactLane.CONTEXT_PRESSURE,), "Logged context tokens and, where exposed, the context-window denominator.", ProviderCapability.PARTIAL, ProviderCapability.EXACT),
     _signal("MODEL_TURNS", "Model turns", (ImpactLane.TOKEN_AMPLIFICATION,), "Deduplicated assistant usage or token-snapshot iterations.", ProviderCapability.EXACT, ProviderCapability.EXACT),
@@ -2900,6 +2901,14 @@ def insights_payload(store: StateStore, days: int = 30, provider: str = "all") -
     return {"period_days": days, "provider": provider, "sessions": len(rows), "recurring_faults": recurring, "weakest_marker": weakest, "compaction_refill_sessions": refill, "insights": insights}
 
 
+def stale_session_preflight(row: sqlite3.Row, now: Optional[dt.datetime] = None) -> dict[str, Any]:
+    now = now or dt.datetime.now(dt.timezone.utc); last = iso_to_dt(row["last_activity_at"])
+    idle = (now - last).total_seconds() if last else None
+    pct = float(row["peak_context_pct"] or 0.0)
+    warning = bool(idle is not None and idle >= 3600 and (pct > .55 or int(row["peak_context_tokens"] or 0) >= 150_000))
+    return {"supported_interception": False, "idle_seconds": idle, "context_pct": pct or None, "cache_ratio": (int(row["cached_input_tokens"] or 0) / int(row["input_tokens"])) if int(row["input_tokens"] or 0) else None, "warning": warning, "message": "This session is already large and has been idle for a substantial period. Continuing may require previous context to be processed again. Consider compacting or starting fresh." if warning else "No stale-session preflight warning from observed local facts.", "note": "No provider cache-expiry claim is made."}
+
+
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
@@ -2978,7 +2987,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight"}: return None
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -3009,6 +3018,14 @@ def live_cli(argv: list[str]) -> Optional[int]:
             payload = insights_payload(store, args.days, args.provider)
             print(json.dumps(payload, indent=2) if args.json else "\n".join(payload["insights"]) if payload["insights"] else "No qualifying session-health history yet.")
             return 0
+        finally: store.close()
+    if argv[0] == "preflight":
+        parser = argparse.ArgumentParser(prog="agentopsy preflight"); parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["claude", "codex"], required=True); parser.add_argument("--session", required=True)
+        args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+        try:
+            row = store.db.execute("SELECT * FROM sessions WHERE provider=? AND session_id LIKE ?", (args.provider, args.session + "%")).fetchone()
+            if not row: raise ValueError("No matching stored session for preflight")
+            print(json.dumps(stale_session_preflight(row), indent=2)); return 0
         finally: store.close()
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
     parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
@@ -3095,7 +3112,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight"}:
         try:
             return live_cli(argv)
         except SystemExit:

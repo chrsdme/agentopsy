@@ -238,6 +238,16 @@ class InsightsTests(unittest.TestCase):
             store.close()
 
 
+class PreflightTests(unittest.TestCase):
+    def test_stale_high_context_warning_is_advisory_not_expiry_claim(self):
+        row = {"last_activity_at": (asa.dt.datetime.now(asa.dt.timezone.utc) - asa.dt.timedelta(hours=3)).isoformat(), "peak_context_pct": .8, "peak_context_tokens": 0, "cached_input_tokens": 10, "input_tokens": 20}
+        warning = asa.stale_session_preflight(row)
+        self.assertTrue(warning["warning"])
+        self.assertFalse(warning["supported_interception"])
+        self.assertIn("No provider cache-expiry claim", warning["note"])
+        self.assertIn("starting fresh", warning["message"])
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:

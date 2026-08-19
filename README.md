@@ -415,6 +415,8 @@ agentopsy --project my-project --since 7d --summary
   `recommend`, `adopt`, and `reset`; factory safety ceilings remain in force.
 - deterministic personal workflow insights: `agentopsy insights --days N
   --provider claude|codex`, based only on local session-health aggregates.
+- stale-session advisory: `agentopsy preflight --provider PROVIDER --session ID`;
+  it reports observed local facts and never claims provider cache expiry.
 
 ## Claude Code
 
