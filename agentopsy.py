@@ -137,6 +137,12 @@ def rotation_plan(project: str, *, safe_to_act: bool, adapter_capability: Provid
     return {"action_safety": ActionSafety.SAFE_TO_ACT.value, "reason": "Preconditions passed; preserve handoff until native session identity transition is verified.", "handoff": handoff, "action": "native_new_session"}
 
 
+def fail_safe_control(reason: str, *, provider: str, session_id: str, malformed_records: int = 0) -> GuardianEvent:
+    """Fail closed on integrity uncertainty; evidence is compact and transcript-free."""
+    severity = Severity.SUPER_CRITICAL if malformed_records > 10 else Severity.HIGH
+    return GuardianEvent("CONTROL_FAIL_SAFE", severity, (ImpactLane.INTEGRITY,), ActionSafety.ACTION_BLOCKED, {"malformed_records": malformed_records, "control_disabled": True})
+
+
 def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_session: bool, exact_harness: bool, capability: ProviderCapability, safe_idle_boundary: bool, active_critical_operation: bool, integrity_ok: bool) -> ControlDecision:
     """Control is opt-in and capability gated; this function never performs it."""
     if mode == AutoActMode.OBSERVE: return ControlDecision(mode, False, "Observe mode only advises; it never alters a provider session.")

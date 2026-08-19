@@ -429,6 +429,8 @@ agentopsy --project my-project --since 7d --summary
   ineffective, or thrash; unavailable adapters never trigger compaction.
 - full rotation is blocked unless a durable validated handoff and a verified
   native session transition are available.
+- integrity uncertainty fails closed: active control is disabled and advice
+  falls back to observe without retaining transcript content.
 
 ## Claude Code
 

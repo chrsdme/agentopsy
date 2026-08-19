@@ -312,6 +312,14 @@ class RotationTests(unittest.TestCase):
             self.assertIsNone(plan["action"])
 
 
+class FailSafeTests(unittest.TestCase):
+    def test_integrity_failure_blocks_control_without_transcript_evidence(self):
+        event = asa.fail_safe_control("parser uncertainty", provider="codex", session_id="s", malformed_records=11)
+        self.assertEqual(event.action_safety, asa.ActionSafety.ACTION_BLOCKED)
+        self.assertEqual(event.severity, asa.Severity.SUPER_CRITICAL)
+        self.assertEqual(event.evidence, {"malformed_records": 11, "control_disabled": True})
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
