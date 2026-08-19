@@ -89,6 +89,8 @@ class IncrementalServiceTests(unittest.TestCase):
             partial = ingestor.scan(); self.assertEqual(partial.parse_errors, 0); self.assertEqual(store.sessions()[0]["input_tokens"], 0)
             p.write_text(p.read_text() + raw[20:] + "\n")
             completed = ingestor.scan(); self.assertLess(completed.bytes_newly_parsed, p.stat().st_size); self.assertEqual(store.sessions()[0]["input_tokens"], 9)
+            self.assertEqual(len(store.sessions()), 1)
+            self.assertEqual(store.sessions()[0]["session_id"], "s1")
             p.unlink(); p.write_text(json.dumps(first) + "\n")
             replaced = ingestor.scan(); self.assertEqual(replaced.files_rescanned, 1)
             store.close()

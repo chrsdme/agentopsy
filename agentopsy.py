@@ -2157,10 +2157,17 @@ class IncrementalIngestor:
         text = partial + chunk.decode("utf-8", errors="replace")
         lines = text.splitlines(keepends=True); trailing = ""
         if lines and not lines[-1].endswith(("\n", "\r")): trailing = lines.pop()
-        adapter = ADAPTERS[candidate.provider]; sid = ""
+        adapter = ADAPTERS[candidate.provider]; sid = "" if reset else str(old["session_id"] if old else "")
         for line in lines:
             if not line.strip(): continue
-            try: sid = self.store.apply_record(candidate.provider, path, adapter.parse_record(json.loads(line), path))
+            try:
+                data = adapter.parse_record(json.loads(line), path)
+                # Codex metadata normally carries the native session ID only once.
+                # Later records must stay attached to that file's established ID,
+                # rather than falling back to a filename-derived placeholder.
+                if sid and str(data.get("session_id") or "") == path.stem:
+                    data["session_id"] = sid
+                sid = self.store.apply_record(candidate.provider, path, data)
             except json.JSONDecodeError:
                 metrics.parse_errors += 1
                 # Before metadata identifies a session, retain the error in scan
