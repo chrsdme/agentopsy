@@ -278,3 +278,11 @@ hashes only. It supports five- and fifteen-minute views plus ten-, twenty-,
 and fifty-turn views without retaining transcript payloads or unbounded event
 history. Provider classification is cached against file identity, size/offset,
 and parser version so unchanged service polls do not reopen transcript files.
+
+## v0.4 review-debt audit
+
+The v0.3 cached provider-classification, durable file identity, cold-start
+notification recency guard, and version/report metadata are retained and
+covered by regression checks. Context proxies remain explicitly labelled where
+providers do not expose a trustworthy denominator; no speculative replacement
+is applied.
