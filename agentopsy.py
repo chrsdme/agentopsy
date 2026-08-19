@@ -3307,6 +3307,11 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
                 decision = control_decision_for_live_session(row, auto_act, store)
                 if not decision.allowed:
                     metrics.control_blocked += 1
+                elif decision.action == "full":
+                    # Full mode has no verified rotation/new-session adapter yet;
+                    # an allowed decision must still resolve to a blocked, accounted
+                    # outcome rather than silently doing nothing.
+                    metrics.control_blocked += 1
                 elif decision.action == "compact":
                     mapping = exact_identity_for_live_session(store, row)
                     if mapping is None or compact_action_recent(store, prov, sid, notification["cooldown_seconds"]):
