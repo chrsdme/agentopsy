@@ -87,6 +87,28 @@ class ActionSafety(str, enum.Enum):
     ACTION_BLOCKED = "ACTION_BLOCKED"
 
 
+class AutoActMode(str, enum.Enum):
+    OBSERVE = "observe"
+    COMPACT = "compact"
+    FULL = "full"
+
+
+@dataclasses.dataclass(frozen=True)
+class ControlDecision:
+    mode: AutoActMode
+    allowed: bool
+    reason: str
+    action: Optional[str] = None
+
+
+def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_session: bool, exact_harness: bool, capability: ProviderCapability, safe_idle_boundary: bool, active_critical_operation: bool, integrity_ok: bool) -> ControlDecision:
+    """Control is opt-in and capability gated; this function never performs it."""
+    if mode == AutoActMode.OBSERVE: return ControlDecision(mode, False, "Observe mode only advises; it never alters a provider session.")
+    if not all((exact_provider, exact_session, exact_harness, safe_idle_boundary, integrity_ok)) or capability == ProviderCapability.UNAVAILABLE or active_critical_operation:
+        return ControlDecision(mode, False, "Control blocked: exact mapping, supported capability, safe idle boundary, no critical operation, and healthy integrity are all required.")
+    return ControlDecision(mode, True, "All safety preconditions passed; adapter execution remains separately verified.", "compact" if mode == AutoActMode.COMPACT else "full")
+
+
 class ProviderCapability(str, enum.Enum):
     EXACT = "EXACT"
     OBSERVED = "OBSERVED"
