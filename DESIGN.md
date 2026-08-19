@@ -181,6 +181,13 @@ current/effective severity, trend, contributing lanes, causal explanations,
 and a qualitative next-risk state. It never claims an unsupported token-count
 forecast.
 
+## v0.4 personal calibration
+
+`agentopsy calibrate status|build|recommend|adopt|reset` maintains local-only,
+reviewable robust profiles (P50/P75/P90/P95 and MAD). Confidence incorporates
+evidence volume and stability. Profiles do not weaken factory hard safety
+ceilings; adoption records an explicit local choice only.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

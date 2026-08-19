@@ -195,6 +195,34 @@ class CausalRiskTests(unittest.TestCase):
         self.assertEqual(summary.to_dict()["causal_risk"]["predicted_next_risk_state"], "CRITICAL")
 
 
+class CalibrationTests(unittest.TestCase):
+    def test_robust_profile_reports_quantiles_confidence_and_stability(self):
+        low = asa.robust_profile([1, 2, 3], 3)
+        self.assertEqual(low["confidence"], "LOW")
+        unstable = asa.robust_profile(list(range(30)), 30, 2000, 1000)
+        self.assertEqual(unstable["confidence"], "MEDIUM")
+        stable = asa.robust_profile([10] * 30, 30, 2000, 1000)
+        self.assertEqual(stable["confidence"], "HIGH")
+        self.assertEqual(stable["p95"], 10)
+
+    def test_calibration_commands_are_reviewable_before_adoption(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = str(Path(td) / "state")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(asa.main(["calibrate", "status", "--state-dir", state]), 0)
+                self.assertEqual(asa.main(["calibrate", "build", "--state-dir", state]), 0)
+            store = asa.StateStore(state)
+            profile = asa.calibration_status(store)
+            self.assertTrue(profile["factory_hard_ceilings_authoritative"])
+            self.assertFalse(profile["adopted"])
+            store.close()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(asa.main(["calibrate", "recommend", "--state-dir", state]), 0)
+                self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", state]), 0)
+                self.assertEqual(asa.main(["calibrate", "reset", "--state-dir", state]), 0)
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
