@@ -2463,6 +2463,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # install.sh symlinks agentopsyd -> agentopsy.py; the pip entry point invokes
+    # service_main directly, so route the symlinked invocation the same way.
+    if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
+        return service_main(argv)
     live_result = live_cli(argv)
     if live_result is not None:
         return live_result
