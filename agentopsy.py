@@ -1716,6 +1716,35 @@ def format_session_date(s: SessionSummary) -> str:
     return stamp.astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
 
+def format_summary_timestamp(value: str) -> str:
+    stamp = iso_to_dt(value)
+    if not stamp:
+        return "time unavailable"
+    if stamp.tzinfo is None:
+        zone = "timezone unknown"
+    else:
+        zone = stamp.tzname() or "timezone unknown"
+    return f"{stamp.strftime('%Y-%m-%d %H:%M')} {zone}"
+
+
+def format_summary_session_span(s: SessionSummary) -> str:
+    start = iso_to_dt(s.start)
+    end = iso_to_dt(s.end)
+    if not start or not end:
+        if start:
+            return f"{format_summary_timestamp(s.start)}–time unavailable"
+        if end:
+            return f"time unavailable–{format_summary_timestamp(s.end)}"
+        return "time unavailable"
+
+    start_text = format_summary_timestamp(s.start)
+    end_text = format_summary_timestamp(s.end)
+    if start.date() == end.date() and start.tzname() == end.tzname():
+        zone = start.tzname() if start.tzinfo is not None else "timezone unknown"
+        return f"{start.strftime('%Y-%m-%d %H:%M')}–{end.strftime('%H:%M')} {zone}"
+    return f"{start_text}–{end_text}"
+
+
 def render_session_list(sessions: list[SessionSummary]) -> str:
     """Minimal copy-friendly list for later --session selection."""
     ordered = sorted(sessions, key=_session_sort_dt, reverse=True)
@@ -1737,7 +1766,11 @@ def render_summary(sessions: list[SessionSummary]) -> str:
             continue
         number += 1
         label = provider.title()
-        lines += [f"{number}. {label}", "─" * 48]
+        provider_sessions = [s for s in sessions if s.provider == provider]
+        heading = f"{number}. {label}"
+        if len(provider_sessions) == 1:
+            heading += f" — {format_summary_session_span(provider_sessions[0])}"
+        lines += [heading, "─" * 48]
         if provider == "claude":
             lines += [
                 f"{a['sessions']} session{'s' if a['sessions'] != 1 else ''}",
