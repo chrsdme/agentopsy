@@ -1,4 +1,5 @@
 # Python bytecode / caches
+/local_only/
 __pycache__/
 *.py[cod]
 .pytest_cache/

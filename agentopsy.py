@@ -26,6 +26,7 @@ import argparse
 import collections
 import dataclasses
 import datetime as dt
+import enum
 import hashlib
 import json
 import os
@@ -44,12 +45,66 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.3.0-dev"
+VERSION = "0.4.0-dev"
 PARSER_VERSION = 1
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 SEVERITY_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
+
+
+class Severity(str, enum.Enum):
+    """How urgently a Guardian signal should be understood."""
+    SAFE = "SAFE"
+    LIGHT = "LIGHT"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+    SUPER_CRITICAL = "SUPER_CRITICAL"
+    EMERGENCY = "EMERGENCY"
+
+
+class ImpactLane(str, enum.Enum):
+    """Independent workflow dimension affected by a Guardian signal."""
+    CONTEXT_PRESSURE = "CONTEXT_PRESSURE"
+    CONTEXT_VELOCITY = "CONTEXT_VELOCITY"
+    TOKEN_AMPLIFICATION = "TOKEN_AMPLIFICATION"
+    CACHE_REUSE = "CACHE_REUSE"
+    TOOL_OUTPUT = "TOOL_OUTPUT"
+    REPETITION = "REPETITION"
+    INSTRUCTION_OVERHEAD = "INSTRUCTION_OVERHEAD"
+    DELEGATION_ADVISOR = "DELEGATION_ADVISOR"
+    COMPACTION_HEALTH = "COMPACTION_HEALTH"
+    SESSION_LIFECYCLE = "SESSION_LIFECYCLE"
+    INTEGRITY = "INTEGRITY"
+
+
+class ActionSafety(str, enum.Enum):
+    """Whether a signal is merely advisory or safe for an opt-in control action."""
+    ADVISE_ONLY = "ADVISE_ONLY"
+    ACTION_CANDIDATE = "ACTION_CANDIDATE"
+    WAITING_SAFE = "WAITING_SAFE"
+    SAFE_TO_ACT = "SAFE_TO_ACT"
+    ACTION_BLOCKED = "ACTION_BLOCKED"
+
+
+@dataclasses.dataclass(frozen=True)
+class GuardianEvent:
+    """A compact, transcript-free event spanning one or more impact lanes."""
+    code: str
+    severity: Severity
+    lanes: tuple[ImpactLane, ...]
+    action_safety: ActionSafety
+    evidence: dict[str, int | float | bool | None] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("Guardian event code is required")
+        if not self.lanes:
+            raise ValueError("Guardian event must affect at least one impact lane")
+        if len(set(self.lanes)) != len(self.lanes):
+            raise ValueError("Guardian event impact lanes must be unique")
+        if any(not isinstance(value, (int, float, bool, type(None))) for value in self.evidence.values()):
+            raise ValueError("Guardian evidence must contain only compact numeric or boolean facts")
 
 # Conservative defaults. They are intentionally configurable from the CLI.
 DEFAULT_GAP_MINUTES = 30.0
@@ -2013,12 +2068,31 @@ class StateStore:
     def close(self) -> None: self.db.close()
 
     def _migrate(self) -> None:
-        with self.db:
-            self.db.execute("CREATE TABLE IF NOT EXISTS service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
             version = self.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()
-            if version and int(version[0]) > SCHEMA_VERSION:
+            current = int(version[0]) if version else 0
+            if current > SCHEMA_VERSION:
                 raise RuntimeError("state database is newer than this Agentopsy version")
-            self.db.executescript("""
+            for target, migration in self._migration_steps():
+                if target <= current:
+                    continue
+                migration()
+                self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('schema_version',?)", (str(target),))
+                current = target
+            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('parser_version',?)", (str(PARSER_VERSION),))
+        except Exception:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
+
+    def _migration_steps(self) -> tuple[tuple[int, Any], ...]:
+        return ((1, self._migration_v1), (2, self._migration_v2))
+
+    def _migration_v1(self) -> None:
+        self.db.executescript("""
             CREATE TABLE IF NOT EXISTS files (
               id INTEGER PRIMARY KEY, provider TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
               identity TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mtime_ns INTEGER NOT NULL DEFAULT 0,
@@ -2044,8 +2118,17 @@ class StateStore:
               session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL,
               PRIMARY KEY(session_id, provider, kind, key_hash));
             """)
-            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('parser_version',?)", (str(PARSER_VERSION),))
+
+    def _migration_v2(self) -> None:
+        """Add Context Guardian's multi-lane, action-safety event foundation."""
+        self.db.execute("""CREATE TABLE guardian_events (
+            id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL,
+            severity TEXT NOT NULL, action_safety TEXT NOT NULL, code TEXT NOT NULL,
+            evidence TEXT NOT NULL DEFAULT '{}', resolved_at TEXT)""")
+        self.db.execute("""CREATE TABLE guardian_event_lanes (
+            event_id INTEGER NOT NULL REFERENCES guardian_events(id) ON DELETE CASCADE,
+            lane TEXT NOT NULL, PRIMARY KEY(event_id, lane))""")
+        self.db.execute("CREATE INDEX guardian_events_session_idx ON guardian_events(session_id, provider, timestamp DESC)")
 
     def file(self, path: Path) -> Optional[sqlite3.Row]:
         return self.db.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 import tempfile
 import unittest
 import sys
@@ -11,6 +12,75 @@ spec = importlib.util.spec_from_file_location("asa", HERE / "agentopsy.py")
 asa = importlib.util.module_from_spec(spec)
 sys.modules["asa"] = asa
 spec.loader.exec_module(asa)
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    def make_v1_state(self, state: Path) -> Path:
+        state.mkdir()
+        db_path = state / "agentopsy.db"
+        db = sqlite3.connect(db_path)
+        db.executescript("""
+            CREATE TABLE service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE files (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+              identity TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mtime_ns INTEGER NOT NULL DEFAULT 0,
+              last_offset INTEGER NOT NULL DEFAULT 0, partial_line TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, parser_version INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'ok');
+            CREATE TABLE sessions (session_id TEXT NOT NULL, provider TEXT NOT NULL, project TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+              started_at TEXT NOT NULL DEFAULT '', last_activity_at TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
+              model_turns INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, tool_result_chars INTEGER NOT NULL DEFAULT 0,
+              max_tool_result_chars INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_creation_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+              peak_context_tokens INTEGER NOT NULL DEFAULT 0, context_window_tokens INTEGER NOT NULL DEFAULT 0, peak_context_pct REAL NOT NULL DEFAULT 0,
+              compactions INTEGER NOT NULL DEFAULT 0, repeated_reads INTEGER NOT NULL DEFAULT 0, repeated_commands INTEGER NOT NULL DEFAULT 0,
+              malformed_records INTEGER NOT NULL DEFAULT 0, health_state TEXT NOT NULL DEFAULT 'HEALTHY', health_since TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(session_id, provider));
+        """)
+        db.execute("INSERT INTO service_meta VALUES('schema_version', '1')")
+        db.execute("INSERT INTO files(provider,path,identity,session_id,first_seen,last_seen,parser_version) VALUES(?,?,?,?,?,?,?)", ("codex", "/tmp/old.jsonl", "inode:1", "old-session", "a", "b", 1))
+        db.execute("INSERT INTO sessions(session_id,provider,project,path) VALUES(?,?,?,?)", ("old-session", "codex", "project", "/tmp/old.jsonl"))
+        db.commit()
+        db.close()
+        return db_path
+
+    def test_v1_state_migrates_idempotently_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            self.make_v1_state(state)
+            store = asa.StateStore(str(state))
+            self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], "2")
+            self.assertEqual(store.file(Path("/tmp/old.jsonl"))["session_id"], "old-session")
+            self.assertEqual(store.sessions("codex")[0]["project"], "project")
+            self.assertEqual({row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'guardian_%'")}, {"guardian_events", "guardian_event_lanes"})
+            store.close()
+            reopened = asa.StateStore(str(state))
+            self.assertEqual(reopened.sessions("codex")[0]["session_id"], "old-session")
+            self.assertEqual(reopened.db.execute("SELECT count(*) FROM guardian_events").fetchone()[0], 0)
+            reopened.close()
+
+    def test_failed_migration_rolls_back_without_advancing_schema_version(self):
+        class FailingV2Store(asa.StateStore):
+            def _migration_steps(self):
+                def fail():
+                    self.db.execute("CREATE TABLE failed_migration_marker (id INTEGER)")
+                    raise sqlite3.OperationalError("injected migration failure")
+                return ((2, fail),)
+
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            self.make_v1_state(state)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "injected migration failure"):
+                FailingV2Store(str(state))
+            db = sqlite3.connect(state / "agentopsy.db")
+            self.assertEqual(db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], "1")
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='failed_migration_marker'").fetchone())
+            self.assertEqual(db.execute("SELECT session_id FROM sessions").fetchone()[0], "old-session")
+            db.close()
+
+    def test_guardian_dimensions_are_independent_and_evidence_is_transcript_free(self):
+        event = asa.GuardianEvent("CONTEXT_HIGH", asa.Severity.CRITICAL, (asa.ImpactLane.CONTEXT_PRESSURE, asa.ImpactLane.TOOL_OUTPUT), asa.ActionSafety.ADVISE_ONLY, {"context_pct": 0.91})
+        self.assertEqual(event.action_safety, asa.ActionSafety.ADVISE_ONLY)
+        with self.assertRaises(ValueError):
+            asa.GuardianEvent("BAD", asa.Severity.HIGH, (asa.ImpactLane.INTEGRITY,), asa.ActionSafety.ACTION_BLOCKED, {"transcript": "secret body"})
 
 
 class AnalyzerTests(unittest.TestCase):

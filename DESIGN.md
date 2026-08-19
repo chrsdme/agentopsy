@@ -159,3 +159,16 @@ reducers. SQLite cursors own file identity, byte offset, and incomplete-line
 recovery. Health policy consumes compact derived counters and bounded evidence,
 never account-quota telemetry. The optional service, notifications, Herdr
 bridge, and handoff validator all operate from that local state.
+
+## v0.4 Context Guardian foundation
+
+Guardian signals keep three dimensions deliberately independent: `Severity`
+expresses urgency, one or more `ImpactLane` values explain the affected
+workflow dimensions, and `ActionSafety` describes whether an opt-in control
+action is safe. A serious signal is therefore not permission to interrupt or
+modify a session. Guardian evidence is limited to compact numeric/boolean
+facts; transcript bodies are never stored in SQLite.
+
+SQLite schema changes are applied as numbered, transactional migrations. A
+failed migration leaves the previous schema version intact, and opening an
+already-upgraded state database is idempotent.
