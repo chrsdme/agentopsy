@@ -2921,6 +2921,20 @@ def policy_import(store: StateStore, payload: dict[str, Any]) -> None:
     except Exception: store.db.rollback(); raise
 
 
+def guardian_replay(store: StateStore, provider: str = "all") -> list[dict[str, Any]]:
+    """Read-only deterministic policy replay; no provider/session mutation."""
+    timeline = []
+    for row in sorted(store.sessions(provider), key=lambda item: (item["last_activity_at"], item["session_id"])):
+        severity = context_severity(float(row["peak_context_pct"] or 0.0))
+        states = [severity.value]
+        if severity in {Severity.CRITICAL, Severity.SUPER_CRITICAL, Severity.EMERGENCY}: states.append("WOULD_COMPACT")
+        if severity in {Severity.SUPER_CRITICAL, Severity.EMERGENCY}: states.append("WOULD_REQUIRE_HANDOFF")
+        if severity == Severity.EMERGENCY: states.append("WOULD_ROTATE")
+        if int(row["compactions"] or 0) and int(row["repeated_commands"] or 0) >= 2: states.append("RAPID_REFILL")
+        timeline.append({"timestamp": row["last_activity_at"], "provider": row["provider"], "states": states, "reason": "Recorded local context/repetition facts replayed against v0.4 policy."})
+    return timeline
+
+
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
@@ -2999,7 +3013,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian"}: return None
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -3051,6 +3065,13 @@ def live_cli(argv: list[str]) -> Optional[int]:
                 if not args.path: raise ValueError("policy import requires a path")
                 policy_import(store, json.loads(Path(args.path).read_text(encoding="utf-8")))
             else: store.db.execute("DELETE FROM service_meta WHERE key='runtime_policy'"); store.db.commit()
+            return 0
+        finally: store.close()
+    if argv[0] == "guardian":
+        parser = argparse.ArgumentParser(prog="agentopsy guardian"); parser.add_argument("action", choices=["replay"]); parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all")
+        args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+        try:
+            for item in guardian_replay(store, args.provider): print(f"{item['timestamp']} {item['provider']}: {' -> '.join(item['states'])}")
             return 0
         finally: store.close()
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
@@ -3138,7 +3159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian"}:
         try:
             return live_cli(argv)
         except SystemExit:

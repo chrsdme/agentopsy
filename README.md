@@ -419,6 +419,8 @@ agentopsy --project my-project --since 7d --summary
   it reports observed local facts and never claims provider cache expiry.
 - policy controls: `agentopsy policy show|export|import|reset`; imports are
   validated before transactional local-state updates.
+- deterministic dry-run policy timeline: `agentopsy guardian replay`; it only
+  reports what policy would recommend and never controls a provider session.
 
 ## Claude Code
 

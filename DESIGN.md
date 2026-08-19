@@ -200,6 +200,12 @@ Policy uses versioned built-in safe defaults, SQLite runtime overrides, and
 optional JSON import/export. Imports are schema-validated before a transaction
 updates active state, preventing partial policy changes.
 
+## v0.4 replay
+
+`agentopsy guardian replay` replays local historical state through the policy
+and emits deterministic severity/`WOULD_*` timeline states. It is read-only and
+does not execute any provider control action.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.
