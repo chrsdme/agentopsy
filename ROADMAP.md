@@ -61,7 +61,7 @@ stat file
   └── size < offset -> transcript truncated/replaced, rebuild only that file
 ```
 
-A normal tick should therefore read **zero bytes** for unchanged sessions and only the newly appended tail for active sessions.
+A normal tick should therefore read **zero bytes of transcript content** for unchanged sessions and only the newly appended tail for active sessions. As implemented, each tick still reopens every discovered file to re-sniff its provider (up to 12 lines) before the size check runs; this is small per file but not the zero-I/O claim above, and does not scale to very large session counts. Caching the classification result is deferred.
 
 ### SQLite state
 
