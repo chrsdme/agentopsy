@@ -425,6 +425,8 @@ agentopsy --project my-project --since 7d --summary
   and safe-boundary precondition before an adapter can be considered.
 - provider adapters are capability-gated; unverified native actions remain
   unavailable and Agentopsy never types blindly into a terminal.
+- observed compactions are classified as effective, weak, rapid-refill,
+  ineffective, or thrash; unavailable adapters never trigger compaction.
 
 ## Claude Code
 
