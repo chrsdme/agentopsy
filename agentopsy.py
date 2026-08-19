@@ -2337,10 +2337,15 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
         # Without the recency check, a cold start (or any scan that first
         # ingests months of history) would surface a desktop popup for every
         # stale, long-finished session that happens to be over a threshold.
-        recent_cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)).isoformat()
+        recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
         for prov, sid in metrics.touched_sessions:
             row = store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, prov)).fetchone()
-            if row is None or not row["last_activity_at"] or row["last_activity_at"] < recent_cutoff: continue
+            activity = iso_to_dt(row["last_activity_at"]) if row else None
+            # last_activity_at is raw provider text (e.g. Codex's "...503Z" vs
+            # Claude's own format); parse both sides rather than comparing
+            # timestamp strings lexically, which silently mis-sorts across
+            # differing fractional-second widths or UTC offset spellings.
+            if activity is None or activity < recent_cutoff: continue
             for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (sid, prov)).fetchall():
                 if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"], event["severity"], row["provider"], row["session_id"])
         return metrics
@@ -2360,7 +2365,11 @@ def service_main(argv: Optional[list[str]] = None) -> int:
             print(render_health(store.sessions())); return 0
         finally: store.close()
     if args.command == "once":
-        m = service_once(args.state_dir, args.provider, notify=not args.no_notify); print(dataclasses.asdict(m)); return 0
+        m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
+        # touched_sessions is an internal notification-gating detail (raw
+        # session IDs); do not print it in the scan summary.
+        summary = {k: v for k, v in dataclasses.asdict(m).items() if k != "touched_sessions"}
+        print(summary); return 0
     if args.interval <= 0: parser.error("--interval must be positive")
     lock = default_state_dir(args.state_dir) / "agentopsyd.lock"
     try:
