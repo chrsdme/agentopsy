@@ -639,6 +639,18 @@ agentopsy/
 
 # Tests
 
+Fast deterministic checks during focused work:
+
+```bash
+make quick
+```
+
+Release/full checks:
+
+```bash
+make full
+```
+
 ```bash
 python -m unittest discover -s tests -v
 ```
