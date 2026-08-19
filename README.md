@@ -525,7 +525,10 @@ or account quota is never used as a rotation signal.
 
 The service emits terminal notifications and uses `notify-send` when available.
 Notifications can be disabled with `--no-notify`; repeated events are cooled
-down. Herdr is optional and passive in this release. No automatic `/clear`,
+down. Environment configuration is available for unattended runs:
+`AGENTOPSY_NOTIFICATIONS=off`, `AGENTOPSY_NOTIFICATION_MIN_SEVERITY=high`,
+`AGENTOPSY_NOTIFICATION_PROVIDERS=claude`, and
+`AGENTOPSY_NOTIFICATION_SESSIONS=<id,...>`. Herdr is optional and passive in this release. No automatic `/clear`,
 `/new`, reset, or rotation is performed.
 
 ## Legacy polling mode

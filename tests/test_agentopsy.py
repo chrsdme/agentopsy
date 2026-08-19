@@ -102,6 +102,16 @@ class IncrementalServiceTests(unittest.TestCase):
             self.assertEqual(row["health_state"], "ROTATION_RECOMMENDED")
             store.close()
 
+    def test_handoff_contract_and_empty_trends(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "project"; handoff = project / ".ai" / "state" / "HANDOFF.md"
+            handoff.parent.mkdir(parents=True)
+            handoff.write_text("\n".join("## " + item for item in asa.HANDOFF_SECTIONS))
+            self.assertTrue(asa.validate_handoff(str(project))["valid"])
+            store = asa.StateStore(str(Path(td) / "state"))
+            self.assertEqual(asa.trend_payload(store, 7)["providers"]["claude"]["sessions"], 0)
+            store.close()
+
 
 class SelectionAndOutputTests(unittest.TestCase):
     def make_summary(self, provider, sid, end, *, start="", turns=0, total=0, cached=0, input_tokens=0, output=0, peak_pct=0.0):

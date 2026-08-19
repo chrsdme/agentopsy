@@ -2206,10 +2206,15 @@ def run_watch(args: argparse.Namespace) -> int:
 class Notifier:
     """Optional local notifier; absence of a desktop/Herdr is always harmless."""
     def __init__(self, enabled: bool = True, minimum: str = "medium"):
-        self.enabled, self.minimum = enabled, minimum
+        self.enabled = enabled and os.environ.get("AGENTOPSY_NOTIFICATIONS", "1").lower() not in {"0", "false", "off"}
+        self.minimum = os.environ.get("AGENTOPSY_NOTIFICATION_MIN_SEVERITY", minimum)
+        self.providers = {x for x in os.environ.get("AGENTOPSY_NOTIFICATION_PROVIDERS", "").split(",") if x}
+        self.sessions = {x for x in os.environ.get("AGENTOPSY_NOTIFICATION_SESSIONS", "").split(",") if x}
 
-    def notify(self, title: str, message: str) -> None:
-        if not self.enabled: return
+    def notify(self, title: str, message: str, severity: str = "medium", provider: str = "", session_id: str = "") -> None:
+        if not self.enabled or SEVERITY_ORDER.get(severity, 0) < SEVERITY_ORDER.get(self.minimum, 2): return
+        if self.providers and provider not in self.providers: return
+        if self.sessions and session_id not in self.sessions: return
         print(f"Agentopsy: {title}\n{message}", file=sys.stderr)
         if shutil.which("notify-send"):
             try: subprocess.run(["notify-send", "Agentopsy: " + title, message], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
@@ -2272,7 +2277,7 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
         notifier = Notifier(notify)
         for row in store.sessions(provider):
             for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (row["session_id"], row["provider"])).fetchall():
-                if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"])
+                if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"], event["severity"], row["provider"], row["session_id"])
         return metrics
     finally: store.close()
 
