@@ -2483,9 +2483,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    live_result = live_cli(argv)
-    if live_result is not None:
-        return live_result
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff"}:
+        try:
+            return live_cli(argv)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
     args = build_parser().parse_args(argv)
     try:
         if args.watch:
