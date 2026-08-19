@@ -262,6 +262,20 @@ class PolicyTests(unittest.TestCase):
             store.close()
 
 
+class ReplayTests(unittest.TestCase):
+    def test_replay_is_deterministic_and_only_emits_would_actions(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            store.db.execute("INSERT INTO sessions(session_id,provider,last_activity_at,peak_context_pct,compactions,repeated_commands) VALUES(?,?,?,?,?,?)", ("r1", "codex", "2026-01-01T00:00:00+00:00", .92, 1, 2))
+            store.db.commit()
+            first = asa.guardian_replay(store)
+            self.assertEqual(first, asa.guardian_replay(store))
+            self.assertIn("WOULD_COMPACT", first[0]["states"])
+            self.assertIn("WOULD_ROTATE", first[0]["states"])
+            self.assertIn("RAPID_REFILL", first[0]["states"])
+            store.close()
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
