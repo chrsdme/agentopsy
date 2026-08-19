@@ -49,10 +49,11 @@ class SchemaMigrationTests(unittest.TestCase):
             state = Path(td) / "state"
             self.make_v1_state(state)
             store = asa.StateStore(str(state))
-            self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], "2")
+            self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], str(asa.SCHEMA_VERSION))
             self.assertEqual(store.file(Path("/tmp/old.jsonl"))["session_id"], "old-session")
             self.assertEqual(store.sessions("codex")[0]["project"], "project")
             self.assertEqual({row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'guardian_%'")}, {"guardian_events", "guardian_event_lanes"})
+            self.assertIsNotNone(store.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='telemetry_samples'").fetchone())
             store.close()
             reopened = asa.StateStore(str(state))
             self.assertEqual(reopened.sessions("codex")[0]["session_id"], "old-session")
@@ -225,13 +226,60 @@ class IncrementalServiceTests(unittest.TestCase):
                 unchanged = ingestor.scan()
                 self.assertEqual(unchanged.bytes_newly_parsed, 0)
                 self.assertEqual(unchanged.files_unchanged, 1)
-                # Known gap: classify_jsonl currently still opens+reads the
-                # unchanged file once per scan. This is an upper bound, not a
-                # required-to-stay-broken assertion: a fix that caches the
-                # classification should bring this to 0 without failing here.
-                self.assertLessEqual(len(calls), 1)
+                self.assertEqual(calls, [])
             finally:
                 asa.classify_jsonl = original
+            store.close()
+
+    def test_rolling_telemetry_is_bounded_and_reports_time_and_turn_windows(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            start = asa.dt.datetime(2026, 1, 1, tzinfo=asa.dt.timezone.utc)
+            with store.db:
+                for i in range(60):
+                    store.apply_record("codex", Path("/tmp/s.jsonl"), {"session_id": "s", "timestamp": (start + asa.dt.timedelta(minutes=i)).isoformat(), "input_tokens": i, "cached_input_tokens": i // 2, "output_tokens": i, "model_turns": 1, "peak_context_tokens": 100 + i, "peak_context_pct": .5 + i / 1000, "tool_result_chars": i, "read_key": f"file:{i % 3}", "command_key": f"cmd:{i % 2}", "content_key": f"result-{i % 2}", "compactions": int(i == 30)})
+            telemetry = store.rolling_telemetry("codex", "s", start + asa.dt.timedelta(minutes=59))
+            self.assertEqual(telemetry["last_10_turns"]["samples"], 10)
+            self.assertEqual(telemetry["last_10_turns"]["context_growth_tokens"], 9.0)
+            self.assertEqual(telemetry["last_5m"]["context_growth_tokens"], 5.0)
+            self.assertEqual(telemetry["compaction_snapshots"], 1)
+            self.assertEqual(telemetry["context_refill_after_compaction"], 29)
+            self.assertEqual(telemetry["last_10_turns"]["cache_reuse_change"], 4)
+            self.assertIsNone(telemetry["last_10_turns"]["advisor_subagent_amplification"])
+            row = store.db.execute("SELECT read_hash,command_hash,content_hash FROM telemetry_samples WHERE read_hash!='' OR command_hash!='' LIMIT 1").fetchone()
+            self.assertTrue(row["read_hash"] and row["command_hash"] and row["content_hash"])
+            for i in range(260):
+                store.apply_record("codex", Path("/tmp/s.jsonl"), {"session_id": "s", "timestamp": (start + asa.dt.timedelta(minutes=60 + i)).isoformat(), "tool_result_chars": 1})
+            self.assertEqual(store.db.execute("SELECT count(*) FROM telemetry_samples WHERE session_id='s'").fetchone()[0], 250)
+            store.close()
+
+    def test_unchanged_scale_scan_uses_cached_provider_without_opening_transcripts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir()
+            for i in range(40):
+                (root / f"rollout-{i}.jsonl").write_text(json.dumps({"type": "session_meta", "payload": {"session_id": f"s{i}"}}) + "\n")
+            store = asa.StateStore(str(state)); ingestor = asa.IncrementalIngestor(store, [(root, "test")])
+            ingestor.scan()
+            calls, original = [], asa.classify_jsonl
+            asa.classify_jsonl = lambda path: calls.append(path) or original(path)
+            try:
+                metrics = ingestor.scan()
+            finally:
+                asa.classify_jsonl = original
+            self.assertEqual(calls, [])
+            self.assertEqual((metrics.files_unchanged, metrics.bytes_newly_parsed), (40, 0))
+            store.close()
+
+    def test_provider_cache_invalidates_on_parser_or_file_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir(); path = root / "rollout.jsonl"
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"session_id": "s"}}) + "\n")
+            store = asa.StateStore(str(state)); asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            self.assertEqual(store.cached_provider(path), "codex")
+            path.write_text(path.read_text() + "\n")
+            self.assertIsNone(store.cached_provider(path))
             store.close()
 
     def test_codex_response_item_id_is_not_a_session_id(self):

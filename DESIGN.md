@@ -172,3 +172,11 @@ facts; transcript bodies are never stored in SQLite.
 SQLite schema changes are applied as numbered, transactional migrations. A
 failed migration leaves the previous schema version intact, and opening an
 already-upgraded state database is idempotent.
+
+## v0.4 rolling telemetry
+
+The live store keeps a fixed, per-session ring of compact numeric telemetry and
+hashes only. It supports five- and fifteen-minute views plus ten-, twenty-,
+and fifty-turn views without retaining transcript payloads or unbounded event
+history. Provider classification is cached against file identity, size/offset,
+and parser version so unchanged service polls do not reopen transcript files.
