@@ -2909,6 +2909,18 @@ def stale_session_preflight(row: sqlite3.Row, now: Optional[dt.datetime] = None)
     return {"supported_interception": False, "idle_seconds": idle, "context_pct": pct or None, "cache_ratio": (int(row["cached_input_tokens"] or 0) / int(row["input_tokens"])) if int(row["input_tokens"] or 0) else None, "warning": warning, "message": "This session is already large and has been idle for a substantial period. Continuing may require previous context to be processed again. Consider compacting or starting fresh." if warning else "No stale-session preflight warning from observed local facts.", "note": "No provider cache-expiry claim is made."}
 
 
+DEFAULT_POLICY = {"version": 1, "notification": {"enabled": True, "minimum_severity": "medium", "cooldown_seconds": 900}}
+def policy_show(store: StateStore) -> dict[str, Any]:
+    row = store.db.execute("SELECT value FROM service_meta WHERE key='runtime_policy'").fetchone()
+    return json.loads(row[0]) if row else dict(DEFAULT_POLICY)
+def policy_import(store: StateStore, payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("notification"), dict): raise ValueError("Invalid policy schema/version")
+    if not isinstance(payload["notification"].get("enabled"), bool) or payload["notification"].get("minimum_severity") not in SEVERITY_ORDER: raise ValueError("Invalid notification policy")
+    store.db.execute("BEGIN IMMEDIATE")
+    try: store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('runtime_policy',?)", (json.dumps(payload, sort_keys=True),)); store.db.commit()
+    except Exception: store.db.rollback(); raise
+
+
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
@@ -2987,7 +2999,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy"}: return None
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -3026,6 +3038,20 @@ def live_cli(argv: list[str]) -> Optional[int]:
             row = store.db.execute("SELECT * FROM sessions WHERE provider=? AND session_id LIKE ?", (args.provider, args.session + "%")).fetchone()
             if not row: raise ValueError("No matching stored session for preflight")
             print(json.dumps(stale_session_preflight(row), indent=2)); return 0
+        finally: store.close()
+    if argv[0] == "policy":
+        parser = argparse.ArgumentParser(prog="agentopsy policy"); parser.add_argument("action", choices=["show", "export", "import", "reset"]); parser.add_argument("path", nargs="?"); parser.add_argument("--state-dir")
+        args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+        try:
+            if args.action == "show": print(json.dumps(policy_show(store), indent=2))
+            elif args.action == "export":
+                if not args.path: raise ValueError("policy export requires a path")
+                Path(args.path).write_text(json.dumps(policy_show(store), indent=2), encoding="utf-8")
+            elif args.action == "import":
+                if not args.path: raise ValueError("policy import requires a path")
+                policy_import(store, json.loads(Path(args.path).read_text(encoding="utf-8")))
+            else: store.db.execute("DELETE FROM service_meta WHERE key='runtime_policy'"); store.db.commit()
+            return 0
         finally: store.close()
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
     parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
@@ -3112,7 +3138,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy"}:
         try:
             return live_cli(argv)
         except SystemExit:
