@@ -114,6 +114,15 @@ class IncrementalServiceTests(unittest.TestCase):
         value = asa.ClaudeAdapter().extract_usage({"type": "assistant", "message": {"usage": {"iterations": [{"input_tokens": 1}, {"input_tokens": 2}]}}})
         self.assertEqual((value["model_turns"], value["input_tokens"]), (1, 3))
 
+    def test_health_event_cooldown_and_disabled_notifications(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            store.event("codex", "s", "high", "HIGH_CONTEXT", "high", {}, cooldown=3600)
+            store.event("codex", "s", "high", "HIGH_CONTEXT", "high", {}, cooldown=3600)
+            self.assertEqual(store.db.execute("select count(*) from health_events").fetchone()[0], 1)
+            self.assertFalse(asa.Notifier(False).enabled)
+            store.close()
+
     def test_malformed_claude_and_health_transition(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
