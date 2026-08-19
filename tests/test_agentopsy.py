@@ -100,6 +100,16 @@ class IncrementalServiceTests(unittest.TestCase):
         path = Path("rollout-real.jsonl")
         self.assertEqual(adapter.identify_session({"type": "response_item", "payload": {"id": "item-123"}}, path), path.stem)
 
+    def test_claude_streamed_assistant_records_are_deduplicated(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
+            row = {"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "sessionId": "c", "message": {"id": "m1", "usage": {"input_tokens": 2, "output_tokens": 1}, "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}}
+            p.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
+            store = asa.StateStore(str(Path(td) / "state")); asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            session = store.sessions("claude")[0]
+            self.assertEqual((session["model_turns"], session["input_tokens"], session["tool_calls"]), (1, 2, 1))
+            store.close()
+
     def test_malformed_claude_and_health_transition(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
