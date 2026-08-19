@@ -74,6 +74,35 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("CODEX_CONTEXT_CRITICAL", {d.code for d in s.defects})
 
 
+class IncrementalServiceTests(unittest.TestCase):
+    def test_incremental_append_partial_recovery_and_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir(); p = root / "rollout-a.jsonl"
+            first = {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta", "payload": {"session_id": "s1", "cwd": "/project"}}
+            p.write_text(json.dumps(first) + "\n")
+            store = asa.StateStore(str(state)); ingestor = asa.IncrementalIngestor(store, [(root, "test")])
+            one = ingestor.scan(); self.assertGreater(one.bytes_newly_parsed, 0)
+            two = ingestor.scan(); self.assertEqual(two.bytes_newly_parsed, 0); self.assertEqual(two.files_unchanged, 1)
+            appended = {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 9, "cached_input_tokens": 2, "output_tokens": 1}, "last_token_usage": {"total_tokens": 60}, "model_context_window": 100}}}
+            raw = json.dumps(appended); p.write_text(p.read_text() + raw[:20])
+            partial = ingestor.scan(); self.assertEqual(partial.parse_errors, 0); self.assertEqual(store.sessions()[0]["input_tokens"], 0)
+            p.write_text(p.read_text() + raw[20:] + "\n")
+            completed = ingestor.scan(); self.assertLess(completed.bytes_newly_parsed, p.stat().st_size); self.assertEqual(store.sessions()[0]["input_tokens"], 9)
+            p.unlink(); p.write_text(json.dumps(first) + "\n")
+            replaced = ingestor.scan(); self.assertEqual(replaced.files_rescanned, 1)
+            store.close()
+
+    def test_malformed_claude_and_health_transition(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
+            p.write_text('{broken}\n' + json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "sessionId": "c", "message": {"usage": {"input_tokens": 1, "cache_read_input_tokens": 210000}}}) + "\n")
+            store = asa.StateStore(str(Path(td) / "state")); result = asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            self.assertEqual(result.parse_errors, 1); row = store.sessions("claude")[0]
+            self.assertEqual(row["health_state"], "ROTATION_RECOMMENDED")
+            store.close()
+
+
 class SelectionAndOutputTests(unittest.TestCase):
     def make_summary(self, provider, sid, end, *, start="", turns=0, total=0, cached=0, input_tokens=0, output=0, peak_pct=0.0):
         return asa.SessionSummary(

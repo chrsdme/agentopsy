@@ -1979,6 +1979,200 @@ def export_selected(args: argparse.Namespace, sessions: list[SessionSummary], ro
     return notices
 
 
+def default_state_dir(value: Optional[str] = None) -> Path:
+    return Path(os.path.expanduser(value or os.environ.get("AGENTOPSY_STATE_DIR", "~/.local/state/agentopsy")))
+
+
+class StateStore:
+    """Transactional, local-only state. Raw transcript records are never stored."""
+    def __init__(self, state_dir: Optional[str] = None):
+        self.dir = default_state_dir(state_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / "agentopsy.db"
+        self.db = sqlite3.connect(self.path)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self._migrate()
+
+    def close(self) -> None: self.db.close()
+
+    def _migrate(self) -> None:
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            version = self.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()
+            if version and int(version[0]) > SCHEMA_VERSION:
+                raise RuntimeError("state database is newer than this Agentopsy version")
+            self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS files (
+              id INTEGER PRIMARY KEY, provider TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+              identity TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, mtime_ns INTEGER NOT NULL DEFAULT 0,
+              last_offset INTEGER NOT NULL DEFAULT 0, partial_line TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, parser_version INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'ok');
+            CREATE TABLE IF NOT EXISTS sessions (
+              session_id TEXT NOT NULL, provider TEXT NOT NULL, project TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+              started_at TEXT NOT NULL DEFAULT '', last_activity_at TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
+              model_turns INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, tool_result_chars INTEGER NOT NULL DEFAULT 0,
+              max_tool_result_chars INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_creation_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+              peak_context_tokens INTEGER NOT NULL DEFAULT 0, context_window_tokens INTEGER NOT NULL DEFAULT 0, peak_context_pct REAL NOT NULL DEFAULT 0,
+              compactions INTEGER NOT NULL DEFAULT 0, repeated_reads INTEGER NOT NULL DEFAULT 0, repeated_commands INTEGER NOT NULL DEFAULT 0,
+              malformed_records INTEGER NOT NULL DEFAULT 0, health_state TEXT NOT NULL DEFAULT 'HEALTHY', health_since TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(session_id, provider));
+            CREATE TABLE IF NOT EXISTS health_events (
+              id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL,
+              severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', resolved_at TEXT, UNIQUE(session_id, provider, code, resolved_at));
+            CREATE TABLE IF NOT EXISTS occurrences (
+              session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(session_id, provider, kind, key_hash));
+            """)
+            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('parser_version',?)", (str(PARSER_VERSION),))
+
+    def file(self, path: Path) -> Optional[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
+
+    def reset_file_session(self, row: sqlite3.Row) -> None:
+        if row["session_id"]:
+            self.db.execute("DELETE FROM sessions WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+            self.db.execute("DELETE FROM occurrences WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+
+    def upsert_file(self, *, provider: str, path: Path, identity: str, size: int, mtime_ns: int, offset: int, partial: str, session_id: str, status: str) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.db.execute("""INSERT INTO files(provider,path,identity,size,mtime_ns,last_offset,partial_line,session_id,first_seen,last_seen,parser_version,status)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET provider=excluded.provider,identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns,last_offset=excluded.last_offset,partial_line=excluded.partial_line,session_id=excluded.session_id,last_seen=excluded.last_seen,parser_version=excluded.parser_version,status=excluded.status""",
+            (provider, str(path), identity, size, mtime_ns, offset, partial, session_id, now, now, PARSER_VERSION, status))
+
+    def apply_record(self, provider: str, path: Path, data: dict[str, Any], malformed: bool = False) -> str:
+        sid = str(data.get("session_id") or path.stem)
+        ts = str(data.get("timestamp") or "")
+        row = self.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, provider)).fetchone()
+        if row is None:
+            self.db.execute("INSERT INTO sessions(session_id,provider,project,path,started_at,last_activity_at,health_since) VALUES(?,?,?,?,?,?,?)", (sid, provider, str(data.get("project") or ""), str(path), ts, ts, dt.datetime.now(dt.timezone.utc).isoformat()))
+        # Codex token snapshots are cumulative; append-only Claude values are additive.
+        cumulative = provider == "codex" and data.get("input_tokens") is not None
+        set_parts, args = [], []
+        for field in ("project", "model", "effort", "version"):
+            if data.get(field): set_parts.append(f"{field}=?"); args.append(str(data[field]))
+        if ts: set_parts.append("last_activity_at=?"); args.append(ts)
+        for field in ("peak_context_tokens", "context_window_tokens", "peak_context_pct", "max_tool_result_chars"):
+            val = data.get(field)
+            if val not in (None, "", 0, 0.0): set_parts.append(f"{field}=MAX({field},?)"); args.append(val)
+        for field in ("model_turns", "tool_calls", "tool_result_chars", "cache_creation_tokens", "compactions"):
+            val = safe_int(data.get(field));
+            if val: set_parts.append(f"{field}={field}+?"); args.append(val)
+        for field in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens"):
+            val = data.get(field)
+            if val is not None:
+                set_parts.append(f"{field}=?" if cumulative else f"{field}={field}+?"); args.append(safe_int(val))
+        if malformed: set_parts.append("malformed_records=malformed_records+1")
+        if set_parts:
+            args.extend([sid, provider]); self.db.execute(f"UPDATE sessions SET {','.join(set_parts)} WHERE session_id=? AND provider=?", args)
+        for kind, key in (("read", data.get("read_key")), ("command", data.get("command_key"))):
+            if key:
+                digest = sha1_text(str(key)); self.db.execute("INSERT INTO occurrences(session_id,provider,kind,key_hash,count) VALUES(?,?,?,?,1) ON CONFLICT(session_id,provider,kind,key_hash) DO UPDATE SET count=count+1", (sid, provider, kind, digest))
+                col = "repeated_reads" if kind == "read" else "repeated_commands"
+                self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE session_id=? AND provider=? AND kind=?) WHERE session_id=? AND provider=?", (sid, provider, kind, sid, provider))
+        return sid
+
+    def sessions(self, provider: str = "all", session: str = "") -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM sessions", []
+        where = []
+        if provider != "all": where.append("provider=?"); args.append(provider)
+        if session: where.append("session_id LIKE ?"); args.append(session + "%")
+        if where: sql += " WHERE " + " AND ".join(where)
+        return self.db.execute(sql + " ORDER BY last_activity_at DESC", args).fetchall()
+
+    def event(self, provider: str, sid: str, severity: str, code: str, message: str, evidence: dict[str, Any], cooldown: int = 900) -> None:
+        now = dt.datetime.now(dt.timezone.utc); previous = self.db.execute("SELECT timestamp FROM health_events WHERE session_id=? AND provider=? AND code=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (sid, provider, code)).fetchone()
+        if previous and (now - iso_to_dt(previous[0])).total_seconds() < cooldown: return
+        self.db.execute("INSERT INTO health_events(timestamp,session_id,provider,severity,code,message,evidence) VALUES(?,?,?,?,?,?,?)", (now.isoformat(), sid, provider, severity, code, message, json.dumps(evidence, sort_keys=True)))
+
+
+@dataclasses.dataclass(frozen=True)
+class HealthPolicy:
+    watch_pct: float = 0.50
+    checkpoint_pct: float = 0.65
+    rotation_pct: float = 0.80
+    recovery_pct: float = 0.45
+    cooldown_seconds: int = 900
+
+    @classmethod
+    def from_environment(cls) -> "HealthPolicy":
+        raw = os.environ.get("AGENTOPSY_HEALTH_POLICY", "")
+        if not raw: return cls()
+        try: return cls(**{k: v for k, v in json.loads(raw).items() if k in cls.__dataclass_fields__})
+        except (ValueError, TypeError, json.JSONDecodeError): raise ValueError("AGENTOPSY_HEALTH_POLICY must be a JSON object with health thresholds")
+
+
+def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, list[tuple[str, str, str, dict[str, Any]]]]:
+    pct = float(row["peak_context_pct"] or 0.0)
+    if row["provider"] == "claude" and not pct:
+        # Claude does not reliably report a window denominator; use a documented provisional 250k reference only for policy bands.
+        pct = min(1.0, int(row["peak_context_tokens"] or 0) / 250_000)
+    previous = row["health_state"]
+    if pct >= policy.rotation_pct: state = "ROTATION_RECOMMENDED"
+    elif pct >= policy.checkpoint_pct: state = "CHECKPOINT_RECOMMENDED"
+    elif pct >= policy.watch_pct: state = "WATCH"
+    elif pct < policy.recovery_pct or previous == "HEALTHY": state = "HEALTHY"
+    else: state = previous  # hysteresis retains the existing band between recovery and entry thresholds.
+    events = []
+    if state != "HEALTHY": events.append(("high" if state == "ROTATION_RECOMMENDED" else "medium", "HIGH_CONTEXT" if state != "ROTATION_RECOMMENDED" else "EXTREME_CONTEXT", f"Context occupancy proxy is {pct*100:.1f}% ({state.lower().replace('_', ' ')}).", {"context_pct": round(pct * 100, 1)}))
+    if int(row["max_tool_result_chars"] or 0) // 4 >= GIANT_RESULT_TOKENS: events.append(("high", "GIANT_TOOL_RESULT", "A large tool result was observed.", {"tokens_proxy": int(row["max_tool_result_chars"]) // 4}))
+    if int(row["repeated_reads"] or 0) >= 4: events.append(("medium", "REPEATED_READ", "A read target has repeated.", {"repeats": row["repeated_reads"]}))
+    if int(row["repeated_commands"] or 0) >= 5: events.append(("medium", "COMMAND_REPETITION", "A command has repeated.", {"repeats": row["repeated_commands"]}))
+    if int(row["compactions"] or 0) >= 3: events.append(("medium", "COMPACTION_THRASH", "Repeated compactions were observed.", {"compactions": row["compactions"]}))
+    return state, events
+
+
+@dataclasses.dataclass
+class IngestionMetrics:
+    bytes_examined: int = 0; bytes_newly_parsed: int = 0; files_unchanged: int = 0; files_advanced: int = 0; files_rescanned: int = 0; parse_errors: int = 0
+
+
+class IncrementalIngestor:
+    def __init__(self, store: StateStore, roots: Optional[list[tuple[Path, str]]] = None, provider: str = "all"):
+        self.store, self.roots, self.provider = store, roots or discover_live_roots(), provider
+
+    def scan(self) -> IngestionMetrics:
+        metrics = IngestionMetrics()
+        candidates = collect_candidates(self.roots, self.provider)
+        with self.store.db:
+            for candidate in candidates: self._ingest(candidate, metrics)
+            self.store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('last_successful_scan',?)", (dt.datetime.now(dt.timezone.utc).isoformat(),))
+        return metrics
+
+    def _ingest(self, candidate: Candidate, metrics: IngestionMetrics) -> None:
+        path = candidate.path; stat = path.stat(); identity = f"{stat.st_dev}:{stat.st_ino}"; old = self.store.file(path)
+        reset = old is not None and (old["identity"] != identity or stat.st_size < old["last_offset"])
+        if old and not reset and stat.st_size == old["size"]:
+            metrics.files_unchanged += 1; self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=old["last_offset"],partial=old["partial_line"],session_id=old["session_id"],status="ok"); return
+        if reset:
+            self.store.reset_file_session(old); offset, partial = 0, ""; metrics.files_rescanned += 1
+        else: offset, partial = (int(old["last_offset"]), str(old["partial_line"])) if old else (0, "")
+        with path.open("rb") as f:
+            f.seek(offset); chunk = f.read()
+        metrics.bytes_examined += len(chunk); metrics.bytes_newly_parsed += len(chunk)
+        text = partial + chunk.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True); trailing = ""
+        if lines and not lines[-1].endswith(("\n", "\r")): trailing = lines.pop()
+        adapter = ADAPTERS[candidate.provider]; sid = ""
+        for line in lines:
+            if not line.strip(): continue
+            try: sid = self.store.apply_record(candidate.provider, path, adapter.parse_record(json.loads(line), path))
+            except json.JSONDecodeError:
+                metrics.parse_errors += 1; sid = self.store.apply_record(candidate.provider, path, {"session_id": sid or path.stem}, malformed=True)
+        self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=sid or (old["session_id"] if old else path.stem),status="ok")
+        metrics.files_advanced += 1
+        if sid:
+            row = self.store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, candidate.provider)).fetchone()
+            if row:
+                state, events = evaluate_live_health(row, HealthPolicy.from_environment())
+                self.store.db.execute("UPDATE sessions SET health_state=? WHERE session_id=? AND provider=?", (state, sid, candidate.provider))
+                for severity, code, message, evidence in events: self.store.event(candidate.provider, sid, severity, code, message, evidence)
+
+
 def run_watch(args: argparse.Namespace) -> int:
     interval = args.watch
     if interval <= 0:
