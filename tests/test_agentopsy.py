@@ -259,7 +259,33 @@ class PolicyTests(unittest.TestCase):
             self.assertFalse(asa.policy_show(store)["notification"]["enabled"])
             with self.assertRaises(ValueError):
                 asa.policy_import(store, {"version": 2, "notification": {}})
+            with self.assertRaises(ValueError):
+                asa.policy_import(store, {"version": 1, "notification": {"enabled": True, "minimum_severity": "medium", "cooldown_seconds": -1}})
             self.assertFalse(asa.policy_show(store)["notification"]["enabled"])
+            store.close()
+
+    def test_persisted_cooldown_changes_live_event_cadence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir(); path = root / "rollout.jsonl"
+            now = asa.dt.datetime.now(asa.dt.timezone.utc).isoformat()
+            meta = {"type": "session_meta", "timestamp": now, "payload": {"session_id": "cooldown"}}
+            def token(total): return {"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": total, "total_tokens": total}, "last_token_usage": {"total_tokens": total}, "model_context_window": 100}}}
+            path.write_text("\n".join(json.dumps(item) for item in (meta, token(90))) + "\n")
+            store = asa.StateStore(str(state))
+            asa.policy_import(store, {"version": 1, "notification": {"enabled": True, "minimum_severity": "medium", "cooldown_seconds": 3600}})
+            store.close()
+            asa.service_once(str(state), roots=[(root, "test")], notify=False)
+            path.write_text(path.read_text() + json.dumps(token(91)) + "\n")
+            asa.service_once(str(state), roots=[(root, "test")], notify=False)
+            store = asa.StateStore(str(state))
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE session_id='cooldown' AND code='EXTREME_CONTEXT'").fetchone()[0], 1)
+            asa.policy_import(store, {"version": 1, "notification": {"enabled": True, "minimum_severity": "medium", "cooldown_seconds": 0}})
+            store.close()
+            path.write_text(path.read_text() + json.dumps(token(92)) + "\n")
+            asa.service_once(str(state), roots=[(root, "test")], notify=False)
+            store = asa.StateStore(str(state))
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE session_id='cooldown' AND code='EXTREME_CONTEXT'").fetchone()[0], 2)
             store.close()
 
 
