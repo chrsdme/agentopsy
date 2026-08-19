@@ -206,6 +206,14 @@ updates active state, preventing partial policy changes.
 and emits deterministic severity/`WOULD_*` timeline states. It is read-only and
 does not execute any provider control action.
 
+## v0.4 control modes
+
+Control defaults to `observe`; `compact` and `full` are only decision modes.
+They fail closed unless exact provider/session/harness mapping, a positively
+supported capability, safe idle boundary, healthy integrity state, and no
+critical operation are all verified. A control decision itself performs no
+provider action.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

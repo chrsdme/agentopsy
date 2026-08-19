@@ -276,6 +276,17 @@ class ReplayTests(unittest.TestCase):
             store.close()
 
 
+class ControlModeTests(unittest.TestCase):
+    def test_observe_and_missing_safety_preconditions_never_act(self):
+        observe = asa.evaluate_control_request(asa.AutoActMode.OBSERVE, exact_provider=True, exact_session=True, exact_harness=True, capability=asa.ProviderCapability.EXACT, safe_idle_boundary=True, active_critical_operation=False, integrity_ok=True)
+        self.assertFalse(observe.allowed)
+        blocked = asa.evaluate_control_request(asa.AutoActMode.COMPACT, exact_provider=True, exact_session=True, exact_harness=True, capability=asa.ProviderCapability.UNAVAILABLE, safe_idle_boundary=True, active_critical_operation=False, integrity_ok=True)
+        self.assertFalse(blocked.allowed)
+        permitted = asa.evaluate_control_request(asa.AutoActMode.COMPACT, exact_provider=True, exact_session=True, exact_harness=True, capability=asa.ProviderCapability.EXACT, safe_idle_boundary=True, active_critical_operation=False, integrity_ok=True)
+        self.assertTrue(permitted.allowed)
+        self.assertEqual(permitted.action, "compact")
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
