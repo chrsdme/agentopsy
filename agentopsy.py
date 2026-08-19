@@ -360,13 +360,14 @@ class ClaudeAdapter(ProviderAdapter):
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
         event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
-                 "compactions": 0, "read_key": "", "command_key": ""}
+                 "compactions": 0, "read_key": "", "command_key": "", "tool_call_items": [], "tool_result_items": []}
         msg = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = msg.get("content")
         if record.get("type") == "assistant" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     event["tool_calls"] += 1
+                    event["tool_call_items"].append(str(block.get("id") or ""))
                     name, inp = str(block.get("name") or ""), block.get("input") or {}
                     if name == "Read": event["read_key"] = str(inp.get("file_path") or inp.get("path") or "")
                     if name == "Bash": event["command_key"] = normalise_command(str(inp.get("command") or ""))
@@ -375,6 +376,7 @@ class ClaudeAdapter(ProviderAdapter):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     chars = content_len(block.get("content")); event["tool_result_chars"] += chars
                     event["max_tool_result_chars"] = max(event["max_tool_result_chars"], chars)
+                    event["tool_result_items"].append((str(block.get("tool_use_id") or ""), chars))
         return event
 
     def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -383,6 +385,8 @@ class ClaudeAdapter(ProviderAdapter):
         msg = record.get("message") if isinstance(record.get("message"), dict) else {}
         result.update({"project": str(record.get("cwd") or ""), "model": str(msg.get("model") or ""),
                        "effort": str(record.get("effort") or ""), "version": str(record.get("version") or "")})
+        if record.get("type") == "assistant":
+            result["usage_key"] = str(msg.get("id") or record.get("requestId") or record.get("uuid") or "")
         return result
 
 
@@ -2030,6 +2034,9 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS occurrences (
               session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(session_id, provider, kind, key_hash));
+            CREATE TABLE IF NOT EXISTS record_dedup (
+              session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL,
+              PRIMARY KEY(session_id, provider, kind, key_hash));
             """)
             self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
             self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('parser_version',?)", (str(PARSER_VERSION),))
@@ -2041,6 +2048,7 @@ class StateStore:
         if row["session_id"]:
             self.db.execute("DELETE FROM sessions WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
             self.db.execute("DELETE FROM occurrences WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+            self.db.execute("DELETE FROM record_dedup WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
 
     def upsert_file(self, *, provider: str, path: Path, identity: str, size: int, mtime_ns: int, offset: int, partial: str, session_id: str, status: str) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2059,7 +2067,9 @@ class StateStore:
         set_parts, args = [], []
         for field in ("project", "model", "effort", "version"):
             if data.get(field): set_parts.append(f"{field}=?"); args.append(str(data[field]))
-        if ts: set_parts.append("last_activity_at=?"); args.append(ts)
+        if ts:
+            set_parts.append("last_activity_at=?"); args.append(ts)
+            set_parts.append("started_at=CASE WHEN started_at='' THEN ? ELSE started_at END"); args.append(ts)
         for field in ("peak_context_tokens", "context_window_tokens", "peak_context_pct", "max_tool_result_chars"):
             val = data.get(field)
             if val not in (None, "", 0, 0.0): set_parts.append(f"{field}=MAX({field},?)"); args.append(val)
@@ -2079,6 +2089,11 @@ class StateStore:
                 col = "repeated_reads" if kind == "read" else "repeated_commands"
                 self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE session_id=? AND provider=? AND kind=?) WHERE session_id=? AND provider=?", (sid, provider, kind, sid, provider))
         return sid
+
+    def mark_unique(self, provider: str, sid: str, kind: str, key: str) -> bool:
+        if not key: return True
+        cur = self.db.execute("INSERT OR IGNORE INTO record_dedup(session_id,provider,kind,key_hash) VALUES(?,?,?,?)", (sid, provider, kind, sha1_text(key)))
+        return cur.rowcount == 1
 
     def sessions(self, provider: str = "all", session: str = "") -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM sessions", []
@@ -2171,6 +2186,20 @@ class IncrementalIngestor:
                 # rather than falling back to a filename-derived placeholder.
                 if sid and str(data.get("session_id") or "") == path.stem:
                     data["session_id"] = sid
+                if candidate.provider == "claude":
+                    target_sid = str(data.get("session_id") or sid or path.stem)
+                    usage_key = str(data.pop("usage_key", ""))
+                    if usage_key and not self.store.mark_unique(candidate.provider, target_sid, "assistant_usage", usage_key):
+                        for field in ("input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens", "reasoning_tokens", "model_turns", "peak_context_tokens"):
+                            data[field] = 0
+                    calls = data.pop("tool_call_items", [])
+                    if calls:
+                        data["tool_calls"] = sum(self.store.mark_unique(candidate.provider, target_sid, "tool_call", str(item)) for item in calls)
+                    results = data.pop("tool_result_items", [])
+                    if results:
+                        fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item))]
+                        data["tool_result_chars"] = sum(fresh)
+                        data["max_tool_result_chars"] = max(fresh, default=0)
                 sid = self.store.apply_record(candidate.provider, path, data)
             except json.JSONDecodeError:
                 metrics.parse_errors += 1
