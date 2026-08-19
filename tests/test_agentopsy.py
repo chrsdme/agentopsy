@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sqlite3
 import contextlib
 import io
@@ -286,6 +287,61 @@ class ControlModeTests(unittest.TestCase):
         self.assertTrue(permitted.allowed)
         self.assertEqual(permitted.action, "compact")
 
+    def test_service_cli_routes_each_auto_act_mode_to_live_fail_closed_control(self):
+        seen_modes = []
+        original = asa.evaluate_control_request
+
+        def tracked(mode, **kwargs):
+            seen_modes.append(mode)
+            return original(mode, **kwargs)
+
+        asa.evaluate_control_request = tracked
+        try:
+            for mode in asa.AutoActMode:
+                with tempfile.TemporaryDirectory() as td:
+                    root, state = Path(td) / "sessions", Path(td) / "state"
+                    root.mkdir()
+                    now = asa.dt.datetime.now(asa.dt.timezone.utc).isoformat()
+                    records = [
+                        {"type": "session_meta", "timestamp": now, "payload": {"session_id": f"{mode.value}-session"}},
+                        {"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 90, "total_tokens": 90}, "last_token_usage": {"total_tokens": 90}, "model_context_window": 100}}},
+                    ]
+                    (root / f"rollout-{mode.value}.jsonl").write_text("\n".join(json.dumps(item) for item in records) + "\n")
+                    output = io.StringIO()
+                    previous_codex_home = os.environ.get("CODEX_HOME")
+                    previous_claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
+                    os.environ["CODEX_HOME"] = td
+                    os.environ["CLAUDE_CONFIG_DIR"] = td
+                    try:
+                        with contextlib.redirect_stdout(output):
+                            self.assertEqual(asa.main(["service", "once", "--state-dir", str(state), "--no-notify", "--auto-act", mode.value]), 0)
+                    finally:
+                        if previous_codex_home is None: os.environ.pop("CODEX_HOME", None)
+                        else: os.environ["CODEX_HOME"] = previous_codex_home
+                        if previous_claude_config is None: os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                        else: os.environ["CLAUDE_CONFIG_DIR"] = previous_claude_config
+                    self.assertIn("'control_evaluations': 1", output.getvalue())
+                    self.assertIn("'control_blocked': 1", output.getvalue())
+        finally:
+            asa.evaluate_control_request = original
+        self.assertEqual(seen_modes, list(asa.AutoActMode))
+
+    def test_live_integrity_uncertainty_reaches_fail_safe_without_provider_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir()
+            now = asa.dt.datetime.now(asa.dt.timezone.utc).isoformat()
+            records = [
+                {"type": "session_meta", "timestamp": now, "payload": {"session_id": "unsafe"}},
+                {"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 90, "total_tokens": 90}, "last_token_usage": {"total_tokens": 90}, "model_context_window": 100}}},
+            ]
+            (root / "rollout-unsafe.jsonl").write_text("\n".join(json.dumps(item) for item in records) + "\n{malformed}\n")
+            metrics = asa.service_once(str(state), roots=[(root, "test")], notify=False, auto_act=asa.AutoActMode.FULL)
+            self.assertEqual((metrics.control_evaluations, metrics.control_blocked, metrics.control_fail_safes), (1, 1, 1))
+            store = asa.StateStore(str(state))
+            self.assertEqual(store.db.execute("SELECT code FROM health_events WHERE session_id='unsafe' AND provider='codex' ORDER BY id DESC LIMIT 1").fetchone()[0], "CONTROL_FAIL_SAFE")
+            store.close()
+
 
 class ControlAdapterTests(unittest.TestCase):
     def test_unestablished_adapters_are_explicitly_unavailable(self):
@@ -302,6 +358,17 @@ class CompactionTests(unittest.TestCase):
         refill = asa.classify_compaction(100, 30, 95, 0, 1)
         self.assertEqual(refill["outcome"], "RAPID_REFILL")
         self.assertEqual(asa.classify_compaction(100, 70, None, 3, 5)["outcome"], "THRASH")
+
+    def test_missing_before_sample_is_unknown_not_ineffective(self):
+        self.assertEqual(asa.classify_compaction(0, 0, None, 0, 1)["outcome"], "UNKNOWN")
+
+    def test_repeated_effective_compactions_are_currently_classified_as_thrash(self):
+        # Documents current behaviour: compaction_count >= 5 is checked before
+        # the reduction ratio, so five individually-EFFECTIVE compactions
+        # (90% reduction each) are classified as THRASH by count alone. This
+        # is a product-semantics question (frequency vs. effectiveness), not
+        # fixed here — see the v0.4 review findings.
+        self.assertEqual(asa.classify_compaction(1000, 100, 150, 0, 5)["outcome"], "THRASH")
 
 
 class RotationTests(unittest.TestCase):
