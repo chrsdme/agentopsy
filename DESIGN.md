@@ -214,6 +214,12 @@ supported capability, safe idle boundary, healthy integrity state, and no
 critical operation are all verified. A control decision itself performs no
 provider action.
 
+## v0.4 control adapters
+
+Provider/harness control is isolated behind adapter capabilities for Claude,
+Codex, and Herdr. Unverified capabilities are explicitly unavailable; the core
+never assumes a slash command or sends blind PTY input.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

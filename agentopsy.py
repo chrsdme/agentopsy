@@ -101,6 +101,23 @@ class ControlDecision:
     action: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ControlAdapter:
+    provider: str
+    harness: str
+    capabilities: dict[str, ProviderCapability]
+
+    def capability(self, action: str) -> ProviderCapability:
+        return self.capabilities.get(action, ProviderCapability.UNAVAILABLE)
+
+
+def control_adapters() -> tuple[ControlAdapter, ...]:
+    """No blind PTY typing: capabilities are unavailable until positively established."""
+    actions = ("compact", "new_session", "clear", "identify_active_session", "safe_idle", "verify_acceptance")
+    unavailable = {action: ProviderCapability.UNAVAILABLE for action in actions}
+    return (ControlAdapter("claude", "native", unavailable), ControlAdapter("codex", "native", unavailable), ControlAdapter("herdr", "integration", unavailable))
+
+
 def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_session: bool, exact_harness: bool, capability: ProviderCapability, safe_idle_boundary: bool, active_critical_operation: bool, integrity_ok: bool) -> ControlDecision:
     """Control is opt-in and capability gated; this function never performs it."""
     if mode == AutoActMode.OBSERVE: return ControlDecision(mode, False, "Observe mode only advises; it never alters a provider session.")
