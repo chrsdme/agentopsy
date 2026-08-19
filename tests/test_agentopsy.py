@@ -350,6 +350,22 @@ class ControlAdapterTests(unittest.TestCase):
         self.assertEqual(adapters["claude"].capability("safe_idle"), asa.ProviderCapability.UNAVAILABLE)
         self.assertEqual(adapters["herdr"].harness, "integration")
 
+    def test_live_control_stays_blocked_without_native_session_mapping(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            store.db.execute("INSERT INTO sessions(session_id,provider,health_state) VALUES(?,?,?)", ("transcript-only", "codex", "ROTATION_RECOMMENDED"))
+            store.db.commit()
+            original = asa.control_adapters
+            asa.control_adapters = lambda: (asa.ControlAdapter("codex", "native", {"compact": asa.ProviderCapability.EXACT}),)
+            try:
+                row = store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", ("transcript-only", "codex")).fetchone()
+                decision = asa.control_decision_for_live_session(row, asa.AutoActMode.COMPACT)
+            finally:
+                asa.control_adapters = original
+                store.close()
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.action, None)
+
 
 class CompactionTests(unittest.TestCase):
     def test_observed_compaction_outcomes_are_explainable(self):
