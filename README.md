@@ -409,6 +409,8 @@ agentopsy --project my-project --since 7d --summary
   penalty, and severe context conditions retain an explicit severity floor.
 - accessible severity bands and compound behavioural-risk policy; use
   `--color auto`, `--color always`, `--color never`, or `NO_COLOR`.
+- explainable causal-risk promotions, qualitative trend, contributing lanes,
+  and predicted next risk state without speculative token forecasts.
 
 ## Claude Code
 

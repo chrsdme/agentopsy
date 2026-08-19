@@ -174,6 +174,27 @@ class SeverityPolicyTests(unittest.TestCase):
         self.assertEqual(asa.build_parser().parse_args(["--no-color"]).color, "never")
 
 
+class CausalRiskTests(unittest.TestCase):
+    def test_light_indicators_promote_with_explainable_causal_path(self):
+        summary = asa.SessionSummary("codex", "risk", "/tmp/a", "test", peak_context_pct=.60)
+        summary.repeated_reads = [("path:range", 2)]
+        asa.finalise_grade(summary)
+        risk = summary.causal_risk
+        self.assertEqual(risk.current_severity, asa.Severity.LIGHT)
+        self.assertEqual(risk.effective_severity, asa.Severity.HIGH)
+        self.assertEqual(risk.trend, "DETERIORATING")
+        self.assertEqual(risk.predicted_next_risk_state, asa.Severity.HIGH)
+        self.assertIn(asa.ImpactLane.REPETITION, risk.contributing_lanes)
+        self.assertTrue(risk.explanations)
+
+    def test_compaction_refetch_path_is_critical_and_serialised(self):
+        summary = asa.SessionSummary("codex", "risk", "/tmp/a", "test", compactions=1, post_compact_repeats=2)
+        asa.finalise_grade(summary)
+        self.assertEqual(summary.causal_risk.effective_severity, asa.Severity.CRITICAL)
+        self.assertEqual(summary.causal_risk.trend, "RAPIDLY_DETERIORATING")
+        self.assertEqual(summary.to_dict()["causal_risk"]["predicted_next_risk_state"], "CRITICAL")
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
