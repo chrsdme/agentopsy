@@ -140,6 +140,7 @@ class SignalDefinition:
 SIGNAL_REGISTRY_VERSION = 1
 MARKER_SCORING_VERSION = 1
 MARKER_SCORING_STATUS = "provisional"
+BEHAVIORAL_SEVERITY_POLICY_VERSION = 1
 
 
 def _signal(code: str, title: str, lanes: tuple[ImpactLane, ...], measurement: str, claude: ProviderCapability, codex: ProviderCapability, *, impact: str = "Use the measured trend to prioritise a bounded corrective step.", corrective: str = "Reduce the contributing work and re-measure before escalating.", alternative: str = "Record the observation and continue with a smaller, focused next step.", extension: Optional[ExtensionLoadMode] = None) -> SignalDefinition:
@@ -240,11 +241,60 @@ ANSI = {
     "cyan": "\033[36m",
     "green": "\033[32m",
     "magenta": "\033[35m",
+    "orange": "\033[93m",
+    "strong_red": "\033[1;31m",
+    "reverse_red": "\033[1;7;31m",
 }
 
 
 def c(text: str, colour: str, enabled: bool) -> str:
     return f"{ANSI[colour]}{text}{ANSI['reset']}" if enabled else text
+
+
+def colour_enabled(mode: str, stream: Any = sys.stdout, environ: Optional[dict[str, str]] = None) -> bool:
+    """Respect accessible explicit colour controls and the NO_COLOR convention."""
+    env = os.environ if environ is None else environ
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return bool(getattr(stream, "isatty", lambda: False)()) and not bool(env.get("NO_COLOR"))
+
+
+def context_severity(context_pct: Optional[float]) -> Severity:
+    """Factory v0.4 context bands; percentage is a 0..1 fraction."""
+    pct = max(0.0, min(1.0, float(context_pct or 0.0)))
+    if pct > 0.90: return Severity.EMERGENCY
+    if pct > 0.85: return Severity.SUPER_CRITICAL
+    if pct > 0.75: return Severity.CRITICAL
+    if pct > 0.65: return Severity.HIGH
+    if pct > 0.55: return Severity.LIGHT
+    return Severity.SAFE
+
+
+def context_status_text(severity: Severity) -> str:
+    return "SESSION HEALTHY" if severity == Severity.SAFE else f"CONTEXT {severity.value}"
+
+
+def behavioural_severity(metrics: dict[str, Optional[float]]) -> dict[str, Severity]:
+    """Versioned provisional ladders; related pressure signals compound together."""
+    ladders = {
+        "context_velocity": (0.01, 0.03, 0.06, 0.10), "high_context_dwell": (60, 300, 900, 1800),
+        "individual_tool_output": (4_000, 10_000, 25_000, 50_000), "rolling_tool_output": (25_000, 100_000, 250_000, 500_000),
+        "repeated_reads": (2, 4, 8, 12), "repeated_path_range_reads": (2, 4, 8, 12),
+        "command_repetition": (3, 5, 10, 20), "cache_reuse_degradation": (0.10, 0.25, 0.50, 0.75),
+        "instruction_overhead": (25_000, 50_000, 100_000, 200_000), "advisor_subagent_amplification": (2, 3, 5, 8),
+        "stale_resume": (1, 24, 72, 168), "compaction_health": (1, 3, 5, 8),
+    }
+    levels = (Severity.LIGHT, Severity.HIGH, Severity.CRITICAL, Severity.SUPER_CRITICAL)
+    result = {name: next((level for threshold, level in reversed(tuple(zip(thresholds, levels))) if float(metrics.get(name) or 0) >= threshold), Severity.SAFE) for name, thresholds in ladders.items()}
+    # A pair of related severe observations predicts more than either alone.
+    pressure = (result["context_velocity"], result["high_context_dwell"], result["rolling_tool_output"])
+    if sum(level in {Severity.CRITICAL, Severity.SUPER_CRITICAL, Severity.EMERGENCY} for level in pressure) >= 2:
+        result["compound_context_pressure"] = Severity.EMERGENCY
+    else:
+        result["compound_context_pressure"] = max(pressure, key=lambda level: _SEVERITY_RANK[level])
+    return result
 
 
 def iso_to_dt(value: Any) -> Optional[dt.datetime]:
@@ -2575,6 +2625,18 @@ def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, l
     if int(row["repeated_reads"] or 0) >= 4: events.append(("medium", "REPEATED_READ", "A read target has repeated.", {"repeats": row["repeated_reads"]}))
     if int(row["repeated_commands"] or 0) >= 5: events.append(("medium", "COMMAND_REPETITION", "A command has repeated.", {"repeats": row["repeated_commands"]}))
     if int(row["compactions"] or 0) >= 3: events.append(("medium", "COMPACTION_THRASH", "Repeated compactions were observed.", {"compactions": row["compactions"]}))
+    behavioural = behavioural_severity({
+        "individual_tool_output": int(row["max_tool_result_chars"] or 0) / 4,
+        "rolling_tool_output": int(row["tool_result_chars"] or 0) / 4,
+        "repeated_reads": int(row["repeated_reads"] or 0),
+        "repeated_path_range_reads": int(row["repeated_reads"] or 0),
+        "command_repetition": int(row["repeated_commands"] or 0),
+        "instruction_overhead": 0, "advisor_subagent_amplification": 0,
+        "stale_resume": 0, "compaction_health": int(row["compactions"] or 0),
+    })
+    compound = behavioural["compound_context_pressure"]
+    if compound == Severity.EMERGENCY:
+        events.append(("critical", "COMPOUND_CONTEXT_PRESSURE", "Multiple context-pressure signals compound into an emergency risk.", {"policy_version": BEHAVIORAL_SEVERITY_POLICY_VERSION}))
     return state, events
 
 
@@ -2914,7 +2976,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--details", type=int, default=10, help="Detailed sessions in the default terminal/full Markdown report (default: 10).")
     p.add_argument("--all", action="store_true", help="Show every selected session in the default terminal ranking.")
     p.add_argument("--include-subagents", action="store_true", help="List Claude subagent transcripts independently as well as parent aggregates.")
-    p.add_argument("--no-color", action="store_true", help="Disable ANSI colours in terminal output.")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="ANSI colour mode (default: auto; NO_COLOR disables auto).")
+    p.add_argument("--no-color", dest="color", action="store_const", const="never", help="Compatibility alias for --color never.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--watch", type=int, metavar="SECONDS", default=0, help="Legacy polling mode: rescan live stores on this interval and maintain latest.md/latest.json. Intended to be replaced by incremental service mode.")
     p.add_argument("--report-dir", help="Directory for --watch reports (default ~/.local/state/agentopsy).")
@@ -2947,7 +3010,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not sessions:
             raise RuntimeError("No sessions remain after applying the requested filters/selection.")
 
-        colour = sys.stdout.isatty() and not args.no_color
+        colour = colour_enabled(args.color)
         if args.sessions:
             print(render_session_list(sessions))
         elif args.summary:

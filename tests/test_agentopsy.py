@@ -150,6 +150,30 @@ class MarkerScoringTests(unittest.TestCase):
         self.assertIn("Marker scorecard", markdown)
 
 
+class SeverityPolicyTests(unittest.TestCase):
+    def test_factory_context_bands_and_accessible_status(self):
+        cases = [(0.55, asa.Severity.SAFE), (.551, asa.Severity.LIGHT), (.651, asa.Severity.HIGH), (.751, asa.Severity.CRITICAL), (.851, asa.Severity.SUPER_CRITICAL), (.901, asa.Severity.EMERGENCY)]
+        for pct, expected in cases:
+            self.assertEqual(asa.context_severity(pct), expected)
+        self.assertEqual(asa.context_status_text(asa.Severity.SAFE), "SESSION HEALTHY")
+        self.assertIn("EMERGENCY", asa.context_status_text(asa.Severity.EMERGENCY))
+
+    def test_behavioural_policy_compounds_related_context_risks(self):
+        severities = asa.behavioural_severity({"context_velocity": .07, "high_context_dwell": 1000, "rolling_tool_output": 300_000})
+        self.assertEqual(severities["context_velocity"], asa.Severity.CRITICAL)
+        self.assertEqual(severities["compound_context_pressure"], asa.Severity.EMERGENCY)
+        self.assertEqual(asa.behavioural_severity({})["command_repetition"], asa.Severity.SAFE)
+
+    def test_colour_modes_and_no_color(self):
+        class Tty:
+            def isatty(self): return True
+        self.assertTrue(asa.colour_enabled("always", Tty(), {"NO_COLOR": "1"}))
+        self.assertFalse(asa.colour_enabled("auto", Tty(), {"NO_COLOR": "1"}))
+        self.assertFalse(asa.colour_enabled("never", Tty(), {}))
+        self.assertEqual(asa.build_parser().parse_args(["--color", "always"]).color, "always")
+        self.assertEqual(asa.build_parser().parse_args(["--no-color"]).color, "never")
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
