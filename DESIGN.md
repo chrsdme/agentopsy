@@ -188,6 +188,12 @@ reviewable robust profiles (P50/P75/P90/P95 and MAD). Confidence incorporates
 evidence volume and stability. Profiles do not weaken factory hard safety
 ceilings; adoption records an explicit local choice only.
 
+## v0.4 historical insights
+
+`agentopsy insights` reports recurring session-health faults, weakest markers,
+and compaction/refill patterns from local aggregate state. It does not quote
+transcripts, infer project history, build lineage, graph commits, or use RAG.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

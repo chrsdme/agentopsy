@@ -2889,6 +2889,17 @@ def calibration_status(store: StateStore) -> dict[str, Any]:
     return json.loads(row[0]) if row else {"status": "INSUFFICIENT", "message": "No calibration built yet."}
 
 
+def insights_payload(store: StateStore, days: int = 30, provider: str = "all") -> dict[str, Any]:
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    rows = [r for r in store.sessions(provider) if r["last_activity_at"] >= cutoff]
+    if not rows: return {"period_days": days, "provider": provider, "sessions": 0, "insights": []}
+    recurring = {"repeated_reads": sum(int(r["repeated_reads"]) >= 4 for r in rows), "command_repetition": sum(int(r["repeated_commands"]) >= 5 for r in rows), "compaction_thrash": sum(int(r["compactions"]) >= 3 for r in rows), "high_context": sum(float(r["peak_context_pct"] or 0) > .65 for r in rows)}
+    weakest = max(recurring, key=recurring.get)
+    refill = sum(int(r["compactions"]) and int(r["repeated_commands"]) >= 2 for r in rows)
+    insights = [f"Most recurrent workflow fault: {weakest.replace('_', ' ')} ({recurring[weakest]}/{len(rows)} sessions).", f"Compaction followed by repeated commands occurred in {refill}/{len(rows)} sessions.", "Use bounded reads, checkpoints, and fresh sessions at high context; these are workflow recommendations, not provider cache-expiry claims."]
+    return {"period_days": days, "provider": provider, "sessions": len(rows), "recurring_faults": recurring, "weakest_marker": weakest, "compaction_refill_sessions": refill, "insights": insights}
+
+
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
@@ -2967,7 +2978,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights"}: return None
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -2990,6 +3001,14 @@ def live_cli(argv: list[str]) -> Optional[int]:
                 if args.action == "recommend": payload["recommendation"] = "Review robust P90/P95 baselines; factory hard safety ceilings remain authoritative."
                 if args.action == "adopt": payload["adopted"] = True; store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(payload, sort_keys=True),)); store.db.commit()
             print(json.dumps(payload, indent=2)); return 0
+        finally: store.close()
+    if argv[0] == "insights":
+        parser = argparse.ArgumentParser(prog="agentopsy insights"); parser.add_argument("--state-dir"); parser.add_argument("--days", type=int, default=30); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+        try:
+            payload = insights_payload(store, args.days, args.provider)
+            print(json.dumps(payload, indent=2) if args.json else "\n".join(payload["insights"]) if payload["insights"] else "No qualifying session-health history yet.")
+            return 0
         finally: store.close()
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
     parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
@@ -3076,7 +3095,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights"}:
         try:
             return live_cli(argv)
         except SystemExit:
