@@ -194,6 +194,12 @@ ceilings; adoption records an explicit local choice only.
 and compaction/refill patterns from local aggregate state. It does not quote
 transcripts, infer project history, build lineage, graph commits, or use RAG.
 
+## v0.4 policy configuration
+
+Policy uses versioned built-in safe defaults, SQLite runtime overrides, and
+optional JSON import/export. Imports are schema-validated before a transaction
+updates active state, preventing partial policy changes.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

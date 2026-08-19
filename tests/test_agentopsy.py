@@ -248,6 +248,20 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("starting fresh", warning["message"])
 
 
+class PolicyTests(unittest.TestCase):
+    def test_policy_import_is_validated_and_transactional(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            self.assertEqual(asa.policy_show(store)["version"], 1)
+            valid = {"version": 1, "notification": {"enabled": False, "minimum_severity": "high", "cooldown_seconds": 60}}
+            asa.policy_import(store, valid)
+            self.assertFalse(asa.policy_show(store)["notification"]["enabled"])
+            with self.assertRaises(ValueError):
+                asa.policy_import(store, {"version": 2, "notification": {}})
+            self.assertFalse(asa.policy_show(store)["notification"]["enabled"])
+            store.close()
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:

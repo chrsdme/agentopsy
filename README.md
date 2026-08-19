@@ -417,6 +417,8 @@ agentopsy --project my-project --since 7d --summary
   --provider claude|codex`, based only on local session-health aggregates.
 - stale-session advisory: `agentopsy preflight --provider PROVIDER --session ID`;
   it reports observed local facts and never claims provider cache expiry.
+- policy controls: `agentopsy policy show|export|import|reset`; imports are
+  validated before transactional local-state updates.
 
 ## Claude Code
 
