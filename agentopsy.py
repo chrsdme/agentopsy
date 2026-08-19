@@ -350,15 +350,17 @@ class ClaudeAdapter(ProviderAdapter):
                   "output_tokens": 0, "reasoning_tokens": 0, "model_turns": 0, "peak_context_tokens": 0}
         if record.get("type") != "assistant":
             return values
+        has_usage = False
         for item in iterations:
             if not isinstance(item, dict):
                 continue
+            has_usage = True
             inp = safe_int(item.get("input_tokens")); cached = safe_int(item.get("cache_read_input_tokens"))
             created = safe_int(item.get("cache_creation_input_tokens")); out = safe_int(item.get("output_tokens"))
             values["input_tokens"] += inp; values["cached_input_tokens"] += cached
             values["cache_creation_tokens"] += created; values["output_tokens"] += out
             values["peak_context_tokens"] = max(values["peak_context_tokens"], inp + cached + created)
-            values["model_turns"] += 1
+        values["model_turns"] = int(has_usage)
         return values
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
