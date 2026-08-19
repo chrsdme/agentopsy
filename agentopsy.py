@@ -2240,7 +2240,8 @@ HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Fil
 
 def validate_handoff(project: str) -> dict[str, Any]:
     path = Path(project) / ".ai" / "state" / "HANDOFF.md"
-    result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None}
+    result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None,
+              "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.3 does not infer agent idle/safe state or automate rotation."}
     if not path.is_file(): return result
     text = path.read_text(encoding="utf-8", errors="replace")
     result["missing"] = [name for name in HANDOFF_SECTIONS if not re.search(rf"(?mi)^#+\s*{re.escape(name)}\s*$", text)]
