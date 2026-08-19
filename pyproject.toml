@@ -32,9 +32,9 @@ classifiers = [
 agentopsy = "agentopsy:main"
 
 [project.urls]
-# Fill these after creating the GitHub repository.
-# Homepage = "https://github.com/OWNER/agentopsy"
-# Issues = "https://github.com/OWNER/agentopsy/issues"
+Homepage = "https://github.com/chrsdme/agentopsy"
+Repository = "https://github.com/chrsdme/agentopsy"
+Issues = "https://github.com/chrsdme/agentopsy/issues"
 
 [tool.setuptools]
 py-modules = ["agentopsy"]
