@@ -111,6 +111,45 @@ class SignalRegistryTests(unittest.TestCase):
             self.assertIn(heading, text)
 
 
+class MarkerScoringTests(unittest.TestCase):
+    def test_unavailable_markers_are_na_and_excluded_from_efficiency(self):
+        summary = asa.SessionSummary("claude", "scorecard", "/tmp/a", "test")
+        asa.finalise_grade(summary)
+        scores = {marker.code: marker for marker in summary.marker_scores}
+        self.assertEqual(scores["COMPACTION_HEALTH"].score, None)
+        self.assertEqual(scores["INSTRUCTION_OVERHEAD"].percent, None)
+        self.assertEqual(summary.overall_efficiency_score, 100)
+        self.assertIsNone(summary.lane_scores[asa.ImpactLane.COMPACTION_HEALTH.value])
+
+    def test_context_emergency_floor_survives_high_overall_efficiency(self):
+        summary = asa.SessionSummary("codex", "scorecard", "/tmp/a", "test")
+        asa.add_defect(summary, "critical", "CODEX_CONTEXT_CRITICAL", "Critical context", "Start fresh")
+        asa.add_defect(summary, "medium", "GIANT_TOOL_RESULT", "Large output", "Bound the output")
+        asa.finalise_grade(summary)
+        scores = {marker.code: marker for marker in summary.marker_scores}
+        self.assertEqual(summary.overall_efficiency_score, 85)
+        self.assertEqual(scores["CONTEXT_PRESSURE"].score, 1)
+        self.assertEqual(scores["CONTEXT_PRESSURE"].severity, asa.Severity.EMERGENCY)
+        self.assertEqual(summary.effective_severity, asa.Severity.EMERGENCY)
+        self.assertEqual(summary.worst_indicators[0], "CONTEXT_PRESSURE")
+        self.assertEqual(summary.corrective_opportunities, ["Start fresh", "Bound the output"])
+
+    def test_scorecard_is_serialised_and_rendered_with_required_fields(self):
+        summary = asa.SessionSummary("codex", "scorecard", "/tmp/a", "test")
+        asa.finalise_grade(summary)
+        payload = summary.to_dict()
+        self.assertEqual(payload["overall_efficiency_score"], 100)
+        self.assertEqual(payload["effective_severity"], "SAFE")
+        self.assertEqual(payload["trend"], "UNKNOWN")
+        self.assertIn("lane_scores", payload)
+        self.assertIn("marker_scores", payload)
+        self.assertEqual(payload["marker_scores"][0]["percent"], 100)
+        terminal = "\n".join(asa.render_terminal_detail(summary, colour=False))
+        markdown = "\n".join(asa.render_markdown_detail(summary))
+        self.assertIn("efficiency=100/100", terminal)
+        self.assertIn("Marker scorecard", markdown)
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:

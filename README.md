@@ -404,6 +404,9 @@ agentopsy --project my-project --since 7d --summary
 - repeated file/path reads;
 - malformed transcript lines;
 - health score and A-F workflow grade.
+- a provisional, versioned 5-point marker scorecard with lane and overall
+  efficiency scores; unavailable provider telemetry is N/A rather than a
+  penalty, and severe context conditions retain an explicit severity floor.
 
 ## Claude Code
 
