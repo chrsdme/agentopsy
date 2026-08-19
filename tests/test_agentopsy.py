@@ -505,6 +505,67 @@ class CompactVerificationTests(unittest.TestCase):
             self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.IDENTITY_LOST)
             store.close()
 
+    def test_service_once_compact_path_verifies_once_then_cooldown_blocks_repeat(self):
+        """End-to-end wiring: service_once must reach COMPACT_VERIFIED only via
+        exact identity + Herdr idle re-query + async provider lifecycle evidence,
+        and a second immediate tick must be blocked by cooldown, not re-invoked."""
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir()
+            transcript = root / "rollout-compact.jsonl"
+            now = asa._identity_now().isoformat()
+            records = [
+                {"type": "session_meta", "timestamp": now, "payload": {"session_id": "compact-session"}},
+                {"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 90, "total_tokens": 90}, "last_token_usage": {"total_tokens": 90}, "model_context_window": 100}}},
+            ]
+            transcript.write_text("\n".join(json.dumps(item) for item in records) + "\n")
+
+            store = asa.StateStore(str(state))
+            store.register_identity("codex", "compact-session", str(transcript), "w:p1", "startup")
+            store.db.commit()
+            store.close()
+
+            original_socket, original_run = asa._socket_request, subprocess.run
+
+            def fake_socket(socket_path, method, params, timeout=0.5):
+                if method == "agent.list":
+                    return {"result": {"agents": [{"agent": "codex", "pane_id": "w:p1", "agent_status": "idle", "agent_session": {"value": "compact-session"}}]}}
+                return {"result": {}}
+
+            def fake_run(cmd, **kwargs):
+                # Simulate the provider emitting PostCompact + a smaller context
+                # sample asynchronously, exactly as a real async hook delivery would,
+                # before verification re-queries state.
+                live_store = asa.StateStore(str(state))
+                live_store.record_identity_lifecycle("codex", "compact-session", "PostCompact")
+                live_store.db.execute("UPDATE sessions SET compactions=compactions+1 WHERE session_id='compact-session' AND provider='codex'")
+                live_store.db.execute("""INSERT INTO telemetry_samples(timestamp,session_id,provider,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asa._identity_now().isoformat(), "compact-session", "codex", 2, 10, 0.1, 0, "", "", "", None, None, 1))
+                live_store.db.commit(); live_store.close()
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            asa._socket_request, subprocess.run = fake_socket, fake_run
+            try:
+                metrics = asa.service_once(str(state), roots=[(root, "test")], notify=False, auto_act=asa.AutoActMode.COMPACT)
+            finally:
+                asa._socket_request, subprocess.run = original_socket, original_run
+
+            self.assertEqual(metrics.control_verified, 1)
+            self.assertEqual(metrics.control_invocations, 1)
+            store = asa.StateStore(str(state))
+            self.assertEqual(store.db.execute("SELECT code FROM health_events WHERE session_id='compact-session' AND provider='codex' ORDER BY id DESC LIMIT 1").fetchone()[0], "COMPACT_VERIFIED")
+            store.close()
+
+            # A second tick within the cooldown window must not invoke Herdr again.
+            invoked = []
+            asa._socket_request, subprocess.run = fake_socket, (lambda cmd, **kwargs: invoked.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+            try:
+                metrics2 = asa.service_once(str(state), roots=[(root, "test")], notify=False, auto_act=asa.AutoActMode.COMPACT)
+            finally:
+                asa._socket_request, subprocess.run = original_socket, original_run
+            self.assertEqual(metrics2.control_verified, 0)
+            self.assertEqual(invoked, [])
+
 
 class CompactionTests(unittest.TestCase):
     def test_observed_compaction_outcomes_are_explainable(self):
