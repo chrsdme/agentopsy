@@ -232,6 +232,12 @@ Full rotation requires a validated durable handoff, safe boundary, and verified
 native new-session capability. Uncertainty produces `ACTION_BLOCKED`; the
 handoff is preserved until a verifiable session transition succeeds.
 
+## v0.4 fail-safe control
+
+Parser, identity, integrity, service, telemetry, or command uncertainty fails
+closed: active action is disabled for the affected scope, policy returns to
+observe, and compact non-transcript integrity evidence is retained.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.
