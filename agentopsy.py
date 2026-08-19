@@ -122,7 +122,11 @@ def classify_compaction(before_context: int, after_context: int, refill_context:
     """Classify observed/provider-verified compactions; never invoke one here."""
     reduction = max(0, before_context - after_context)
     ratio = reduction / before_context if before_context else 0.0
-    if compaction_count >= 5: outcome = "THRASH"
+    if before_context <= 0:
+        # A missing/absent before-sample is not evidence of an ineffective
+        # compaction; never turn missing provider telemetry into a negative signal.
+        outcome = "UNKNOWN"
+    elif compaction_count >= 5: outcome = "THRASH"
     elif refill_context is not None and refill_context >= before_context * .9: outcome = "RAPID_REFILL"
     elif ratio >= .5 and repeated_after < 2: outcome = "EFFECTIVE"
     elif ratio >= .2: outcome = "WEAK"
@@ -149,6 +153,31 @@ def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_s
     if not all((exact_provider, exact_session, exact_harness, safe_idle_boundary, integrity_ok)) or capability == ProviderCapability.UNAVAILABLE or active_critical_operation:
         return ControlDecision(mode, False, "Control blocked: exact mapping, supported capability, safe idle boundary, no critical operation, and healthy integrity are all required.")
     return ControlDecision(mode, True, "All safety preconditions passed; adapter execution remains separately verified.", "compact" if mode == AutoActMode.COMPACT else "full")
+
+
+def control_decision_for_live_session(row: sqlite3.Row, mode: AutoActMode) -> ControlDecision:
+    """Route a live risk candidate through the fail-closed control decision layer.
+
+    Transcript-derived session IDs are not native interactive-session identities.
+    Until an adapter proves that mapping and a safe input boundary, this function
+    deliberately evaluates a blocked request rather than attempting an action.
+    """
+    if row["health_state"] not in {"CHECKPOINT_RECOMMENDED", "ROTATION_RECOMMENDED"}:
+        return ControlDecision(mode, False, "No control requested: live risk has not reached a checkpoint or rotation recommendation.")
+    if int(row["malformed_records"] or 0):
+        return ControlDecision(mode, False, "Control blocked by transcript-integrity uncertainty.")
+    adapter = next((item for item in control_adapters() if item.provider == row["provider"] and item.harness == "native"), None)
+    capability = adapter.capability("compact") if adapter else ProviderCapability.UNAVAILABLE
+    return evaluate_control_request(
+        mode,
+        exact_provider=row["provider"] in {"claude", "codex"},
+        exact_session=False,
+        exact_harness=False,
+        capability=capability,
+        safe_idle_boundary=False,
+        active_critical_operation=False,
+        integrity_ok=True,
+    )
 
 
 class ProviderCapability(str, enum.Enum):
@@ -2755,6 +2784,7 @@ def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, l
 class IngestionMetrics:
     bytes_examined: int = 0; bytes_newly_parsed: int = 0; files_unchanged: int = 0; files_advanced: int = 0; files_rescanned: int = 0; parse_errors: int = 0
     touched_sessions: set = dataclasses.field(default_factory=set)
+    control_evaluations: int = 0; control_blocked: int = 0; control_fail_safes: int = 0
 
 
 class IncrementalIngestor:
@@ -2999,7 +3029,7 @@ def guardian_replay(store: StateStore, provider: str = "all") -> list[dict[str, 
     return timeline
 
 
-def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
+def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True, auto_act: AutoActMode = AutoActMode.OBSERVE) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
         metrics = IncrementalIngestor(store, roots, provider).scan()
@@ -3011,6 +3041,15 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
         recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15)
         for prov, sid in metrics.touched_sessions:
             row = store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, prov)).fetchone()
+            if row and row["health_state"] in {"CHECKPOINT_RECOMMENDED", "ROTATION_RECOMMENDED"}:
+                metrics.control_evaluations += 1
+                if int(row["malformed_records"] or 0):
+                    fail_safe = fail_safe_control("transcript-integrity uncertainty", provider=prov, session_id=sid, malformed_records=int(row["malformed_records"] or 0))
+                    store.event(prov, sid, fail_safe.severity.value.lower(), fail_safe.code, "Control disabled because transcript integrity is uncertain.", fail_safe.evidence)
+                    metrics.control_fail_safes += 1
+                decision = control_decision_for_live_session(row, auto_act)
+                if not decision.allowed:
+                    metrics.control_blocked += 1
             activity = iso_to_dt(row["last_activity_at"]) if row else None
             # last_activity_at is raw provider text (e.g. Codex's "...503Z" vs
             # Claude's own format); parse both sides rather than comparing
@@ -3019,6 +3058,7 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
             if activity is None or activity < recent_cutoff: continue
             for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (sid, prov)).fetchall():
                 if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"], event["severity"], row["provider"], row["session_id"])
+        store.db.commit()
         return metrics
     finally: store.close()
 
@@ -3027,7 +3067,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="agentopsyd", description="Passive local Agentopsy session-health service.")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("run", "once"):
-        q = sub.add_parser(name); q.add_argument("--interval", type=int, default=20); q.add_argument("--state-dir"); q.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); q.add_argument("--foreground", action="store_true"); q.add_argument("--no-notify", action="store_true")
+        q = sub.add_parser(name); q.add_argument("--interval", type=int, default=20); q.add_argument("--state-dir"); q.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); q.add_argument("--foreground", action="store_true"); q.add_argument("--no-notify", action="store_true"); q.add_argument("--auto-act", choices=[mode.value for mode in AutoActMode], default=AutoActMode.OBSERVE.value, help="Control mode; defaults to observe and fails closed until a verified adapter is available.")
     status = sub.add_parser("status"); status.add_argument("--state-dir")
     args = parser.parse_args(argv)
     if args.command == "status":
@@ -3036,7 +3076,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
             print(render_health(store.sessions())); return 0
         finally: store.close()
     if args.command == "once":
-        m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
+        m = service_once(args.state_dir, args.provider, notify=not args.no_notify, auto_act=AutoActMode(args.auto_act))
         # touched_sessions is an internal notification-gating detail (raw
         # session IDs); do not print it in the scan summary.
         summary = {k: v for k, v in dataclasses.asdict(m).items() if k != "touched_sessions"}
@@ -3060,7 +3100,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
         os.write(fd, str(os.getpid()).encode())
         while running:
             try:
-                m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
+                m = service_once(args.state_dir, args.provider, notify=not args.no_notify, auto_act=AutoActMode(args.auto_act))
                 print(f"sessions scan: advanced={m.files_advanced} unchanged={m.files_unchanged} parsed={human_bytes(m.bytes_newly_parsed)}", flush=True)
             except Exception as e:
                 # A transient failure (e.g. a concurrent CLI scan racing on the
