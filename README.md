@@ -427,6 +427,8 @@ agentopsy --project my-project --since 7d --summary
   unavailable and Agentopsy never types blindly into a terminal.
 - observed compactions are classified as effective, weak, rapid-refill,
   ineffective, or thrash; unavailable adapters never trigger compaction.
+- full rotation is blocked unless a durable validated handoff and a verified
+  native session transition are available.
 
 ## Claude Code
 
