@@ -2,6 +2,24 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.4.0-dev] - Unreleased
+
+### Changed
+
+- The incremental service now exposes `--auto-act observe|compact|full`
+  (default `observe`) and routes high-context candidates through the
+  fail-closed control decision path.
+- Active control remains unavailable unless an exact native session and
+  harness mapping, safe boundary, capability, and independently observable
+  result are all established.
+- Compaction THRASH classification now requires observed frequent timing plus
+  rapid refill, ineffective reduction, or repeated post-compaction work;
+  effective spaced compactions are not THRASH by count alone.
+- Persisted notification cooldown, enablement, and minimum severity now affect
+  the real incremental service path.
+- The live collector no longer advertises an unreachable compound-context
+  emergency when required independent signals are not measured.
+
 ## [0.3.0] - Unreleased
 
 ### Added

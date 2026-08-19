@@ -544,8 +544,11 @@ incremental state without changing provider transcripts:
 # one safe incremental pass
 agentopsy service once
 
+# explicit mode selection; observe is the default
+agentopsy service once --auto-act observe
+
 # run passively (20 seconds by default)
-agentopsyd run --foreground --interval 20
+agentopsyd run --foreground --interval 20 --auto-act observe
 
 # inspect derived local state
 agentopsy health
@@ -570,11 +573,15 @@ or account quota is never used as a rotation signal.
 
 The service emits terminal notifications and uses `notify-send` when available.
 Notifications can be disabled with `--no-notify`; repeated events are cooled
-down. Environment configuration is available for unattended runs:
+down according to the persisted `policy.notification.cooldown_seconds` value
+(`agentopsy policy show|export|import|reset`). Environment configuration is available for unattended runs:
 `AGENTOPSY_NOTIFICATIONS=off`, `AGENTOPSY_NOTIFICATION_MIN_SEVERITY=high`,
 `AGENTOPSY_NOTIFICATION_PROVIDERS=claude`, and
-`AGENTOPSY_NOTIFICATION_SESSIONS=<id,...>`. Herdr is optional and passive in this release. No automatic `/clear`,
-`/new`, reset, or rotation is performed.
+`AGENTOPSY_NOTIFICATION_SESSIONS=<id,...>`. `--auto-act compact` and `full`
+reach the fail-closed decision layer, but no provider action is currently
+enabled: Agentopsy cannot yet join a transcript identity to an exact live
+native session. Herdr is optional; no automatic `/clear`, `/new`, reset, or
+rotation is performed.
 
 ## Legacy polling mode
 

@@ -238,11 +238,28 @@ Parser, identity, integrity, service, telemetry, or command uncertainty fails
 closed: active action is disabled for the affected scope, policy returns to
 observe, and compact non-transcript integrity evidence is retained.
 
+The incremental service accepts `--auto-act observe|compact|full` and defaults
+to observe. Live checkpoint and rotation candidates reach the control decision
+layer, but a transcript-derived ID is not treated as a live native-session ID.
+Until an exact provider/session/pane mapping, verified idle boundary, capability,
+and independently observable result are all available, compact and full are
+blocked rather than sent to a provider.
+
 ## v0.4 installer/service UX
 
 The installer updates only binaries, preserving local SQLite state and runtime
 overrides. User systemd service setup is explicit (`--service`), no root is
 required, and non-systemd environments receive a clear no-service result.
+
+## v0.4 live-policy fidelity
+
+Persisted notification enablement, severity floor, and cooldown control the
+live incremental service. The display loop also has a separate same-tick
+duplicate guard. THRASH requires observed frequent timing and refill,
+ineffectiveness, or repeated-work evidence; absent timing does not turn a
+count into a negative compaction classification. Compound context promotion is
+reserved for callers with genuine independent measured lanes and is not emitted
+by the current live collector.
 
 ## Future live architecture
 
