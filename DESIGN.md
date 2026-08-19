@@ -172,6 +172,15 @@ compaction. Related context pressure signals compound into an emergency rather
 than being independently averaged. Terminal colour supports `--color auto`,
 `always`, and `never` (plus `NO_COLOR`); text labels always convey severity.
 
+## v0.4 causal risk
+
+The causal engine promotes only named, observed combinations—such as repeated
+reads with elevated context, large tool output with sustained turns, stale
+resume with cache collapse, or compaction followed by refetch. It exposes
+current/effective severity, trend, contributing lanes, causal explanations,
+and a qualitative next-risk state. It never claims an unsupported token-count
+forecast.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

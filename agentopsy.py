@@ -434,6 +434,22 @@ class MarkerScore:
         return data
 
 
+@dataclasses.dataclass
+class CausalRisk:
+    current_severity: Severity = Severity.SAFE
+    effective_severity: Severity = Severity.SAFE
+    trend: str = "STABLE"
+    contributing_lanes: list[ImpactLane] = dataclasses.field(default_factory=list)
+    predicted_next_risk_state: Optional[Severity] = None
+    explanations: list[str] = dataclasses.field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"current_severity": self.current_severity.value, "effective_severity": self.effective_severity.value,
+                "trend": self.trend, "contributing_lanes": [lane.value for lane in self.contributing_lanes],
+                "predicted_next_risk_state": self.predicted_next_risk_state.value if self.predicted_next_risk_state else None,
+                "explanations": self.explanations}
+
+
 # These markers intentionally aggregate only explainable existing defect rules.
 # Their 5..1 thresholds are the corresponding configured rule thresholds above;
 # versioning makes future recalibration explicit rather than changing history.
@@ -565,6 +581,7 @@ class SessionSummary:
     trend: MarkerTrend = MarkerTrend.UNKNOWN
     worst_indicators: list[str] = dataclasses.field(default_factory=list)
     corrective_opportunities: list[str] = dataclasses.field(default_factory=list)
+    causal_risk: CausalRisk = dataclasses.field(default_factory=CausalRisk)
     notes: list[str] = dataclasses.field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -575,6 +592,7 @@ class SessionSummary:
         d["marker_scores"] = [x.to_dict() if isinstance(x, MarkerScore) else x for x in self.marker_scores]
         d["effective_severity"] = self.effective_severity.value
         d["trend"] = self.trend.value
+        d["causal_risk"] = self.causal_risk.to_dict()
         return d
 
 
@@ -925,6 +943,7 @@ def finalise_grade(summary: SessionSummary) -> None:
     else:
         summary.grade = "A"
     finalise_marker_scorecard(summary)
+    finalise_causal_risk(summary)
 
 
 _MARKER_SCORE_BY_DEFECT_SEVERITY = {"low": 4, "medium": 3, "high": 2, "critical": 1}
@@ -988,6 +1007,26 @@ def finalise_marker_scorecard(summary: SessionSummary) -> None:
     summary.corrective_opportunities = list(dict.fromkeys(
         marker.corrective_opportunity for marker in worst if marker.corrective_opportunity
     ))[:3]
+
+
+def finalise_causal_risk(summary: SessionSummary) -> None:
+    """Explain promotions from observed combinations; never forecast token counts."""
+    current = max((context_severity(summary.peak_context_pct), summary.effective_severity), key=lambda value: _SEVERITY_RANK[value])
+    paths: list[tuple[str, tuple[ImpactLane, ...], Severity]] = []
+    repeats = max([count for _, count in summary.repeated_reads], default=0)
+    if repeats >= 2 and summary.peak_context_pct > .55:
+        paths.append(("Repeated reads combine with elevated context pressure, predicting further input amplification.", (ImpactLane.REPETITION, ImpactLane.CONTEXT_PRESSURE, ImpactLane.CONTEXT_VELOCITY), Severity.HIGH))
+    if summary.max_tool_result_tokens_proxy >= LARGE_RESULT_TOKENS and summary.model_turns >= 10:
+        paths.append(("Large tool output plus sustained turn activity predicts context acceleration.", (ImpactLane.TOOL_OUTPUT, ImpactLane.CONTEXT_VELOCITY), Severity.HIGH))
+    if summary.max_idle_gap_seconds >= 24 * 3600 and summary.peak_context_pct > .55 and not summary.cached_input_tokens:
+        paths.append(("Stale resume, elevated context, and absent cache reuse predict elevated processing pressure.", (ImpactLane.SESSION_LIFECYCLE, ImpactLane.CONTEXT_PRESSURE, ImpactLane.CACHE_REUSE), Severity.CRITICAL))
+    if summary.compactions and summary.post_compact_repeats >= 2:
+        paths.append(("Compaction followed by repeated work predicts ineffective compaction and rapid refill.", (ImpactLane.COMPACTION_HEALTH, ImpactLane.REPETITION, ImpactLane.CONTEXT_VELOCITY), Severity.CRITICAL))
+    promoted = max([current] + [severity for _, _, severity in paths], key=lambda value: _SEVERITY_RANK[value])
+    trend = "RAPIDLY_DETERIORATING" if any(severity == Severity.CRITICAL for _, _, severity in paths) else "DETERIORATING" if paths else "STABLE"
+    lanes = list(dict.fromkeys(lane for _, path_lanes, _ in paths for lane in path_lanes))
+    prediction = promoted if paths and _SEVERITY_RANK[promoted] > _SEVERITY_RANK[current] else None
+    summary.causal_risk = CausalRisk(current, promoted, trend, lanes, prediction, [text for text, _, _ in paths])
 
 
 def extract_plain_user_text(content: Any) -> str:
@@ -1977,6 +2016,10 @@ def render_terminal_detail(s: SessionSummary, colour: bool) -> list[str]:
     lines.append(f"  markers: {marker_text}")
     if s.worst_indicators:
         lines.append(f"  worst indicators: {', '.join(s.worst_indicators)}")
+    risk = s.causal_risk
+    lines.append(f"  causal-risk: current={risk.current_severity.value}; effective={risk.effective_severity.value}; trend={risk.trend}; predicted={risk.predicted_next_risk_state.value if risk.predicted_next_risk_state else 'N/A'}")
+    for explanation in risk.explanations:
+        lines.append(f"  causal path: {explanation}")
     for opportunity in s.corrective_opportunities:
         lines.append(f"  corrective opportunity: {opportunity}")
     if s.repeated_reads:
@@ -2138,6 +2181,9 @@ def render_markdown_detail(s: SessionSummary) -> list[str]:
         lines.append("- Worst indicators: " + ", ".join(f"`{code}`" for code in s.worst_indicators))
     if s.corrective_opportunities:
         lines.append("- Corrective opportunities: " + " ".join(s.corrective_opportunities))
+    lines.append(f"- Causal risk: current **{s.causal_risk.current_severity.value}**; effective **{s.causal_risk.effective_severity.value}**; trend `{s.causal_risk.trend}`; predicted next state `{s.causal_risk.predicted_next_risk_state.value if s.causal_risk.predicted_next_risk_state else 'N/A'}`.")
+    for explanation in s.causal_risk.explanations:
+        lines.append(f"  - Causal path: {explanation}")
     lines += ["", "**Flags**", ""]
     if not s.defects:
         lines.append("- None triggered by the current rules.")
