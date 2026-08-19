@@ -373,18 +373,18 @@ class CompactionTests(unittest.TestCase):
         self.assertEqual(effective["outcome"], "EFFECTIVE")
         refill = asa.classify_compaction(100, 30, 95, 0, 1)
         self.assertEqual(refill["outcome"], "RAPID_REFILL")
-        self.assertEqual(asa.classify_compaction(100, 70, None, 3, 5)["outcome"], "THRASH")
+        self.assertEqual(asa.classify_compaction(100, 70, None, 3, 5, compaction_window_seconds=300)["outcome"], "THRASH")
 
     def test_missing_before_sample_is_unknown_not_ineffective(self):
         self.assertEqual(asa.classify_compaction(0, 0, None, 0, 1)["outcome"], "UNKNOWN")
 
-    def test_repeated_effective_compactions_are_currently_classified_as_thrash(self):
-        # Documents current behaviour: compaction_count >= 5 is checked before
-        # the reduction ratio, so five individually-EFFECTIVE compactions
-        # (90% reduction each) are classified as THRASH by count alone. This
-        # is a product-semantics question (frequency vs. effectiveness), not
-        # fixed here — see the v0.4 review findings.
-        self.assertEqual(asa.classify_compaction(1000, 100, 150, 0, 5)["outcome"], "THRASH")
+    def test_effective_spaced_compactions_are_not_thrash_due_to_count_alone(self):
+        result = asa.classify_compaction(1000, 100, 150, 0, 5, compaction_window_seconds=7200)
+        self.assertEqual(result["outcome"], "EFFECTIVE")
+
+    def test_frequent_rapid_refill_is_thrash(self):
+        result = asa.classify_compaction(1000, 100, 950, 0, 5, compaction_window_seconds=300)
+        self.assertEqual(result["outcome"], "THRASH")
 
 
 class RotationTests(unittest.TestCase):

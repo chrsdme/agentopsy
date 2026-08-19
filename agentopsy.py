@@ -118,20 +118,23 @@ def control_adapters() -> tuple[ControlAdapter, ...]:
     return (ControlAdapter("claude", "native", unavailable), ControlAdapter("codex", "native", unavailable), ControlAdapter("herdr", "integration", unavailable))
 
 
-def classify_compaction(before_context: int, after_context: int, refill_context: Optional[int], repeated_after: int, compaction_count: int) -> dict[str, Any]:
+def classify_compaction(before_context: int, after_context: int, refill_context: Optional[int], repeated_after: int, compaction_count: int, *, compaction_window_seconds: Optional[float] = None) -> dict[str, Any]:
     """Classify observed/provider-verified compactions; never invoke one here."""
     reduction = max(0, before_context - after_context)
     ratio = reduction / before_context if before_context else 0.0
+    rapid_refill = refill_context is not None and refill_context >= before_context * .9
+    frequent = compaction_count >= 5 and compaction_window_seconds is not None and compaction_window_seconds <= 3600
+    ineffective_or_repeated = ratio < .2 or repeated_after >= 2
     if before_context <= 0:
         # A missing/absent before-sample is not evidence of an ineffective
         # compaction; never turn missing provider telemetry into a negative signal.
         outcome = "UNKNOWN"
-    elif compaction_count >= 5: outcome = "THRASH"
-    elif refill_context is not None and refill_context >= before_context * .9: outcome = "RAPID_REFILL"
+    elif frequent and (rapid_refill or ineffective_or_repeated): outcome = "THRASH"
+    elif rapid_refill: outcome = "RAPID_REFILL"
     elif ratio >= .5 and repeated_after < 2: outcome = "EFFECTIVE"
     elif ratio >= .2: outcome = "WEAK"
     else: outcome = "INEFFECTIVE"
-    return {"outcome": outcome, "context_before": before_context, "context_after": after_context, "reduction": reduction, "reduction_pct": ratio, "repeated_after": repeated_after, "compaction_frequency": compaction_count}
+    return {"outcome": outcome, "context_before": before_context, "context_after": after_context, "reduction": reduction, "reduction_pct": ratio, "repeated_after": repeated_after, "compaction_frequency": compaction_count, "compaction_window_seconds": compaction_window_seconds}
 
 
 def rotation_plan(project: str, *, safe_to_act: bool, adapter_capability: ProviderCapability) -> dict[str, Any]:
