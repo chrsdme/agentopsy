@@ -398,6 +398,114 @@ class ControlAdapterTests(unittest.TestCase):
             self.assertEqual(decision.action, None)
 
 
+class IdentityBridgeTests(unittest.TestCase):
+    def _store(self, td): return asa.StateStore(str(Path(td) / "state"))
+
+    def test_exact_registration_duplicate_and_stale_mapping(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); path = str(Path(td) / "sessions" / "a.jsonl")
+            store.register_identity("codex", "s1", path, "w:p1", "startup")
+            store.register_identity("codex", "s1", path, "w:p1", "resume")
+            self.assertEqual(store.db.execute("SELECT count(*) FROM identity_mappings").fetchone()[0], 1)
+            self.assertEqual(store.exact_identity("codex", "s1", path)["confidence"], "EXACT")
+            expired = asa._identity_now() + asa.dt.timedelta(seconds=asa.IDENTITY_TTL_SECONDS + 1)
+            self.assertIsNone(store.exact_identity("codex", "s1", path, now=expired)); store.close()
+
+    def test_pane_reuse_transcript_replacement_and_restart_invalidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); one, two = str(Path(td) / "one.jsonl"), str(Path(td) / "two.jsonl")
+            store.register_identity("codex", "old", one, "w:p1", "startup")
+            store.register_identity("codex", "new", two, "w:p1", "resume")
+            self.assertIsNone(store.exact_identity("codex", "old", one))
+            self.assertIsNotNone(store.exact_identity("codex", "new", two))
+            store.invalidate_identity("codex", "new", pane_id="w:p1")
+            self.assertIsNone(store.exact_identity("codex", "new", two)); store.close()
+
+    def test_lifecycle_malformed_and_missing_herdr_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = str(Path(td) / "s.jsonl")
+            self.assertFalse(asa.identity_hook_payload({"hook_event_name": "SessionStart", "session_id": "s", "transcript_path": path}, state_dir=str(Path(td) / "state"), environ={}))
+            self.assertFalse(asa.identity_hook_payload({"hook_event_name": "SessionStart", "session_id": "s", "transcript_path": "relative"}, state_dir=str(Path(td) / "state"), environ={}))
+            store = self._store(td); store.record_identity_lifecycle("codex", "s", "PreCompact"); store.record_identity_lifecycle("codex", "s", "PostCompact"); store.db.commit()
+            self.assertEqual(store.db.execute("SELECT count(*) FROM identity_lifecycle WHERE native_session_id='s'").fetchone()[0], 2); store.close()
+
+    def test_wrong_pane_and_herdr_restart_block_idle_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); path = str(Path(td) / "s.jsonl"); store.register_identity("codex", "s", path, "w:p1")
+            mapping = store.exact_identity("codex", "s", path); original = asa._socket_request
+            asa._socket_request = lambda *a, **k: {"result": {"agents": [{"agent": "codex", "pane_id": "w:wrong", "agent_status": "idle", "agent_session": {"value": "s"}}]}}
+            try: self.assertFalse(asa.herdr_pane_is_idle(mapping))
+            finally: asa._socket_request = original
+            self.assertFalse(asa.herdr_pane_is_idle(mapping, socket_path=str(Path(td) / "missing.sock"))); store.close()
+
+    def test_exact_join_rejects_ambiguous_and_mismatched_provider(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); path = str(Path(td) / "s.jsonl"); store.register_identity("codex", "s", path, "w:p1")
+            with self.assertRaises(ValueError): store.register_identity("claude", "s", path, "w:p1")
+            now = asa._identity_now().isoformat(); later = (asa._identity_now() + asa.dt.timedelta(minutes=1)).isoformat()
+            store.db.execute("INSERT INTO identity_mappings(provider,native_session_id,transcript_path,pane_id,observed_at,expires_at,confidence,active) VALUES(?,?,?,?,?,?,?,1)", ("codex", "s", asa._canonical_transcript_path(path), "w:p2", now, later, "EXACT"))
+            self.assertIsNone(store.exact_identity("codex", "s", path)); store.close()
+
+    def test_hook_registration_and_config_install_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); (root / "config.toml").write_text("[features]\nhooks = false\n")
+            (root / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "bash herdr-agent-state.sh"}]}]}}))
+            first = asa.integration_install_codex(root, str(root / "state")); second = asa.integration_install_codex(root, str(root / "state"))
+            self.assertTrue(first["hooks_enabled"] and second["agentopsy_hook_installed"] and second["herdr_hook_present"])
+            installed = json.loads((root / "hooks.json").read_text())
+            self.assertTrue(all(installed["hooks"][event] for event in ("SessionStart", "PreCompact", "PostCompact")))
+            removed = asa.integration_remove_codex(root); self.assertFalse(removed["agentopsy_hook_installed"]); self.assertTrue(removed["herdr_hook_present"])
+            final = json.loads((root / "hooks.json").read_text())
+            self.assertFalse(any("integration hook codex" in str(item.get("command") or "") for event in final["hooks"].values() for group in event for item in group.get("hooks", []) if isinstance(item, dict)))
+
+
+class CompactVerificationTests(unittest.TestCase):
+    def _mapping_and_request(self, td):
+        store = asa.StateStore(str(Path(td) / "state")); path = str(Path(td) / "s.jsonl")
+        store.register_identity("codex", "s", path, "w:p1")
+        store.db.execute("INSERT INTO sessions(session_id,provider,compactions) VALUES(?,?,0)", ("s", "codex"))
+        store.db.execute("INSERT INTO telemetry_samples(timestamp,session_id,provider,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (asa._identity_now().isoformat(), "s", "codex", 1, 100, 0.5, 0, "", "", "", None, None, 0))
+        store.db.commit()
+        mapping = store.exact_identity("codex", "s", path)
+        return store, mapping, asa.compact_request_snapshot(store, mapping)
+
+    def _provider_compact(self, store, *, after_context=40, lifecycle=True):
+        if lifecycle: store.record_identity_lifecycle("codex", "s", "PostCompact")
+        store.db.execute("UPDATE sessions SET compactions=1 WHERE session_id='s' AND provider='codex'")
+        store.db.execute("INSERT INTO telemetry_samples(timestamp,session_id,provider,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (asa._identity_now().isoformat(), "s", "codex", 2, after_context, 0.2, 0, "", "", "", None, None, 1))
+        store.db.commit()
+
+    def test_async_provider_evidence_verifies_after_non_success_transport(self):
+        with tempfile.TemporaryDirectory() as td:
+            store, mapping, request = self._mapping_and_request(td)
+            self._provider_compact(store)
+            request = asa.dataclasses.replace(request, state=asa.CompactVerification.TIMED_OUT)
+            self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.VERIFIED)
+            store.close()
+
+    def test_transport_ack_without_provider_confirmation_times_out(self):
+        with tempfile.TemporaryDirectory() as td:
+            store, mapping, request = self._mapping_and_request(td)
+            request = asa.dataclasses.replace(request, state=asa.CompactVerification.ACCEPTED)
+            self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.TIMED_OUT)
+            store.close()
+
+    def test_compact_verification_rejects_wrong_identity_missing_event_and_no_reduction(self):
+        with tempfile.TemporaryDirectory() as td:
+            store, mapping, request = self._mapping_and_request(td)
+            self._provider_compact(store, lifecycle=False)
+            self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.TIMED_OUT)
+            store.db.execute("DELETE FROM telemetry_samples WHERE session_id='s' AND id>?", (request.before_telemetry_id,))
+            store.db.execute("UPDATE sessions SET compactions=0 WHERE session_id='s'")
+            self._provider_compact(store, after_context=100)
+            self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.FAILED)
+            store.register_identity("codex", "other", str(Path(td) / "other.jsonl"), "w:p1")
+            self.assertEqual(asa.verify_herdr_compact(store, mapping, request), asa.CompactVerification.IDENTITY_LOST)
+            store.close()
+
+
 class CompactionTests(unittest.TestCase):
     def test_observed_compaction_outcomes_are_explainable(self):
         effective = asa.classify_compaction(100, 30, 50, 0, 1)

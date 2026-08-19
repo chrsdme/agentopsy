@@ -34,6 +34,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import statistics
@@ -47,7 +48,8 @@ from typing import Any, Iterable, Iterator, Optional
 
 VERSION = "0.4.0-dev"
 PARSER_VERSION = 1
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+IDENTITY_TTL_SECONDS = 15 * 60
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 SEVERITY_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
@@ -158,7 +160,7 @@ def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_s
     return ControlDecision(mode, True, "All safety preconditions passed; adapter execution remains separately verified.", "compact" if mode == AutoActMode.COMPACT else "full")
 
 
-def control_decision_for_live_session(row: sqlite3.Row, mode: AutoActMode) -> ControlDecision:
+def control_decision_for_live_session(row: sqlite3.Row, mode: AutoActMode, store: Any = None) -> ControlDecision:
     """Route a live risk candidate through the fail-closed control decision layer.
 
     Transcript-derived session IDs are not native interactive-session identities.
@@ -169,15 +171,16 @@ def control_decision_for_live_session(row: sqlite3.Row, mode: AutoActMode) -> Co
         return ControlDecision(mode, False, "No control requested: live risk has not reached a checkpoint or rotation recommendation.")
     if int(row["malformed_records"] or 0):
         return ControlDecision(mode, False, "Control blocked by transcript-integrity uncertainty.")
-    adapter = next((item for item in control_adapters() if item.provider == row["provider"] and item.harness == "native"), None)
-    capability = adapter.capability("compact") if adapter else ProviderCapability.UNAVAILABLE
+    mapping = exact_identity_for_live_session(store, row) if store is not None else None
+    exact = mapping is not None
+    idle = bool(mapping and herdr_pane_is_idle(mapping))
     return evaluate_control_request(
         mode,
         exact_provider=row["provider"] in {"claude", "codex"},
-        exact_session=False,
-        exact_harness=False,
-        capability=capability,
-        safe_idle_boundary=False,
+        exact_session=exact,
+        exact_harness=exact,
+        capability=ProviderCapability.EXACT if exact else ProviderCapability.UNAVAILABLE,
+        safe_idle_boundary=idle,
         active_critical_operation=False,
         integrity_ok=True,
     )
@@ -2529,6 +2532,98 @@ def default_state_dir(value: Optional[str] = None) -> Path:
     return Path(os.path.expanduser(value or os.environ.get("AGENTOPSY_STATE_DIR", "~/.local/state/agentopsy")))
 
 
+def _canonical_transcript_path(value: str) -> str:
+    """Canonicalise metadata only; never open or retain transcript contents."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing transcript_path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("transcript_path must be absolute")
+    return str(path.resolve(strict=False))
+
+
+def _identity_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _socket_request(socket_path: str, method: str, params: dict[str, Any], *, timeout: float = 0.5) -> Optional[dict[str, Any]]:
+    """Small local-only Herdr RPC helper. A transport error is never fatal."""
+    request = {"id": f"agentopsy:{time.time_ns()}", "method": method, "params": params}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(socket_path)
+            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+            response = client.recv(16384)
+        parsed = json.loads(response.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def report_herdr_session(provider: str, native_session_id: str, pane_id: str, socket_path: str, *, source: str) -> bool:
+    """Register a provider-native ID on the current Herdr pane and require an RPC acknowledgement."""
+    if provider != "codex" or not native_session_id or not pane_id or not socket_path:
+        return False
+    reply = _socket_request(socket_path, "pane.report_agent_session", {
+        "pane_id": pane_id, "source": source, "agent": provider,
+        "seq": time.time_ns(), "agent_session_id": native_session_id,
+    })
+    return bool(reply and "error" not in reply and "result" in reply)
+
+
+def identity_hook_payload(payload: Any, *, state_dir: Optional[str] = None, environ: Optional[dict[str, str]] = None) -> bool:
+    """Consume trusted Codex lifecycle JSON. Never writes stdout or transcript content."""
+    if not isinstance(payload, dict):
+        return False
+    env = os.environ if environ is None else environ
+    if payload.get("hook_event_name") not in {"SessionStart", "PreCompact", "PostCompact"}:
+        return False
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    provider = "codex"
+    event = str(payload["hook_event_name"])
+    source = payload.get("source") if event == "SessionStart" else None
+    source = source if isinstance(source, str) and source else ""
+    transcript = payload.get("transcript_path")
+    try:
+        transcript_path = _canonical_transcript_path(transcript) if isinstance(transcript, str) else ""
+    except ValueError:
+        return False
+    store = StateStore(state_dir)
+    try:
+        if event != "SessionStart":
+            store.record_identity_lifecycle(provider, session_id, event, source)
+            store.db.commit()
+            return True
+        if env.get("HERDR_ENV") != "1":
+            return False
+        pane_id, socket_path = env.get("HERDR_PANE_ID", ""), env.get("HERDR_SOCKET_PATH", "")
+        if not report_herdr_session(provider, session_id, pane_id, socket_path, source="agentopsy:codex"):
+            return False
+        store.register_identity(provider, session_id, transcript_path, pane_id, source)
+        store.db.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        store.close()
+
+
+def identity_hook_main(provider: str, state_dir: Optional[str] = None) -> int:
+    """Hook command entry point: fail closed and always return success to Codex."""
+    if provider != "codex":
+        return 0
+    try:
+        raw = sys.stdin.buffer.read(65536)
+        payload = json.loads(raw.decode("utf-8")) if raw else None
+        identity_hook_payload(payload, state_dir=state_dir)
+    except Exception:
+        pass
+    return 0
+
+
 class StateStore:
     """Transactional, local-only state. Raw transcript records are never stored."""
     def __init__(self, state_dir: Optional[str] = None):
@@ -2566,7 +2661,7 @@ class StateStore:
             self.db.commit()
 
     def _migration_steps(self) -> tuple[tuple[int, Any], ...]:
-        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3))
+        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3), (4, self._migration_v4))
 
     def _migration_v1(self) -> None:
         self.db.executescript("""
@@ -2615,11 +2710,67 @@ class StateStore:
             cached_input_tokens INTEGER, instruction_chars INTEGER, compaction INTEGER NOT NULL DEFAULT 0)""")
         self.db.execute("CREATE INDEX telemetry_samples_session_idx ON telemetry_samples(session_id, provider, id DESC)")
 
+    def _migration_v4(self) -> None:
+        """Metadata-only, short-lived provider-to-Herdr identity bridge."""
+        self.db.execute("""CREATE TABLE identity_mappings (
+            id INTEGER PRIMARY KEY, provider TEXT NOT NULL, native_session_id TEXT NOT NULL,
+            transcript_path TEXT NOT NULL, pane_id TEXT NOT NULL, lifecycle_source TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL, expires_at TEXT NOT NULL, confidence TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(provider, native_session_id, transcript_path, pane_id))""")
+        self.db.execute("CREATE INDEX identity_mappings_lookup_idx ON identity_mappings(provider, native_session_id, active, expires_at DESC)")
+        self.db.execute("CREATE INDEX identity_mappings_pane_idx ON identity_mappings(provider, pane_id, active)")
+        self.db.execute("""CREATE TABLE identity_lifecycle (
+            id INTEGER PRIMARY KEY, provider TEXT NOT NULL, native_session_id TEXT NOT NULL,
+            hook_event_name TEXT NOT NULL, lifecycle_source TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)""")
+        self.db.execute("CREATE INDEX identity_lifecycle_lookup_idx ON identity_lifecycle(provider, native_session_id, observed_at DESC)")
+
+    def record_identity_lifecycle(self, provider: str, native_session_id: str, event: str, source: str = "") -> None:
+        if provider != "codex" or not native_session_id or event not in {"SessionStart", "PreCompact", "PostCompact"}:
+            raise ValueError("unsupported lifecycle identity metadata")
+        self.db.execute("INSERT INTO identity_lifecycle(provider,native_session_id,hook_event_name,lifecycle_source,observed_at) VALUES(?,?,?,?,?)",
+                        (provider, native_session_id, event, source, _identity_now().isoformat()))
+
+    def register_identity(self, provider: str, native_session_id: str, transcript_path: str, pane_id: str, source: str = "") -> None:
+        """Atomically supersede conflicting registrations; no heuristic joins."""
+        if provider != "codex" or not native_session_id or not pane_id:
+            raise ValueError("unsupported or incomplete identity registration")
+        transcript_path = _canonical_transcript_path(transcript_path)
+        now = _identity_now(); expiry = now + dt.timedelta(seconds=IDENTITY_TTL_SECONDS)
+        # A pane may never retain an old native ID, and an ID may never retain an old transcript.
+        self.db.execute("UPDATE identity_mappings SET active=0 WHERE provider=? AND active=1 AND (pane_id=? AND native_session_id<>? OR native_session_id=? AND transcript_path<>?)",
+                        (provider, pane_id, native_session_id, native_session_id, transcript_path))
+        self.db.execute("""INSERT INTO identity_mappings(provider,native_session_id,transcript_path,pane_id,lifecycle_source,observed_at,expires_at,confidence,active)
+            VALUES(?,?,?,?,?,?,?,?,1)
+            ON CONFLICT(provider,native_session_id,transcript_path,pane_id) DO UPDATE SET
+              lifecycle_source=excluded.lifecycle_source,observed_at=excluded.observed_at,expires_at=excluded.expires_at,confidence='EXACT',active=1""",
+                        (provider, native_session_id, transcript_path, pane_id, source, now.isoformat(), expiry.isoformat(), "EXACT"))
+        self.record_identity_lifecycle(provider, native_session_id, "SessionStart", source)
+
+    def invalidate_identity(self, provider: str, native_session_id: str, *, pane_id: str = "") -> int:
+        sql, args = "UPDATE identity_mappings SET active=0 WHERE provider=? AND native_session_id=? AND active=1", [provider, native_session_id]
+        if pane_id:
+            sql += " AND pane_id=?"; args.append(pane_id)
+        return self.db.execute(sql, args).rowcount
+
+    def exact_identity(self, provider: str, native_session_id: str, transcript_path: str, *, now: Optional[dt.datetime] = None) -> Optional[sqlite3.Row]:
+        """Return only a current exact three-way registration, never a best match."""
+        try:
+            transcript_path = _canonical_transcript_path(transcript_path)
+        except ValueError:
+            return None
+        now_text = (now or _identity_now()).isoformat()
+        rows = self.db.execute("""SELECT * FROM identity_mappings WHERE provider=? AND native_session_id=? AND transcript_path=?
+            AND active=1 AND confidence='EXACT' AND expires_at>? ORDER BY id DESC""", (provider, native_session_id, transcript_path, now_text)).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
     def file(self, path: Path) -> Optional[sqlite3.Row]:
         return self.db.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
 
     def reset_file_session(self, row: sqlite3.Row) -> None:
         if row["session_id"]:
+            # A replaced transcript can no longer be an exact live-session witness.
+            self.db.execute("UPDATE identity_mappings SET active=0 WHERE provider=? AND native_session_id=? AND transcript_path=?", (row["provider"], row["session_id"], _canonical_transcript_path(str(row["path"]))))
             self.db.execute("DELETE FROM sessions WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
             self.db.execute("DELETE FROM occurrences WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
             self.db.execute("DELETE FROM record_dedup WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
@@ -2735,6 +2886,116 @@ class StateStore:
         self.db.execute("INSERT INTO health_events(timestamp,session_id,provider,severity,code,message,evidence) VALUES(?,?,?,?,?,?,?)", (now.isoformat(), sid, provider, severity, code, message, json.dumps(evidence, sort_keys=True)))
 
 
+def exact_identity_for_live_session(store: Optional[StateStore], row: sqlite3.Row) -> Optional[sqlite3.Row]:
+    """Join only equal native IDs plus equal canonical transcript paths."""
+    if store is None or row["provider"] != "codex" or not row["session_id"] or not row["path"]:
+        return None
+    return store.exact_identity("codex", str(row["session_id"]), str(row["path"]))
+
+
+def herdr_pane_is_idle(mapping: sqlite3.Row, *, socket_path: Optional[str] = None) -> bool:
+    """Re-query Herdr so a restart or pane reuse immediately blocks control."""
+    sock = socket_path or os.environ.get("HERDR_SOCKET_PATH") or str(Path.home() / ".config" / "herdr" / "herdr.sock")
+    reply = _socket_request(sock, "agent.list", {})
+    agents = ((reply or {}).get("result") or {}).get("agents")
+    if not isinstance(agents, list):
+        return False
+    for agent in agents:
+        session = agent.get("agent_session") if isinstance(agent, dict) else None
+        if not isinstance(session, dict):
+            continue
+        if (agent.get("agent") == mapping["provider"] and agent.get("pane_id") == mapping["pane_id"]
+                and session.get("value") == mapping["native_session_id"] and agent.get("agent_status") == "idle"):
+            return True
+    return False
+
+
+class CompactVerification(str, enum.Enum):
+    REQUESTED = "REQUESTED"
+    ACCEPTED = "ACCEPTED"
+    PROVIDER_CONFIRMED = "PROVIDER_CONFIRMED"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+    TIMED_OUT = "TIMED_OUT"
+    IDENTITY_LOST = "IDENTITY_LOST"
+    AMBIGUOUS = "AMBIGUOUS"
+    FAILED = "FAILED"
+
+
+@dataclasses.dataclass(frozen=True)
+class CompactRequest:
+    state: CompactVerification
+    requested_at: dt.datetime
+    before_compactions: int
+    before_context: Optional[int]
+    before_telemetry_id: int
+
+
+def compact_request_snapshot(store: StateStore, mapping: sqlite3.Row) -> CompactRequest:
+    """Capture compact numeric state immediately before the one allowed request."""
+    row = store.db.execute("SELECT compactions FROM sessions WHERE session_id=? AND provider=?",
+                           (mapping["native_session_id"], mapping["provider"])).fetchone()
+    sample = store.db.execute("""SELECT id,context_tokens FROM telemetry_samples
+        WHERE session_id=? AND provider=? AND context_tokens IS NOT NULL ORDER BY id DESC LIMIT 1""",
+                             (mapping["native_session_id"], mapping["provider"])).fetchone()
+    return CompactRequest(CompactVerification.REQUESTED, _identity_now(), int(row[0] if row else 0),
+                          int(sample["context_tokens"]) if sample else None, int(sample["id"]) if sample else 0)
+
+
+def invoke_herdr_compact(mapping: sqlite3.Row, request: CompactRequest) -> CompactRequest:
+    """Submit one structured request. Completion is proven separately from local evidence."""
+    if not herdr_pane_is_idle(mapping):
+        return dataclasses.replace(request, state=CompactVerification.REJECTED)
+    try:
+        result = subprocess.run(["herdr", "agent", "prompt", str(mapping["pane_id"]), "/compact", "--wait", "--until", "idle"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                timeout=30, check=False)
+        # Herdr can report agent_prompt_stalled when a very short provider turn
+        # reaches idle before its state watcher observes working.  Treat that as
+        # an unverified request, never as proof that delivery failed or succeeded.
+        return dataclasses.replace(request, state=CompactVerification.ACCEPTED if result.returncode == 0 else CompactVerification.REQUESTED)
+    except (OSError, subprocess.TimeoutExpired):
+        return dataclasses.replace(request, state=CompactVerification.TIMED_OUT)
+
+
+def verify_herdr_compact(store: StateStore, mapping: sqlite3.Row, request: CompactRequest) -> CompactVerification:
+    """Verify one request from exact identity, provider lifecycle, and numeric telemetry.
+
+    A CLI transport acknowledgement alone is intentionally insufficient.  The
+    provider can complete before Herdr's waiter observes a working transition,
+    so matching post-request provider evidence is allowed to establish delivery.
+    """
+    current = store.exact_identity(str(mapping["provider"]), str(mapping["native_session_id"]), str(mapping["transcript_path"]))
+    if current is None or current["pane_id"] != mapping["pane_id"]:
+        return CompactVerification.IDENTITY_LOST
+    requested = request.requested_at.isoformat()
+    lifecycle = store.db.execute("""SELECT hook_event_name,lifecycle_source FROM identity_lifecycle
+        WHERE provider=? AND native_session_id=? AND observed_at>=? ORDER BY id""",
+                                 (mapping["provider"], mapping["native_session_id"], requested)).fetchall()
+    provider_lifecycle = any(item["hook_event_name"] == "PostCompact" or
+                             (item["hook_event_name"] == "SessionStart" and item["lifecycle_source"] == "compact")
+                             for item in lifecycle)
+    row = store.db.execute("SELECT compactions FROM sessions WHERE session_id=? AND provider=?",
+                           (mapping["native_session_id"], mapping["provider"])).fetchone()
+    compaction_seen = row is not None and int(row[0]) > request.before_compactions
+    if not provider_lifecycle or not compaction_seen:
+        return CompactVerification.TIMED_OUT
+    after = store.db.execute("""SELECT context_tokens FROM telemetry_samples
+        WHERE session_id=? AND provider=? AND id>? AND context_tokens IS NOT NULL ORDER BY id DESC LIMIT 1""",
+                             (mapping["native_session_id"], mapping["provider"], request.before_telemetry_id)).fetchone()
+    if request.before_context is None or after is None:
+        return CompactVerification.PROVIDER_CONFIRMED
+    return CompactVerification.VERIFIED if int(after[0]) < request.before_context else CompactVerification.FAILED
+
+
+def compact_action_recent(store: StateStore, provider: str, session_id: str, cooldown_seconds: int) -> bool:
+    """A verified compact gets one cooldown window; never repeat it blindly."""
+    row = store.db.execute("""SELECT timestamp FROM health_events WHERE provider=? AND session_id=?
+        AND code='COMPACT_VERIFIED' ORDER BY id DESC LIMIT 1""", (provider, session_id)).fetchone()
+    when = iso_to_dt(str(row[0])) if row else None
+    return bool(when and (_identity_now() - when).total_seconds() < cooldown_seconds)
+
+
 @dataclasses.dataclass(frozen=True)
 class HealthPolicy:
     watch_pct: float = 0.50
@@ -2778,7 +3039,7 @@ def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, l
 class IngestionMetrics:
     bytes_examined: int = 0; bytes_newly_parsed: int = 0; files_unchanged: int = 0; files_advanced: int = 0; files_rescanned: int = 0; parse_errors: int = 0
     touched_sessions: set = dataclasses.field(default_factory=set)
-    control_evaluations: int = 0; control_blocked: int = 0; control_fail_safes: int = 0
+    control_evaluations: int = 0; control_blocked: int = 0; control_fail_safes: int = 0; control_invocations: int = 0; control_verified: int = 0
 
 
 class IncrementalIngestor:
@@ -3043,9 +3304,28 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
                     fail_safe = fail_safe_control("transcript-integrity uncertainty", provider=prov, session_id=sid, malformed_records=int(row["malformed_records"] or 0))
                     store.event(prov, sid, fail_safe.severity.value.lower(), fail_safe.code, "Control disabled because transcript integrity is uncertain.", fail_safe.evidence)
                     metrics.control_fail_safes += 1
-                decision = control_decision_for_live_session(row, auto_act)
+                decision = control_decision_for_live_session(row, auto_act, store)
                 if not decision.allowed:
                     metrics.control_blocked += 1
+                elif decision.action == "compact":
+                    mapping = exact_identity_for_live_session(store, row)
+                    if mapping is None or compact_action_recent(store, prov, sid, notification["cooldown_seconds"]):
+                        metrics.control_blocked += 1
+                    else:
+                        request = invoke_herdr_compact(mapping, compact_request_snapshot(store, mapping))
+                        if request.state == CompactVerification.REJECTED:
+                            metrics.control_blocked += 1
+                        else:
+                            # One bounded re-scan admits asynchronous provider hooks and
+                            # the compacted transcript record without retrying the action.
+                            IncrementalIngestor(store, roots, "codex", event_cooldown=notification["cooldown_seconds"]).scan()
+                            verified = verify_herdr_compact(store, mapping, request)
+                            if verified == CompactVerification.VERIFIED:
+                                metrics.control_invocations += 1
+                                metrics.control_verified += 1
+                                store.event(prov, sid, "info", "COMPACT_VERIFIED", "Compact request verified from matching provider lifecycle and reduced context.", {"verified": True})
+                            else:
+                                metrics.control_blocked += 1
             activity = iso_to_dt(row["last_activity_at"]) if row else None
             # last_activity_at is raw provider text (e.g. Codex's "...503Z" vs
             # Claude's own format); parse both sides rather than comparing
@@ -3112,8 +3392,72 @@ def service_main(argv: Optional[list[str]] = None) -> int:
         except FileNotFoundError: pass
 
 
+def _codex_hook_command(state_dir: Optional[str]) -> str:
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} integration hook codex"
+    return command + (f" --state-dir {shlex.quote(state_dir)}" if state_dir else "")
+
+
+def _backup_file(path: Path) -> Optional[Path]:
+    if not path.exists(): return None
+    backup = path.with_name(path.name + ".agentopsy-backup-" + _identity_now().strftime("%Y%m%d%H%M%S"))
+    shutil.copy2(path, backup)
+    return backup
+
+
+def integration_status(codex_home: Path) -> dict[str, Any]:
+    config, hooks = codex_home / "config.toml", codex_home / "hooks.json"
+    try: payload = json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else {}
+    except Exception: payload = {}
+    commands = [str(item.get("command") or "") for group in payload.get("hooks", {}).get("SessionStart", []) if isinstance(group, dict) for item in group.get("hooks", []) if isinstance(item, dict)]
+    config_text = config.read_text(encoding="utf-8") if config.exists() else ""
+    return {"provider": "codex", "hooks_enabled": bool(re.search(r"(?m)^hooks\s*=\s*true\s*$", config_text)),
+            "agentopsy_hook_installed": any("integration hook codex" in item for item in commands),
+            "herdr_hook_present": any("herdr-agent-state.sh" in item for item in commands),
+            "configuration": str(config), "hook_file": str(hooks)}
+
+
+def integration_install_codex(codex_home: Path, state_dir: Optional[str]) -> dict[str, Any]:
+    """Explicit installer: preserve existing hooks and back up each edited file."""
+    config, hooks = codex_home / "config.toml", codex_home / "hooks.json"
+    if not config.exists(): raise ValueError(f"Codex configuration not found: {config}")
+    _backup_file(config); _backup_file(hooks)
+    text = config.read_text(encoding="utf-8")
+    text = re.sub(r"(?m)^hooks\s*=\s*(true|false)\s*$", "hooks = true", text, count=1) if re.search(r"(?m)^hooks\s*=", text) else text + "\n[features]\nhooks = true\n"
+    config.write_text(text, encoding="utf-8")
+    try: payload = json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else {}
+    except json.JSONDecodeError as exc: raise ValueError("Codex hooks.json is malformed; refusing to modify it") from exc
+    command = _codex_hook_command(state_dir)
+    for event in ("SessionStart", "PreCompact", "PostCompact"):
+        groups = payload.setdefault("hooks", {}).setdefault(event, [])
+        if not any(command == str(item.get("command") or "") for group in groups if isinstance(group, dict) for item in group.get("hooks", []) if isinstance(item, dict)):
+            groups.append({"hooks": [{"type": "command", "command": command, "timeout": 2}]})
+    hooks.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return integration_status(codex_home)
+
+
+def integration_remove_codex(codex_home: Path) -> dict[str, Any]:
+    hooks = codex_home / "hooks.json"
+    if not hooks.exists(): return integration_status(codex_home)
+    _backup_file(hooks); payload = json.loads(hooks.read_text(encoding="utf-8")); retained = []
+    for event in ("SessionStart", "PreCompact", "PostCompact"):
+        retained = []
+        for group in payload.get("hooks", {}).get(event, []):
+            if not isinstance(group, dict): retained.append(group); continue
+            entries = [item for item in group.get("hooks", []) if not (isinstance(item, dict) and "integration hook codex" in str(item.get("command") or ""))]
+            if entries: retained.append({**group, "hooks": entries})
+        payload.setdefault("hooks", {})[event] = retained
+    hooks.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return integration_status(codex_home)
+
+
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration"}: return None
+    if argv[0] == "integration":
+        parser = argparse.ArgumentParser(prog="agentopsy integration"); parser.add_argument("action", choices=["status", "install", "remove", "hook"]); parser.add_argument("provider", choices=["codex"]); parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", "~/.codex")); parser.add_argument("--state-dir")
+        args = parser.parse_args(argv[1:]); home = Path(os.path.expanduser(args.codex_home))
+        if args.action == "hook": return identity_hook_main(args.provider, args.state_dir)
+        payload = integration_status(home) if args.action == "status" else integration_install_codex(home, args.state_dir) if args.action == "install" else integration_remove_codex(home)
+        print(json.dumps(payload, indent=2)); return 0
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -3259,7 +3603,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration"}:
         try:
             return live_cli(argv)
         except SystemExit:
