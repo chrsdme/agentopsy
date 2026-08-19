@@ -47,7 +47,7 @@ from typing import Any, Iterable, Iterator, Optional
 
 VERSION = "0.4.0-dev"
 PARSER_VERSION = 1
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 SEVERITY_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
@@ -527,7 +527,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
         event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
-                 "compactions": 0, "read_key": "", "command_key": "", "tool_call_items": [], "tool_result_items": []}
+                 "compactions": 0, "read_key": "", "command_key": "", "content_key": "", "tool_call_items": [], "tool_result_items": []}
         msg = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = msg.get("content")
         if record.get("type") == "assistant" and isinstance(content, list):
@@ -536,13 +536,16 @@ class ClaudeAdapter(ProviderAdapter):
                     event["tool_calls"] += 1
                     event["tool_call_items"].append(str(block.get("id") or ""))
                     name, inp = str(block.get("name") or ""), block.get("input") or {}
-                    if name == "Read": event["read_key"] = str(inp.get("file_path") or inp.get("path") or "")
+                    if name == "Read":
+                        target = str(inp.get("file_path") or inp.get("path") or "")
+                        event["read_key"] = json.dumps((target, inp.get("offset"), inp.get("limit")), separators=(",", ":")) if target else ""
                     if name == "Bash": event["command_key"] = normalise_command(str(inp.get("command") or ""))
         if record.get("type") == "user" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     chars = content_len(block.get("content")); event["tool_result_chars"] += chars
                     event["max_tool_result_chars"] = max(event["max_tool_result_chars"], chars)
+                    event["content_key"] = json_text(block.get("content"))
                     event["tool_result_items"].append((str(block.get("tool_use_id") or ""), chars))
         return event
 
@@ -587,7 +590,7 @@ class CodexAdapter(ProviderAdapter):
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
         event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
-                 "compactions": int(record.get("type") == "compacted"), "read_key": "", "command_key": ""}
+                 "compactions": int(record.get("type") == "compacted"), "read_key": "", "command_key": "", "content_key": ""}
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         if record.get("type") != "response_item": return event
         typ = payload.get("type")
@@ -598,9 +601,13 @@ class CodexAdapter(ProviderAdapter):
                 try: args = json.loads(args)
                 except json.JSONDecodeError: args = {}
             if name == "exec_command" and isinstance(args, dict): event["command_key"] = normalise_command(str(args.get("cmd") or ""))
+            if name in {"read_file", "read"} and isinstance(args, dict):
+                target = str(args.get("path") or args.get("file_path") or "")
+                event["read_key"] = json.dumps((target, args.get("offset"), args.get("limit")), separators=(",", ":")) if target else ""
         elif typ in {"function_call_output", "custom_tool_call_output"}:
             chars = len(json_text(payload.get("output") if "output" in payload else payload.get("content")))
             event["tool_result_chars"] = chars; event["max_tool_result_chars"] = chars
+            event["content_key"] = json_text(payload.get("output") if "output" in payload else payload.get("content"))
         return event
 
     def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -692,7 +699,7 @@ def classify_jsonl(path: Path) -> Optional[str]:
     return None
 
 
-def collect_candidates(roots: list[tuple[Path, str]], provider_filter: str) -> list[Candidate]:
+def collect_candidates(roots: list[tuple[Path, str]], provider_filter: str, classifier: Optional[Any] = None) -> list[Candidate]:
     candidates: list[Candidate] = []
     seen: set[Path] = set()
     for root, label in roots:
@@ -705,7 +712,7 @@ def collect_candidates(roots: list[tuple[Path, str]], provider_filter: str) -> l
             if rp in seen:
                 continue
             seen.add(rp)
-            provider = classify_jsonl(path)
+            provider = (classifier or classify_jsonl)(path)
             if provider is None or (provider_filter != "all" and provider_filter != provider):
                 continue
             parts = path.parts
@@ -2196,7 +2203,7 @@ class StateStore:
             self.db.commit()
 
     def _migration_steps(self) -> tuple[tuple[int, Any], ...]:
-        return ((1, self._migration_v1), (2, self._migration_v2))
+        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3))
 
     def _migration_v1(self) -> None:
         self.db.executescript("""
@@ -2237,6 +2244,14 @@ class StateStore:
             lane TEXT NOT NULL, PRIMARY KEY(event_id, lane))""")
         self.db.execute("CREATE INDEX guardian_events_session_idx ON guardian_events(session_id, provider, timestamp DESC)")
 
+    def _migration_v3(self) -> None:
+        self.db.execute("""CREATE TABLE telemetry_samples (
+            id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL,
+            turn_index INTEGER NOT NULL, context_tokens INTEGER, context_pct REAL,
+            tool_output_chars INTEGER NOT NULL DEFAULT 0, read_hash TEXT NOT NULL DEFAULT '', command_hash TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '',
+            cached_input_tokens INTEGER, instruction_chars INTEGER, compaction INTEGER NOT NULL DEFAULT 0)""")
+        self.db.execute("CREATE INDEX telemetry_samples_session_idx ON telemetry_samples(session_id, provider, id DESC)")
+
     def file(self, path: Path) -> Optional[sqlite3.Row]:
         return self.db.execute("SELECT * FROM files WHERE path=?", (str(path),)).fetchone()
 
@@ -2245,6 +2260,20 @@ class StateStore:
             self.db.execute("DELETE FROM sessions WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
             self.db.execute("DELETE FROM occurrences WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
             self.db.execute("DELETE FROM record_dedup WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+            self.db.execute("DELETE FROM telemetry_samples WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+
+    def cached_provider(self, path: Path) -> Optional[str]:
+        """Use durable file identity to avoid opening unchanged transcript files."""
+        row = self.file(path)
+        if row is None or int(row["parser_version"]) != PARSER_VERSION:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        if row["identity"] != f"{stat.st_dev}:{stat.st_ino}" or stat.st_size < int(row["last_offset"]) or stat.st_mtime_ns != int(row["mtime_ns"]):
+            return None
+        return str(row["provider"])
 
     def upsert_file(self, *, provider: str, path: Path, identity: str, size: int, mtime_ns: int, offset: int, partial: str, session_id: str, status: str) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2286,7 +2315,43 @@ class StateStore:
                 digest = sha1_text(str(key)); self.db.execute("INSERT INTO occurrences(session_id,provider,kind,key_hash,count) VALUES(?,?,?,?,1) ON CONFLICT(session_id,provider,kind,key_hash) DO UPDATE SET count=count+1", (sid, provider, kind, digest))
                 col = "repeated_reads" if kind == "read" else "repeated_commands"
                 self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE session_id=? AND provider=? AND kind=?) WHERE session_id=? AND provider=?", (sid, provider, kind, sid, provider))
+        self.record_telemetry(provider, sid, ts, data)
         return sid
+
+    def record_telemetry(self, provider: str, sid: str, timestamp: str, data: dict[str, Any]) -> None:
+        """Persist a bounded numeric/hash-only ring; never transcript payloads."""
+        meaningful = any(data.get(key) not in (None, "", 0, 0.0) for key in ("peak_context_tokens", "peak_context_pct", "tool_result_chars", "read_key", "command_key", "content_key", "cached_input_tokens", "compactions", "instruction_chars"))
+        if not meaningful:
+            return
+        row = self.db.execute("SELECT model_turns FROM sessions WHERE session_id=? AND provider=?", (sid, provider)).fetchone()
+        stamp = timestamp if iso_to_dt(timestamp) else dt.datetime.now(dt.timezone.utc).isoformat()
+        self.db.execute("""INSERT INTO telemetry_samples(timestamp,session_id,provider,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (stamp, sid, provider, int(row[0] if row else 0), data.get("peak_context_tokens") or None, data.get("peak_context_pct") or None, safe_int(data.get("tool_result_chars")), sha1_text(str(data["read_key"])) if data.get("read_key") else "", sha1_text(str(data["command_key"])) if data.get("command_key") else "", sha1_text(str(data["content_key"])) if data.get("content_key") else "", data.get("cached_input_tokens"), data.get("instruction_chars"), int(bool(data.get("compactions")))))
+        self.db.execute("""DELETE FROM telemetry_samples WHERE session_id=? AND provider=? AND id NOT IN
+            (SELECT id FROM telemetry_samples WHERE session_id=? AND provider=? ORDER BY id DESC LIMIT 250)""", (sid, provider, sid, provider))
+
+    def rolling_telemetry(self, provider: str, sid: str, now: Optional[dt.datetime] = None) -> dict[str, Any]:
+        rows = self.db.execute("SELECT * FROM telemetry_samples WHERE session_id=? AND provider=? ORDER BY id", (sid, provider)).fetchall()
+        now = now or dt.datetime.now(dt.timezone.utc)
+        parsed = [(r, iso_to_dt(r["timestamp"]) or now) for r in rows]
+        def summarise(samples: list[tuple[sqlite3.Row, dt.datetime]]) -> dict[str, Any]:
+            contexts = [float(r["context_tokens"]) for r, _ in samples if r["context_tokens"] is not None]
+            pcts = [float(r["context_pct"]) for r, _ in samples if r["context_pct"] is not None]
+            turns = max((int(r["turn_index"]) for r, _ in samples), default=0) - min((int(r["turn_index"]) for r, _ in samples), default=0)
+            cache = [int(r["cached_input_tokens"]) for r, _ in samples if r["cached_input_tokens"] is not None]
+            return {"samples": len(samples), "context_growth_tokens": (contexts[-1] - contexts[0]) if len(contexts) > 1 else None, "context_growth_pct": (pcts[-1] - pcts[0]) if len(pcts) > 1 else None, "context_growth_tokens_per_turn": ((contexts[-1] - contexts[0]) / turns) if len(contexts) > 1 and turns else None, "context_growth_pct_per_turn": ((pcts[-1] - pcts[0]) / turns) if len(pcts) > 1 and turns else None, "tool_output_chars": sum(int(r["tool_output_chars"]) for r, _ in samples), "repeated_read_rate": sum(bool(r["read_hash"]) for r, _ in samples) / len(samples) if samples else None, "repeated_command_rate": sum(bool(r["command_hash"]) for r, _ in samples) / len(samples) if samples else None, "cache_reuse_change": cache[-1] - cache[0] if len(cache) > 1 else None, "advisor_subagent_amplification": None, "instruction_startup_overhead": None}
+        result = {"last_5m": summarise([(r, t) for r, t in parsed if t >= now - dt.timedelta(minutes=5)]), "last_15m": summarise([(r, t) for r, t in parsed if t >= now - dt.timedelta(minutes=15)])}
+        turn_rows = [(r, t) for r, t in parsed if int(r["turn_index"]) > 0]
+        for size in (10, 20, 50): result[f"last_{size}_turns"] = summarise(turn_rows[-size:])
+        high = [(r, t) for r, t in parsed if float(r["context_pct"] or 0) >= CODEX_HIGH_CONTEXT_PCT]
+        result["high_context_dwell_seconds"] = sum(max(0, (high[i][1] - high[i - 1][1]).total_seconds()) for i in range(1, len(high)))
+        compact = [i for i, (r, _) in enumerate(parsed) if r["compaction"]]
+        result["compaction_snapshots"] = len(compact)
+        result["context_refill_after_compaction"] = None
+        if compact:
+            index = compact[-1]; after = parsed[index][0]["context_tokens"]; latest = next((r["context_tokens"] for r, _ in reversed(parsed) if r["context_tokens"] is not None), None)
+            if after is not None and latest is not None: result["context_refill_after_compaction"] = max(0, int(latest) - int(after))
+        return result
 
     def mark_unique(self, provider: str, sid: str, kind: str, key: str) -> bool:
         if not key: return True
@@ -2355,7 +2420,7 @@ class IncrementalIngestor:
 
     def scan(self) -> IngestionMetrics:
         metrics = IngestionMetrics()
-        candidates = collect_candidates(self.roots, self.provider)
+        candidates = collect_candidates(self.roots, self.provider, lambda path: self.store.cached_provider(path) or classify_jsonl(path))
         with self.store.db:
             for candidate in candidates: self._ingest(candidate, metrics)
             self.store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('last_successful_scan',?)", (dt.datetime.now(dt.timezone.utc).isoformat(),))
