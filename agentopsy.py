@@ -2203,6 +2203,141 @@ def run_watch(args: argparse.Namespace) -> int:
         return 0
 
 
+class Notifier:
+    """Optional local notifier; absence of a desktop/Herdr is always harmless."""
+    def __init__(self, enabled: bool = True, minimum: str = "medium"):
+        self.enabled, self.minimum = enabled, minimum
+
+    def notify(self, title: str, message: str) -> None:
+        if not self.enabled: return
+        print(f"Agentopsy: {title}\n{message}", file=sys.stderr)
+        if shutil.which("notify-send"):
+            try: subprocess.run(["notify-send", "Agentopsy: " + title, message], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except (OSError, subprocess.SubprocessError): pass
+
+
+class HerdrAdapter:
+    """Passive integration boundary. It never controls or resets an agent."""
+    def available(self) -> bool: return shutil.which("herdr") is not None
+    def list_agents(self) -> list[dict[str, Any]]: return []  # Native structured mapping is provider/version dependent.
+    def identify_session(self, agent: dict[str, Any]) -> str: return str(agent.get("session_id") or "")
+    def notify(self, title: str, message: str) -> bool:
+        if not self.available(): return False
+        try: return subprocess.run(["herdr", "notification", "show", title, message], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError): return False
+    def wait_until_safe(self, _session_id: str) -> bool: return False
+
+
+HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Files Changed", "Verification", "Open Problems", "Do Not Repeat", "Exact Next Action", "Relevant References")
+
+def validate_handoff(project: str) -> dict[str, Any]:
+    path = Path(project) / ".ai" / "state" / "HANDOFF.md"
+    result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None}
+    if not path.is_file(): return result
+    text = path.read_text(encoding="utf-8", errors="replace")
+    result["missing"] = [name for name in HANDOFF_SECTIONS if not re.search(rf"(?mi)^#+\s*{re.escape(name)}\s*$", text)]
+    result["valid"] = not result["missing"]
+    result["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    result["freshness_seconds"] = max(0, int(time.time() - path.stat().st_mtime))
+    return result
+
+
+def render_health(rows: list[sqlite3.Row]) -> str:
+    if not rows: return "No incremental session state yet. Run `agentopsy service once`."
+    lines = []
+    for row in rows:
+        pct = float(row["peak_context_pct"] or 0.0)
+        context = f"{pct*100:.1f}%" if pct else (f"~{human_int(row['peak_context_tokens'])} tokens" if row["peak_context_tokens"] else "unknown")
+        lines += [row["provider"].title(), f"session: {row['session_id']}", f"health: {row['health_state']}", f"context: {context}", f"peak context: {context}", f"large reads: {row['repeated_reads']}", f"repeated commands: {row['repeated_commands']}", f"last activity: {row['last_activity_at'] or '-'}", ""]
+    return "\n".join(lines).rstrip()
+
+
+def trend_payload(store: StateStore, days: int = 30) -> dict[str, Any]:
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    result: dict[str, Any] = {"period_days": days, "providers": {}}
+    for provider in ("claude", "codex"):
+        rows = store.db.execute("SELECT * FROM sessions WHERE provider=? AND last_activity_at>=?", (provider, cutoff)).fetchall()
+        peaks = [float(r["peak_context_pct"] or 0.0) for r in rows if r["peak_context_pct"]]
+        result["providers"][provider] = {"sessions": len(rows), "median_peak_context_pct": statistics.median(peaks) if peaks else None,
+            "sessions_over_65pct": sum(x >= .65 for x in peaks), "repeated_read_sessions": sum(int(r["repeated_reads"]) >= 4 for r in rows),
+            "compaction_thrash_sessions": sum(int(r["compactions"]) >= 3 for r in rows),
+            "tool_output_chars": sum(int(r["tool_result_chars"]) for r in rows), "note": "Context/token values are transcript telemetry or explicit proxies, not billing."}
+    return result
+
+
+def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
+    store = StateStore(state_dir)
+    try:
+        metrics = IncrementalIngestor(store, roots, provider).scan()
+        notifier = Notifier(notify)
+        for row in store.sessions(provider):
+            for event in store.db.execute("SELECT * FROM health_events WHERE session_id=? AND provider=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (row["session_id"], row["provider"])).fetchall():
+                if event["timestamp"] >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3)).isoformat(): notifier.notify(f"{row['provider'].title()} session needs attention", event["message"])
+        return metrics
+    finally: store.close()
+
+
+def service_main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="agentopsyd", description="Passive local Agentopsy session-health service.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("run", "once"):
+        q = sub.add_parser(name); q.add_argument("--interval", type=int, default=20); q.add_argument("--state-dir"); q.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); q.add_argument("--foreground", action="store_true"); q.add_argument("--no-notify", action="store_true")
+    status = sub.add_parser("status"); status.add_argument("--state-dir")
+    args = parser.parse_args(argv)
+    if args.command == "status":
+        store = StateStore(args.state_dir)
+        try:
+            print(render_health(store.sessions())); return 0
+        finally: store.close()
+    if args.command == "once":
+        m = service_once(args.state_dir, args.provider, notify=not args.no_notify); print(dataclasses.asdict(m)); return 0
+    if args.interval <= 0: parser.error("--interval must be positive")
+    lock = default_state_dir(args.state_dir) / "agentopsyd.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            pid = int(lock.read_text().strip()); os.kill(pid, 0)
+        except (ValueError, ProcessLookupError):
+            lock.unlink(missing_ok=True); fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        else:
+            parser.error(f"another agentopsyd instance appears to hold {lock}")
+    running = True
+    def stop(_sig: int, _frame: Any) -> None:
+        nonlocal running; running = False
+    signal.signal(signal.SIGINT, stop); signal.signal(signal.SIGTERM, stop)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        while running:
+            m = service_once(args.state_dir, args.provider, notify=not args.no_notify)
+            print(f"sessions scan: advanced={m.files_advanced} unchanged={m.files_unchanged} parsed={human_bytes(m.bytes_newly_parsed)}", flush=True)
+            for _ in range(args.interval * 10):
+                if not running: break
+                time.sleep(.1)
+        return 0
+    finally:
+        os.close(fd)
+        try: lock.unlink()
+        except FileNotFoundError: pass
+
+
+def live_cli(argv: list[str]) -> Optional[int]:
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff"}: return None
+    if argv[0] == "service": return service_main(argv[1:])
+    parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
+    parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
+    if argv[0] == "trends": parser.add_argument("--days", type=int, default=30); parser.add_argument("--json", action="store_true")
+    if argv[0] == "handoff": parser.add_argument("project")
+    args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+    try:
+        if argv[0] in {"health", "service-status"}: print(render_health(store.sessions(args.provider, args.session)))
+        elif argv[0] == "trends":
+            payload = trend_payload(store, args.days); print(json.dumps(payload, indent=2) if args.json else "\n".join(f"{p.title()}: sessions={v['sessions']} median peak context={v['median_peak_context_pct']} repeated-read sessions={v['repeated_read_sessions']}" for p,v in payload['providers'].items()))
+        else: print(json.dumps(validate_handoff(args.project), indent=2))
+        return 0
+    finally: store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agentopsy",
@@ -2268,6 +2403,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    live_result = live_cli(argv)
+    if live_result is not None:
+        return live_result
     args = build_parser().parse_args(argv)
     try:
         if args.watch:

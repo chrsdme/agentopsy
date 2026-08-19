@@ -25,9 +25,12 @@ The analyser should remain useful by itself even if the service is never install
 - [x] privacy/public-release scrub
 - [x] synthetic tests only in repository
 
-## v0.3 - Incremental collector (`agentopsyd`)
+## v0.3 - Incremental collector (`agentopsyd`) — implemented
 
-The service must **not rescan entire transcripts on every interval**.
+The service does **not rescan entire transcripts on every interval**. File
+cursors, partial-line recovery, health state, compact trend summaries, optional
+desktop notification, handoff validation, and passive Herdr detection are
+implemented. Automatic rotation remains deferred.
 
 ### File cursor model
 
@@ -92,7 +95,7 @@ The service should avoid becoming another source of data bloat:
 - store aggregate counters instead of raw tool output;
 - make raw-content retention an explicit opt-in, not a default.
 
-## v0.4 - Live health and notifications
+## v0.4 - Context-governor calibration and opt-in control
 
 Introduce stateful session-health policies with hysteresis/cooldowns.
 

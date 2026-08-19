@@ -6,6 +6,7 @@ BINDIR="$PREFIX/bin"
 
 mkdir -p "$BINDIR"
 install -m 0755 "$(dirname "$0")/agentopsy.py" "$BINDIR/agentopsy"
+ln -sf agentopsy "$BINDIR/agentopsyd"
 
 printf 'Installed Agentopsy to %s\n' "$BINDIR/agentopsy"
 printf 'Ensure %s is on PATH.\n' "$BINDIR"

@@ -490,9 +490,47 @@ See [SECURITY.md](SECURITY.md).
 
 ---
 
-# Current passive mode
+# Incremental/live mode
 
-Version 0.2 retains the original polling prototype:
+The forensic CLI remains independent. The optional local service adds durable,
+incremental state without changing provider transcripts:
+
+```bash
+# one safe incremental pass
+agentopsy service once
+
+# run passively (20 seconds by default)
+agentopsyd run --foreground --interval 20
+
+# inspect derived local state
+agentopsy health
+agentopsy health --all
+agentopsy health --provider claude
+agentopsy trends --days 7
+agentopsy trends --json
+agentopsy handoff /path/to/project
+```
+
+State is stored at `~/.local/state/agentopsy/agentopsy.db`; set
+`AGENTOPSY_STATE_DIR` or pass `--state-dir` to use another location. A sample
+user service is [docs/agentopsyd.service](docs/agentopsyd.service). Copy it to
+`~/.config/systemd/user/`, then enable it yourself if desired; the installer
+does not enable services.
+
+The live policy defaults are deliberately provisional: watch at 50%, checkpoint
+at 65%, and rotation recommendation at 80%, with recovery below 45%. Codex
+uses reported context-window occupancy. Claude lacks a universal denominator,
+so its live band is explicitly a conservative context-token proxy. Subscription
+or account quota is never used as a rotation signal.
+
+The service emits terminal notifications and uses `notify-send` when available.
+Notifications can be disabled with `--no-notify`; repeated events are cooled
+down. Herdr is optional and passive in this release. No automatic `/clear`,
+`/new`, reset, or rotation is performed.
+
+## Legacy polling mode
+
+The older full-rescan prototype remains available for compatibility:
 
 ```bash
 agentopsy --watch 300
@@ -505,15 +543,14 @@ It periodically regenerates:
 ~/.local/state/agentopsy/latest.json
 ```
 
-This mode is useful for experimentation, but it is **not the intended final live architecture** because it rescans complete files.
-
-The next major implementation target is an incremental SQLite-backed service that remembers the byte offset of each transcript and parses **only newly appended bytes**.
+This mode is useful for experimentation but rescans complete files; prefer the
+incremental service for ongoing observation.
 
 See [ROADMAP.md](ROADMAP.md) and [docs/LIVE_SERVICE_DESIGN.md](docs/LIVE_SERVICE_DESIGN.md).
 
 ---
 
-# Planned live architecture
+# Live architecture
 
 ```text
 Claude / Codex JSONL
@@ -532,7 +569,9 @@ Agentopsy collector
        └──────────> optional Herdr context governor
 ```
 
-The service should never repeatedly parse hundreds of megabytes merely to discover that a session gained another few kilobytes.
+Unchanged files are `stat()`ed only; grown files are sought from their persisted
+offset; truncated/replaced files safely rebuild just that file. SQLite stores
+derived counters and bounded fingerprints, not transcript bodies.
 
 ---
 
@@ -646,4 +685,3 @@ Agentopsy is an independent open-source project. It is not affiliated with, endo
 - Herdr agent automation: https://herdr.dev/docs/agent-automation/
 - Herdr socket API: https://herdr.dev/docs/socket-api/
 - Herdr plugin model: https://herdr.dev/docs/plugins/
-

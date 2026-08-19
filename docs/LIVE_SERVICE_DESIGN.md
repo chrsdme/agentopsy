@@ -341,7 +341,10 @@ context falls <55%
     -> HEALTHY
 ```
 
-Actual defaults must be calibrated from real session histories.
+v0.3 implements provisional defaults (watch 50%, checkpoint 65%, rotation 80%,
+recover below 45%) with cooldown deduplication. They are policy defaults, not
+claims of universal optimum values. Account/subscription quota is explicitly
+excluded from context health.
 
 ---
 
@@ -370,12 +373,12 @@ custom command (explicit opt-in)
 
 ## Herdr notification
 
-Current Herdr supports a direct notification command:
+When the `herdr` CLI is installed, Agentopsy can attempt a passive local
+notification through its notification surface. Its absence or an incompatible
+Herdr version never prevents collection.
 
 ```bash
-herdr notification show "Agentopsy" \
-  --body "Claude context pressure is high; checkpoint recommended" \
-  --sound request
+herdr notification show "Agentopsy" "Claude context pressure is high"
 ```
 
 Reference:
