@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a metric, provider adapter, defect rule, or workflow improvement.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What workflow/session-health problem should Agentopsy detect or improve?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence or example
+      description: Prefer aggregate/synthetic evidence. Do not post sensitive raw transcripts.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior

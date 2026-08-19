@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentopsy"
+version = "0.2.0"
+description = "Local forensic session health analyser for Claude Code and OpenAI Codex CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Agentopsy contributors" }]
+keywords = [
+  "claude-code",
+  "codex",
+  "coding-agent",
+  "context-window",
+  "token-usage",
+  "observability",
+  "session-analysis",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+agentopsy = "agentopsy:main"
+
+[project.urls]
+# Fill these after creating the GitHub repository.
+# Homepage = "https://github.com/OWNER/agentopsy"
+# Issues = "https://github.com/OWNER/agentopsy/issues"
+
+[tool.setuptools]
+py-modules = ["agentopsy"]

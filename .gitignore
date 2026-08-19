@@ -1,0 +1,65 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments / local env
+.venv/
+venv/
+.env
+.env.*
+
+# Build / packaging output
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Agentopsy runtime state
+.agentopsy/
+agentopsy.db
+agentopsy.db-*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+latest.md
+latest.json
+reports/
+exports/
+analysis/
+
+# Generated logs / reports
+*.log
+agentopsy-report*.md
+agentopsy-analysis*.md
+*_session_report.md
+*_analysis_report.md
+
+# Never commit real agent transcripts or exported archives by default
+*.jsonl
+*.jsonl.gz
+session-archives/
+sessions/
+archived_sessions/
+
+# Local archives / release bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Editor / OS clutter
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
