@@ -2162,7 +2162,10 @@ class IncrementalIngestor:
             if not line.strip(): continue
             try: sid = self.store.apply_record(candidate.provider, path, adapter.parse_record(json.loads(line), path))
             except json.JSONDecodeError:
-                metrics.parse_errors += 1; sid = self.store.apply_record(candidate.provider, path, {"session_id": sid or path.stem}, malformed=True)
+                metrics.parse_errors += 1
+                # Before metadata identifies a session, retain the error in scan
+                # metrics rather than inventing a path-derived session row.
+                if sid: self.store.apply_record(candidate.provider, path, {"session_id": sid}, malformed=True)
         self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=sid or (old["session_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1
         if sid:
