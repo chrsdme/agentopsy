@@ -320,6 +320,15 @@ class FailSafeTests(unittest.TestCase):
         self.assertEqual(event.evidence, {"malformed_records": 11, "control_disabled": True})
 
 
+class InstallerTests(unittest.TestCase):
+    def test_installer_accepts_required_flags_and_shell_syntax(self):
+        script = (HERE / "install.sh").read_text()
+        for flag in ("--update", "--service", "--no-service"):
+            self.assertIn(flag, script)
+        result = subprocess.run(["sh", "-n", str(HERE / "install.sh")], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
