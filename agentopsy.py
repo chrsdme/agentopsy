@@ -337,7 +337,10 @@ class ClaudeAdapter(ProviderAdapter):
     name = "claude"
 
     def identify_session(self, record: dict[str, Any], path: Path) -> str:
-        return str(record.get("sessionId") or path.stem)
+        # Claude's transcript filename is the durable session identity used by
+        # the forensic parser. Some record-level IDs are stream/request IDs and
+        # must not split a single transcript into multiple state sessions.
+        return path.stem
 
     def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
         msg = record.get("message") if isinstance(record.get("message"), dict) else {}
