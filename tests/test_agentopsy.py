@@ -116,8 +116,11 @@ class IncrementalServiceTests(unittest.TestCase):
                 unchanged = ingestor.scan()
                 self.assertEqual(unchanged.bytes_newly_parsed, 0)
                 self.assertEqual(unchanged.files_unchanged, 1)
-                # Known gap: classify_jsonl still opens+reads the unchanged file.
-                self.assertEqual(len(calls), 1)
+                # Known gap: classify_jsonl currently still opens+reads the
+                # unchanged file once per scan. This is an upper bound, not a
+                # required-to-stay-broken assertion: a fix that caches the
+                # classification should bring this to 0 without failing here.
+                self.assertLessEqual(len(calls), 1)
             finally:
                 asa.classify_jsonl = original
             store.close()
