@@ -123,6 +123,16 @@ class IncrementalServiceTests(unittest.TestCase):
             self.assertFalse(asa.Notifier(False).enabled)
             store.close()
 
+    def test_codex_duplicate_token_snapshots_are_one_model_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "sessions"; root.mkdir(); p = root / "rollout-c.jsonl"
+            meta = {"type": "session_meta", "payload": {"session_id": "c"}}
+            token = {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}, "last_token_usage": {"total_tokens": 10}, "model_context_window": 100}}}
+            p.write_text("\n".join(json.dumps(x) for x in (meta, token, token)) + "\n")
+            store = asa.StateStore(str(Path(td) / "state")); asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            self.assertEqual(store.sessions("codex")[0]["model_turns"], 1)
+            store.close()
+
     def test_malformed_claude_and_health_transition(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"

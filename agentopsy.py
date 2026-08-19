@@ -420,6 +420,7 @@ class CodexAdapter(ProviderAdapter):
                        "output_tokens": safe_int(total.get("output_tokens")), "reasoning_tokens": safe_int(total.get("reasoning_output_tokens")),
                        "peak_context_tokens": current, "context_window_tokens": window,
                        "peak_context_pct": current / window if window else 0.0, "model_turns": 1})
+        values["usage_key"] = json.dumps((safe_int(total.get("input_tokens")), safe_int(total.get("cached_input_tokens")), safe_int(total.get("output_tokens")), safe_int(total.get("reasoning_output_tokens")), safe_int(total.get("total_tokens")), current, window))
         return values
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -2205,6 +2206,10 @@ class IncrementalIngestor:
                         fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item))]
                         data["tool_result_chars"] = sum(fresh)
                         data["max_tool_result_chars"] = max(fresh, default=0)
+                elif candidate.provider == "codex":
+                    usage_key = str(data.pop("usage_key", ""))
+                    if usage_key and not self.store.mark_unique(candidate.provider, str(data.get("session_id") or sid or path.stem), "token_snapshot", usage_key):
+                        data["model_turns"] = 0
                 sid = self.store.apply_record(candidate.provider, path, data)
             except json.JSONDecodeError:
                 metrics.parse_errors += 1
