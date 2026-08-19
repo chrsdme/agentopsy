@@ -118,6 +118,18 @@ def control_adapters() -> tuple[ControlAdapter, ...]:
     return (ControlAdapter("claude", "native", unavailable), ControlAdapter("codex", "native", unavailable), ControlAdapter("herdr", "integration", unavailable))
 
 
+def classify_compaction(before_context: int, after_context: int, refill_context: Optional[int], repeated_after: int, compaction_count: int) -> dict[str, Any]:
+    """Classify observed/provider-verified compactions; never invoke one here."""
+    reduction = max(0, before_context - after_context)
+    ratio = reduction / before_context if before_context else 0.0
+    if compaction_count >= 5: outcome = "THRASH"
+    elif refill_context is not None and refill_context >= before_context * .9: outcome = "RAPID_REFILL"
+    elif ratio >= .5 and repeated_after < 2: outcome = "EFFECTIVE"
+    elif ratio >= .2: outcome = "WEAK"
+    else: outcome = "INEFFECTIVE"
+    return {"outcome": outcome, "context_before": before_context, "context_after": after_context, "reduction": reduction, "reduction_pct": ratio, "repeated_after": repeated_after, "compaction_frequency": compaction_count}
+
+
 def evaluate_control_request(mode: AutoActMode, *, exact_provider: bool, exact_session: bool, exact_harness: bool, capability: ProviderCapability, safe_idle_boundary: bool, active_critical_operation: bool, integrity_ok: bool) -> ControlDecision:
     """Control is opt-in and capability gated; this function never performs it."""
     if mode == AutoActMode.OBSERVE: return ControlDecision(mode, False, "Observe mode only advises; it never alters a provider session.")

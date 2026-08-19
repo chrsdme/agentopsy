@@ -220,6 +220,12 @@ Provider/harness control is isolated behind adapter capabilities for Claude,
 Codex, and Herdr. Unverified capabilities are explicitly unavailable; the core
 never assumes a slash command or sends blind PTY input.
 
+## v0.4 compaction verification
+
+Observed or provider-verified compactions are classified from pre/post context,
+reduction, subsequent refill, repeated work, and frequency. Automatic compact
+actions remain unavailable until a safe adapter capability is established.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

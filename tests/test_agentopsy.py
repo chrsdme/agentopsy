@@ -295,6 +295,15 @@ class ControlAdapterTests(unittest.TestCase):
         self.assertEqual(adapters["herdr"].harness, "integration")
 
 
+class CompactionTests(unittest.TestCase):
+    def test_observed_compaction_outcomes_are_explainable(self):
+        effective = asa.classify_compaction(100, 30, 50, 0, 1)
+        self.assertEqual(effective["outcome"], "EFFECTIVE")
+        refill = asa.classify_compaction(100, 30, 95, 0, 1)
+        self.assertEqual(refill["outcome"], "RAPID_REFILL")
+        self.assertEqual(asa.classify_compaction(100, 70, None, 3, 5)["outcome"], "THRASH")
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:
