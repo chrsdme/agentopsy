@@ -223,6 +223,21 @@ class CalibrationTests(unittest.TestCase):
                 self.assertEqual(asa.main(["calibrate", "reset", "--state-dir", state]), 0)
 
 
+class InsightsTests(unittest.TestCase):
+    def test_insights_are_session_health_only_and_filterable(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            now = asa.dt.datetime.now(asa.dt.timezone.utc).isoformat()
+            for provider in ("codex", "claude"):
+                store.db.execute("INSERT INTO sessions(session_id,provider,last_activity_at,model_turns,tool_calls,repeated_reads,repeated_commands,compactions,peak_context_pct) VALUES(?,?,?,?,?,?,?,?,?)", (provider, provider, now, 10, 2, 5, 0, 1, .7))
+            store.db.commit()
+            payload = asa.insights_payload(store, 7, "codex")
+            self.assertEqual(payload["sessions"], 1)
+            self.assertEqual(payload["weakest_marker"], "repeated_reads")
+            self.assertNotIn("project", " ".join(payload["insights"]).lower())
+            store.close()
+
+
 class AnalyzerTests(unittest.TestCase):
     def test_classify_claude(self):
         with tempfile.TemporaryDirectory() as td:

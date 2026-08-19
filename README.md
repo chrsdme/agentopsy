@@ -413,6 +413,8 @@ agentopsy --project my-project --since 7d --summary
   and predicted next risk state without speculative token forecasts.
 - local, reviewable robust calibration: `agentopsy calibrate status`, `build`,
   `recommend`, `adopt`, and `reset`; factory safety ceilings remain in force.
+- deterministic personal workflow insights: `agentopsy insights --days N
+  --provider claude|codex`, based only on local session-health aggregates.
 
 ## Claude Code
 
