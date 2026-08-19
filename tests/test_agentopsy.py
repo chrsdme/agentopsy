@@ -95,6 +95,11 @@ class IncrementalServiceTests(unittest.TestCase):
             replaced = ingestor.scan(); self.assertEqual(replaced.files_rescanned, 1)
             store.close()
 
+    def test_codex_response_item_id_is_not_a_session_id(self):
+        adapter = asa.CodexAdapter()
+        path = Path("rollout-real.jsonl")
+        self.assertEqual(adapter.identify_session({"type": "response_item", "payload": {"id": "item-123"}}, path), path.stem)
+
     def test_malformed_claude_and_health_transition(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "projects"; root.mkdir(); p = root / "c.jsonl"
