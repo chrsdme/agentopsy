@@ -2861,6 +2861,34 @@ def trend_payload(store: StateStore, days: int = 30) -> dict[str, Any]:
     return result
 
 
+def robust_profile(values: list[float], sessions: int, turns: int = 0, tools: int = 0) -> dict[str, Any]:
+    """Transcript-free robust calibration facts; hard safety ceilings remain separate."""
+    if not values: return {"confidence": "INSUFFICIENT", "samples": 0}
+    ordered = sorted(values)
+    def q(p: float) -> float: return ordered[min(len(ordered) - 1, round((len(ordered) - 1) * p))]
+    median = q(.5); mad = statistics.median(abs(value - median) for value in ordered)
+    confidence = "HIGH" if sessions >= 30 and turns >= 2000 and tools >= 1000 and mad <= max(1.0, abs(median) * .25) else "MEDIUM" if sessions >= 10 and turns >= 500 else "LOW" if sessions >= 3 else "INSUFFICIENT"
+    return {"confidence": confidence, "samples": len(values), "p50": median, "p75": q(.75), "p90": q(.90), "p95": q(.95), "mad": mad}
+
+
+def calibration_build(store: StateStore) -> dict[str, Any]:
+    rows = store.sessions()
+    profiles: dict[str, Any] = {}
+    for provider in ("claude", "codex"):
+        subset = [r for r in rows if r["provider"] == provider]
+        turns, tools = sum(int(r["model_turns"]) for r in subset), sum(int(r["tool_calls"]) for r in subset)
+        metrics = {"session_duration_seconds": [0.0 for _ in subset], "model_turns": [float(r["model_turns"]) for r in subset], "context_peak_pct": [float(r["peak_context_pct"]) for r in subset if r["peak_context_pct"]], "tool_output_chars": [float(r["tool_result_chars"]) for r in subset], "max_tool_result_chars": [float(r["max_tool_result_chars"]) for r in subset], "repeated_reads": [float(r["repeated_reads"]) for r in subset], "command_repetition": [float(r["repeated_commands"]) for r in subset]}
+        profiles[provider] = {name: robust_profile(values, len(subset), turns, tools) for name, values in metrics.items()}
+    payload = {"version": 1, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "profiles": profiles, "factory_hard_ceilings_authoritative": True, "adopted": False}
+    store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('calibration_profile',?)", (json.dumps(payload, sort_keys=True),)); store.db.commit()
+    return payload
+
+
+def calibration_status(store: StateStore) -> dict[str, Any]:
+    row = store.db.execute("SELECT value FROM service_meta WHERE key='calibration_profile'").fetchone()
+    return json.loads(row[0]) if row else {"status": "INSUFFICIENT", "message": "No calibration built yet."}
+
+
 def service_once(state_dir: Optional[str], provider: str = "all", roots: Optional[list[tuple[Path, str]]] = None, notify: bool = True) -> IngestionMetrics:
     store = StateStore(state_dir)
     try:
@@ -2939,7 +2967,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
 
 
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate"}: return None
     if argv[0] == "signals":
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
@@ -2951,6 +2979,18 @@ def live_cli(argv: list[str]) -> Optional[int]:
         print(explain_signal(argv[1]))
         return 0
     if argv[0] == "service": return service_main(argv[1:])
+    if argv[0] == "calibrate":
+        parser = argparse.ArgumentParser(prog="agentopsy calibrate"); parser.add_argument("action", choices=["status", "build", "recommend", "adopt", "reset"]); parser.add_argument("--state-dir")
+        args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
+        try:
+            if args.action == "build": payload = calibration_build(store)
+            elif args.action == "reset": store.db.execute("DELETE FROM service_meta WHERE key='calibration_profile'"); store.db.commit(); payload = {"status": "RESET"}
+            else:
+                payload = calibration_status(store)
+                if args.action == "recommend": payload["recommendation"] = "Review robust P90/P95 baselines; factory hard safety ceilings remain authoritative."
+                if args.action == "adopt": payload["adopted"] = True; store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(payload, sort_keys=True),)); store.db.commit()
+            print(json.dumps(payload, indent=2)); return 0
+        finally: store.close()
     parser = argparse.ArgumentParser(prog="agentopsy " + argv[0])
     parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["all", "claude", "codex"], default="all"); parser.add_argument("--session", default=""); parser.add_argument("--all", action="store_true", help="Show all matching sessions (the default for stored state).")
     if argv[0] == "trends": parser.add_argument("--days", type=int, default=30); parser.add_argument("--json", action="store_true")
@@ -3036,7 +3076,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate"}:
         try:
             return live_cli(argv)
         except SystemExit:

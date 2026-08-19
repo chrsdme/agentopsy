@@ -411,6 +411,8 @@ agentopsy --project my-project --since 7d --summary
   `--color auto`, `--color always`, `--color never`, or `NO_COLOR`.
 - explainable causal-risk promotions, qualitative trend, contributing lanes,
   and predicted next risk state without speculative token forecasts.
+- local, reviewable robust calibration: `agentopsy calibrate status`, `build`,
+  `recommend`, `adopt`, and `reset`; factory safety ceilings remain in force.
 
 ## Claude Code
 
