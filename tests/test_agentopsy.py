@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 import sys
+import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -75,6 +76,17 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class IncrementalServiceTests(unittest.TestCase):
+    def test_agentopsyd_symlink_dispatches_to_service_cli(self):
+        """Exercise argv[0]-based service dispatch through a real executable."""
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "agentopsyd"
+            link.symlink_to(HERE / "agentopsy.py")
+            result = subprocess.run([str(link), "--help"], text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage: agentopsyd", result.stdout)
+            self.assertIn("{run,once,status}", result.stdout)
+            self.assertNotIn("Local forensic session analyser", result.stdout)
+
     def test_incremental_append_partial_recovery_and_replacement(self):
         with tempfile.TemporaryDirectory() as td:
             root, state = Path(td) / "sessions", Path(td) / "state"
