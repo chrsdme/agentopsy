@@ -75,12 +75,13 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class SelectionAndOutputTests(unittest.TestCase):
-    def make_summary(self, provider, sid, end, *, turns=0, total=0, cached=0, input_tokens=0, output=0, peak_pct=0.0):
+    def make_summary(self, provider, sid, end, *, start="", turns=0, total=0, cached=0, input_tokens=0, output=0, peak_pct=0.0):
         return asa.SessionSummary(
             provider=provider,
             session_id=sid,
             path=f"/{provider}/{sid}.jsonl",
             source="test",
+            start=start,
             end=end,
             model_turns=turns,
             logged_processed_tokens=total,
@@ -118,14 +119,33 @@ class SelectionAndOutputTests(unittest.TestCase):
 
     def test_summary_is_provider_numbered(self):
         sessions = [
-            self.make_summary("claude", "c1", "2026-01-01T00:00:00+00:00", turns=12, total=1000, cached=900),
-            self.make_summary("codex", "x1", "2026-01-02T00:00:00+00:00", total=2000, cached=1500, input_tokens=1900, output=100, peak_pct=0.75),
+            self.make_summary("claude", "c1", "2026-01-01T19:10:00+00:00", start="2026-01-01T15:30:00+00:00", turns=12, total=1000, cached=900),
+            self.make_summary("codex", "x1", "2026-01-02T19:10:00+00:00", start="2026-01-02T15:30:00+00:00", total=2000, cached=1500, input_tokens=1900, output=100, peak_pct=0.75),
         ]
         text = asa.render_summary(sessions)
-        self.assertIn("1. Claude", text)
-        self.assertIn("2. Codex", text)
+        self.assertIn("1. Claude — 2026-01-01 15:30–19:10 UTC", text)
+        self.assertIn("2. Codex — 2026-01-02 15:30–19:10 UTC", text)
         self.assertIn("12 unique model iterations", text)
         self.assertIn("highest context occupancy: 75.0%", text)
+
+    def test_summary_multiple_sessions_keeps_plain_heading(self):
+        sessions = [
+            self.make_summary("claude", "c1", "2026-01-01T19:10:00+00:00", start="2026-01-01T15:30:00+00:00"),
+            self.make_summary("claude", "c2", "2026-01-02T19:10:00+00:00", start="2026-01-02T15:30:00+00:00"),
+        ]
+        text = asa.render_summary(sessions)
+        self.assertIn("1. Claude\n────────────────────────────────────────────────\n2 sessions", text)
+        self.assertNotIn("1. Claude —", text)
+
+    def test_summary_cross_date_span_shows_both_dates(self):
+        session = self.make_summary(
+            "claude",
+            "cross-date",
+            "2026-08-19T01:10:00+00:00",
+            start="2026-08-18T23:30:00+00:00",
+        )
+        text = asa.render_summary([session])
+        self.assertIn("1. Claude — 2026-08-18 23:30 UTC–2026-08-19 01:10 UTC", text)
 
     def test_session_list_contains_only_copy_friendly_core_fields(self):
         s = self.make_summary("claude", "abc-123", "2026-01-01T12:00:00+00:00")
@@ -135,13 +155,13 @@ class SelectionAndOutputTests(unittest.TestCase):
         self.assertIn("2026-01-01", text)
 
     def test_summary_export_is_summary_only(self):
-        s = self.make_summary("claude", "abc-123", "2026-01-01T12:00:00+00:00", turns=2)
+        s = self.make_summary("claude", "abc-123", "2026-01-01T12:00:00+00:00", start="2026-01-01T11:00:00+00:00", turns=2)
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "summary.md"
             asa.write_markdown_export(str(target), [s], [], True, 10)
             text = target.read_text()
             self.assertIn("# Agentopsy Summary", text)
-            self.assertIn("1. Claude", text)
+            self.assertIn("1. Claude — 2026-01-01 11:00–12:00 UTC", text)
             self.assertNotIn("Session health ranking", text)
 
 
