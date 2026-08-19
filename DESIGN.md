@@ -238,6 +238,12 @@ Parser, identity, integrity, service, telemetry, or command uncertainty fails
 closed: active action is disabled for the affected scope, policy returns to
 observe, and compact non-transcript integrity evidence is retained.
 
+## v0.4 installer/service UX
+
+The installer updates only binaries, preserving local SQLite state and runtime
+overrides. User systemd service setup is explicit (`--service`), no root is
+required, and non-systemd environments receive a clear no-service result.
+
 ## Future live architecture
 
 See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.

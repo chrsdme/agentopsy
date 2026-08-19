@@ -431,6 +431,8 @@ agentopsy --project my-project --since 7d --summary
   native session transition are available.
 - integrity uncertainty fails closed: active control is disabled and advice
   falls back to observe without retaining transcript content.
+- installer: `./install.sh [--update] [--service|--no-service]`; systemd user
+  service setup is opt-in and reports when unsupported.
 
 ## Claude Code
 
