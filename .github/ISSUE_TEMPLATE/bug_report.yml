@@ -11,7 +11,7 @@ body:
     id: version
     attributes:
       label: Agentopsy version
-      placeholder: "0.2.0"
+      placeholder: "Paste the output of: agentopsy --version"
     validations:
       required: true
   - type: dropdown

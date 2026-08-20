@@ -3,7 +3,7 @@ Description=Agentopsy passive session health service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/agentopsyd run --foreground --interval 20
+ExecStart=%h/.local/bin/agentopsyd run --foreground --interval 20 --auto-act observe
 Restart=on-failure
 RestartSec=5
 

@@ -1,99 +1,44 @@
-# GitHub Release Notes / Publishing Checklist
+# GitHub Release Checklist
 
-## Suggested repository name
+Use this checklist for a reviewed release from the intended release commit.
+It is a process aid, not a substitute for project-specific release gates.
 
-```text
-agentopsy
-```
+## Before publishing
 
-## Suggested description
+1. Verify the target branch, expected commit, working-tree cleanliness, remote
+   relationship, and that the intended version tag/release do not already
+   exist.
+2. Update only authoritative release metadata and review its diff.
+3. Run `make quick`, `make full`, `python3 -m compileall -q .`, and
+   `git diff --check` on the release commit.
+4. Build the wheel, install it in an isolated environment, and verify
+   `agentopsy --version` reports the exact release version.
+5. Confirm no private transcripts, session identifiers, credentials, local
+   SQLite state, reports, `local_only` material, or generated provider
+   worktrees are tracked.
+6. Fast-forward the reviewed release branch to `main` only when ancestry and
+   remote state are understood; do not rewrite history or force push.
+7. Push `main`, verify `main` equals `origin/main`, then create and push an
+   annotated tag at that exact commit.
 
-> Local forensic session-health analyser for Claude Code and Codex CLI. Finds context bloat, stale resumes, compaction thrash, repeated reads/commands, and tool-output waste.
+## Release notes
 
-## Suggested topics
+State what is available and what is deliberately unavailable. For v0.4:
 
-```text
-claude-code
-codex
-coding-agents
-agent-observability
-context-window
-token-usage
-session-analysis
-local-first
-python
-developer-tools
-```
+- `observe` is the safe default.
+- Codex automatic `/compact` requires exact identity, Herdr mapping, safe
+  idle, provider lifecycle verification, and context reduction; ambiguity
+  fails closed.
+- Claude automatic control, automatic `/new`, `/clear`, and rotation are not
+  enabled; `full` does not change that.
+- Do not include private local session IDs or transcript excerpts.
 
-## Suggested initial release
+Create a release only from an already-pushed verified tag (for GitHub CLI,
+use `gh release create <tag> --verify-tag`). Verify the published title, tag,
+target commit, and capability wording afterwards.
 
-Title:
+## After publishing
 
-```text
-Agentopsy v0.2.0 - first public release
-```
-
-Release body:
-
-```markdown
-Agentopsy is a local, read-only forensic session-health analyser for Claude Code and OpenAI Codex CLI.
-
-Highlights:
-- automatic Claude/Codex session-store discovery
-- ZIP/directory/JSONL analysis
-- context, cache, tool-output and activity-burst analysis
-- stale-session reuse detection
-- compaction/refetch and repetition flags
-- `--sessions`, `--session`, `--last`, and `--summary`
-- combined and provider-specific Markdown exports
-- JSON output
-- zero third-party runtime dependencies
-- no API key, model calls, telemetry, or transcript uploads
-
-This release also documents the planned incremental SQLite service and optional Herdr integration. Automatic session rotation is not enabled by default.
-```
-
-## Before pushing
-
-```bash
-python -m py_compile agentopsy.py
-python -m unittest discover -s tests -v
-./agentopsy.py --help
-```
-
-Review repository contents:
-
-```bash
-find . -maxdepth 3 -type f | sort
-```
-
-Check that no real logs/reports were accidentally added:
-
-```bash
-find . -type f \
-  \( -name '*.jsonl' -o -name '*.db' -o -name '*.zip' \) \
-  -print
-```
-
-Check staged files before first commit:
-
-```bash
-git status --short
-git diff --cached
-```
-
-## Suggested first commit
-
-```text
-feat: release Agentopsy v0.2.0
-```
-
-## GitHub settings
-
-Recommended:
-
-- enable Issues;
-- enable private vulnerability reporting/security advisories if available;
-- protect the default branch once CI is proven;
-- require the `tests` workflow before merging pull requests;
-- do not enable any telemetry or hosted transcript upload as part of the default project.
+Fetch tags and verify `HEAD`, `origin/main`, and the annotated release tag all
+resolve to the validated commit. Perform one final package-install smoke test
+when practical. Keep any operational release log under ignored `local_only/`.

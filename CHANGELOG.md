@@ -6,6 +6,10 @@ All notable changes to Agentopsy are documented here.
 
 ### Changed
 
+- Context Guardian is complete: live session-health scoring, one-to-five
+  marker/lane/overall efficiency scores, causal-risk analysis, calibration
+  with confidence, deterministic historical insights, policy management, and
+  deterministic replay are now available from the local CLI/service.
 - The incremental service now exposes `--auto-act observe|compact|full`
   (default `observe`) and routes high-context candidates through the
   fail-closed control decision path.
@@ -28,7 +32,7 @@ All notable changes to Agentopsy are documented here.
   Herdr transport timeout alone is never treated as success. Claude native
   control remains unavailable.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-08-19
 
 ### Added
 
