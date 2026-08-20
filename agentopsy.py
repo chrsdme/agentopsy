@@ -46,7 +46,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.4.0-dev"
+VERSION = "0.4.0"
 PARSER_VERSION = 1
 SCHEMA_VERSION = 4
 IDENTITY_TTL_SECONDS = 15 * 60

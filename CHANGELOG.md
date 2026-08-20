@@ -2,7 +2,7 @@
 
 All notable changes to Agentopsy are documented here.
 
-## [0.4.0-dev] - Unreleased
+## [0.4.0] - 2026-08-20
 
 ### Changed
 
