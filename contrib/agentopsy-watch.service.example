@@ -1,7 +1,7 @@
-# Experimental legacy polling service for Agentopsy v0.2.
-# The roadmap replaces this with an incremental SQLite-backed daemon that reads
-# only appended transcript bytes. Prefer manual CLI usage unless you explicitly
-# want the current polling prototype.
+# Legacy full-rescan polling service retained for compatibility.
+# Prefer agentopsyd: it incrementally reads appended transcript tails and
+# persists compact local state. Use this unit only when legacy report files are
+# specifically required.
 
 [Unit]
 Description=Agentopsy experimental session-health polling

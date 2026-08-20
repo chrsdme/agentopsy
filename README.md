@@ -2,7 +2,7 @@
 
 **Forensic session health for coding agents.**
 
-Agentopsy is a local, read-only analyser for **Claude Code** and **OpenAI Codex CLI** session transcripts. It shows how sessions grow, where context and tool output accumulate, when agents repeatedly re-read or re-run work, and which sessions deserve investigation before the same habits become expensive workflow patterns.
+Agentopsy is a local analyser for **Claude Code** and **OpenAI Codex CLI** session transcripts. Transcript access is read-only: it shows how sessions grow, where context and tool output accumulate, when agents repeatedly re-read or re-run work, and which sessions deserve investigation before the same habits become expensive workflow patterns. Its optional Codex control path is separately opt-in and fail-closed.
 
 It is not another hosted dashboard and it does not need an API key. Agentopsy parses the session logs already on your machine, produces compact terminal/Markdown/JSON reports, and sends **nothing** to a model or external service.
 
@@ -27,7 +27,7 @@ Claude Code logs ─┐
                   ├──> Agentopsy ──> summaries / session health / defects
 Codex CLI logs ───┘                      │
                                          ├──> Markdown / JSON
-                                         └──> future live health service
+                                         └──> incremental live health service
 ```
 
 ## Why Agentopsy?
@@ -508,7 +508,7 @@ Thresholds are intentionally conservative starting points. They should evolve fr
 
 # Privacy and safety
 
-Agentopsy is designed to be **local-first and read-only**:
+Agentopsy is designed to be **local-first**. Its analysis and collection paths are read-only against provider transcripts:
 
 - no API key required;
 - no model calls;
@@ -560,10 +560,13 @@ agentopsy handoff /path/to/project
 ```
 
 State is stored at `~/.local/state/agentopsy/agentopsy.db`; set
-`AGENTOPSY_STATE_DIR` or pass `--state-dir` to use another location. A sample
-user service is [docs/agentopsyd.service](docs/agentopsyd.service). Copy it to
-`~/.config/systemd/user/`, then enable it yourself if desired; the installer
-does not enable services.
+`AGENTOPSY_STATE_DIR` or pass `--state-dir` to use another location. SQLite
+holds derived aggregates, bounded evidence, hashes, and short-lived identity
+metadata—not transcript bodies by default. A sample user service is
+[docs/agentopsyd.service](docs/agentopsyd.service). `./install.sh --service`
+installs and enables that user service when user systemd is available;
+`--no-service` leaves service setup disabled, and `--update` restarts an
+already-active service after updating the binaries.
 
 The live policy defaults are deliberately provisional: watch at 50%, checkpoint
 at 65%, and rotation recommendation at 80%, with recovery below 45%. Codex
@@ -636,37 +639,19 @@ derived counters and bounded fingerprints, not transcript bodies.
 
 ---
 
-# Herdr direction
+# Herdr and provider control
 
-The intended Herdr integration is initially **observational**:
+Herdr is used as a local identity and delivery bridge for the supported Codex
+compact path, not as permission to type into an arbitrary terminal. Automatic
+`/compact` is available only after exact native-session, transcript, and Herdr
+pane identity; a fresh Herdr idle check; a requested/accepted provider
+lifecycle; and a matching post-request Codex context reduction all agree. A
+Herdr timeout or transport acknowledgement alone is never success.
 
-```text
-Agentopsy health event
-      │
-      ├── context pressure
-      ├── giant tool output
-      ├── stale-session reuse
-      └── compaction/refetch loop
-      │
-      ▼
-Herdr notification / pane metadata
-```
-
-Later, after thresholds have been calibrated, a separate opt-in governor can:
-
-```text
-recommend checkpoint
-      ↓
-request HANDOFF.md
-      ↓
-wait until agent is safe/idle
-      ↓
-start a fresh session
-      ↓
-bootstrap from compact durable state
-```
-
-Automatic session rotation should **not** be the default behavior of the analyser.
+`observe` is the safe default. Claude Code automatic control is unavailable,
+and automatic `/new`, `/clear`, reset, and rotation are unavailable for both
+providers. `full` mode evaluates the stricter policy but does not make an
+unsupported rotation action available.
 
 ---
 
@@ -682,7 +667,8 @@ agentopsy/
 ├── SECURITY.md
 ├── CONTRIBUTING.md
 ├── docs/
-│   └── LIVE_SERVICE_DESIGN.md
+│   ├── LIVE_SERVICE_DESIGN.md
+│   └── agentopsyd.service
 ├── LICENSE
 ├── pyproject.toml
 ├── install.sh
@@ -723,16 +709,10 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.2.0` is intended as the first clean public release candidate:
-
-- Claude Code + Codex support;
-- automatic store discovery;
-- ZIP/directory/file analysis;
-- session defect detection;
-- provider summaries;
-- session selection;
-- Markdown/JSON export;
-- zero third-party runtime dependencies.
+`v0.4.0` is the current release, **Context Guardian**. It includes the
+incremental service, live health scoring and causal risk, calibration,
+historical insights, policy management, deterministic replay, notifications,
+and the narrowly verified Codex compact control path described above.
 
 See [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
 

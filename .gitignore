@@ -1,5 +1,6 @@
 # Python bytecode / caches
 /local_only/
+/.claude/worktrees/
 __pycache__/
 *.py[cod]
 .pytest_cache/

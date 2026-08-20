@@ -208,23 +208,28 @@ does not execute any provider control action.
 
 ## v0.4 control modes
 
-Control defaults to `observe`; `compact` and `full` are only decision modes.
-They fail closed unless exact provider/session/harness mapping, a positively
-supported capability, safe idle boundary, healthy integrity state, and no
-critical operation are all verified. A control decision itself performs no
-provider action.
+Control defaults to `observe`; `compact` and `full` first enter a fail-closed
+decision path. They require exact provider/session/harness mapping, a
+positively supported capability, safe idle boundary, healthy integrity state,
+and no critical operation. A permitted Codex compact decision may then request
+the isolated control adapter; no other provider action is implied.
 
 ## v0.4 control adapters
 
-Provider/harness control is isolated behind adapter capabilities for Claude,
-Codex, and Herdr. Unverified capabilities are explicitly unavailable; the core
-never assumes a slash command or sends blind PTY input.
+Provider/harness control is isolated behind adapter capabilities. The v0.4
+adapter supports Codex `/compact` only through an exact transcript/native
+session/Herdr-pane mapping, a fresh Herdr idle re-query, and provider evidence.
+Claude control is explicitly unavailable. The core never assumes a slash
+command or sends blind PTY input.
 
 ## v0.4 compaction verification
 
-Observed or provider-verified compactions are classified from pre/post context,
-reduction, subsequent refill, repeated work, and frequency. Automatic compact
-actions remain unavailable until a safe adapter capability is established.
+Observed compactions are classified from pre/post context, reduction,
+subsequent refill, repeated work, and frequency. For an automatic Codex
+compact, a request is `COMPACT_VERIFIED` only after matching post-request
+provider lifecycle evidence and a measured context-token reduction for the
+same session. Herdr transport acknowledgement or timeout alone is never proof
+of success.
 
 ## v0.4 full rotation
 
@@ -261,11 +266,7 @@ count into a negative compaction classification. Compound context promotion is
 reserved for callers with genuine independent measured lanes and is not emitted
 by the current live collector.
 
-## Future live architecture
-
-See `ROADMAP.md` for the incremental SQLite collector and Herdr integration design.
-
-## v0.3 implementation plan
+## v0.3 implementation
 
 The live layer keeps the retrospective parsers as the compatibility path. A
 small `ProviderAdapter` boundary normalises only append-safe record facts for

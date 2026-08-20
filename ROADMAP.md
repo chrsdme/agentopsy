@@ -1,257 +1,56 @@
 # Agentopsy Roadmap
 
-This roadmap keeps the project split into two layers:
+Agentopsy keeps two useful layers: a standalone, deterministic forensic CLI
+and an optional local incremental service. Both analyse provider transcripts
+read-only and keep raw transcript bodies out of SQLite by default.
 
-1. **forensic analyser**, deterministic and read-only;
-2. **live health service**, incremental and optionally integrated with Herdr.
+## Released foundations
 
-The analyser should remain useful by itself even if the service is never installed.
+### v0.2 — Public CLI foundation
 
-## v0.2 - Public CLI foundation
+Released 2026-08-19. Claude Code and Codex CLI discovery/parsing, file/directory
+and ZIP inputs, session selection, Markdown/JSON exports, workflow defect
+flags, and synthetic-only public tests are complete.
 
-- [x] Claude Code transcript discovery/parsing
-- [x] Codex transcript + archived-session discovery/parsing
-- [x] ZIP/directory/file sources
-- [x] provider summaries
-- [x] `--sessions`
-- [x] `--session ID`
-- [x] `--last [N]`
-- [x] `--summary`
-- [x] `--export`
-- [x] `--export-claude`
-- [x] `--export-codex`
-- [x] JSON export
-- [x] defect flags and health grades
-- [x] privacy/public-release scrub
-- [x] synthetic tests only in repository
+### v0.3 — Incremental collector
 
-## v0.3 - Incremental collector (`agentopsyd`) — implemented
+Released 2026-08-19. `agentopsyd` persists local file identity, offsets and
+partial-line recovery so unchanged transcripts are not reparsed. It provides
+health/trend queries, bounded SQLite state, notifications/cooldowns, handoff
+validation, and a user-service example. The older `agentopsy --watch` full
+rescan loop remains a compatibility mode only.
 
-The service does **not rescan entire transcripts on every interval**. File
-cursors, partial-line recovery, health state, compact trend summaries, optional
-desktop notification, handoff validation, and passive Herdr detection are
-implemented. Automatic rotation remains deferred.
+### v0.4 — Context Guardian
 
-### File cursor model
+Released 2026-08-20. Context Guardian adds live session-health scoring,
+one-to-five marker and overall efficiency scores, causal risk analysis,
+context pressure/velocity/tool-output/repetition/amplification signals,
+personal calibration and confidence, deterministic historical insights,
+policy show/export/import/reset, and deterministic Guardian replay.
 
-For every discovered transcript store:
+`observe` is the safe default. Codex automatic `/compact` is supported only
+when exact transcript/native-session/Herdr-pane identity, current safe-idle
+state, provider lifecycle evidence, and post-action context reduction all
+match. Missing or ambiguous evidence fails closed. Claude automatic control,
+automatic `/new`, `/clear`, reset, and rotation are unavailable. `full` mode
+does not make unsupported rotation actions available.
 
-```text
-provider
-path
-filesystem device/inode or stable identity
-last observed size
-last parsed byte offset
-mtime_ns
-session_id
-parser version
-```
+## v0.5 — Comparative Optimizer
 
-On each lightweight scan:
+The next planned release is a local comparative optimizer built on the compact
+historical aggregates already collected by Context Guardian. Its scope will be
+set by evidence and must preserve the project’s privacy and fail-closed control
+properties.
 
-```text
-stat file
-  │
-  ├── unchanged size -> do nothing
-  │
-  ├── larger -> seek(last_offset), parse appended bytes only
-  │
-  ├── inode changed -> treat as replacement/new file
-  │
-  └── size < offset -> transcript truncated/replaced, rebuild only that file
-```
+Candidate work includes comparing policy/calibration outcomes across a user’s
+own local sessions, surfacing repeatable workflow improvements with confidence,
+and making recommendations reviewable before adoption. It will not imply raw
+transcript retention, hosted telemetry, universal provider control, or
+automatic rotation.
 
-A normal tick should therefore read **zero bytes of transcript content** for unchanged sessions and only the newly appended tail for active sessions. As implemented, each tick still reopens every discovered file to re-sniff its provider (up to 12 lines) before the size check runs; this is small per file but not the zero-I/O claim above, and does not scale to very large session counts. Caching the classification result is deferred.
+## Provider support
 
-### SQLite state
-
-Default database target:
-
-```text
-~/.local/state/agentopsy/agentopsy.db
-```
-
-Proposed tables:
-
-```text
-files
-sessions
-usage_snapshots
-tool_aggregates
-defects
-notifications
-service_meta
-```
-
-SQLite should run locally with WAL mode. Raw transcript content should **not** be copied into the database by default. Store metrics, hashes, bounded labels and file references instead.
-
-### Bounded evidence
-
-The service should avoid becoming another source of data bloat:
-
-- hash repeated commands/reads;
-- keep bounded previews only where diagnostically useful;
-- cap evidence arrays per defect;
-- store aggregate counters instead of raw tool output;
-- make raw-content retention an explicit opt-in, not a default.
-
-## v0.4 - Context-governor calibration and opt-in control
-
-Introduce stateful session-health policies with hysteresis/cooldowns.
-
-Potential events:
-
-```text
-CONTEXT_PREPARE
-CONTEXT_HIGH
-CONTEXT_CRITICAL
-HIGH_CONTEXT_DWELL
-GIANT_TOOL_RESULT
-TOOL_OUTPUT_FLOOD
-REPEATED_READ_LOOP
-COMMAND_REPETITION_LOOP
-COMPACTION_THRASH
-POST_COMPACT_REFETCH
-STALE_SESSION_RESUMED
-```
-
-Example policy:
-
-```text
-context reaches prepare threshold
-        ↓
-record warning once
-        ↓
-remain quiet until state changes materially
-        ↓
-context reaches high threshold
-        ↓
-notify
-        ↓
-context falls below recovery threshold
-        ↓
-clear warning state
-```
-
-This avoids screaming every two seconds while a session remains above one threshold.
-
-### Notification backends
-
-Keep notification adapters optional and local:
-
-- terminal stderr/status line;
-- Linux `notify-send` when installed;
-- macOS Notification Center adapter;
-- Windows notification adapter;
-- Herdr notification adapter;
-- optional generic command/webhook adapter, disabled by default.
-
-No outbound network destination should be enabled silently.
-
-## v0.5 - Herdr plugin
-
-Herdr is a strong host for the live layer because it already owns the coding-agent terminals. The plugin should consume Agentopsy's small SQLite/JSON health state rather than re-reading raw transcripts.
-
-Proposed responsibilities:
-
-```text
-Agentopsy                    Herdr
----------                    -----
-parse transcript             know active pane/agent
-measure context              know agent lifecycle state
-score health                 show notifications
-recommend action      --->   associate health with pane
-                              optionally trigger workflow
-```
-
-Initial plugin features:
-
-- show health grade/context pressure beside detected Claude/Codex agents;
-- notification when a session crosses configured health thresholds;
-- command to open the latest Agentopsy summary;
-- command to analyse the current agent's native session ID;
-- command to acknowledge/snooze a warning;
-- no automatic `/clear` by default.
-
-## v0.6 - Opt-in Context Governor
-
-Only after real-world threshold calibration.
-
-State machine:
-
-```text
-NORMAL
-  ↓
-PREPARE
-  ↓
-ROTATION_RECOMMENDED
-  ↓
-CHECKPOINT_REQUESTED
-  ↓
-HANDOFF_VERIFIED
-  ↓
-WAITING_SAFE
-  ↓
-ROTATE
-  ↓
-VERIFY_FRESH_SESSION
-  ↓
-BOOTSTRAP
-  ↓
-NORMAL
-```
-
-Hard safety requirements:
-
-- never interrupt an agent while it is actively modifying/running critical work;
-- never equate threshold crossing with permission to clear immediately;
-- never let the LLM be the sole authority that its reset succeeded;
-- never destroy the previous durable handoff until the new session is verified;
-- default to recommendation/notification mode;
-- require explicit opt-in for automated rotation.
-
-## v0.7 - Trends and workflow learning
-
-Longitudinal queries from SQLite:
-
-```text
-median/peak context by provider/model/project
-cache amplification over time
-compactions per productive hour
-repeated-read rate
-repeated-command rate
-tool-output pressure
-session duration distributions
-defect recurrence
-health grade trend
-rotation outcome comparison
-```
-
-This is the layer another workflow-learning or agent-operations system could consume.
-
-The preferred flow is:
-
-```text
-raw transcripts
-     ↓
-Agentopsy deterministic metrics
-     ↓
-few-KB trend summary
-     ↓
-optional reasoning agent
-     ↓
-proposed workflow/skill/hook improvements
-```
-
-Do not feed hundreds of megabytes of raw histories into an LLM merely to discover aggregate patterns that Python/SQLite can calculate exactly.
-
-## Additional providers
-
-Potential future parser adapters:
-
-- Hermes Agent
-- Gemini CLI
-- OpenCode
-- other local coding-agent harnesses with inspectable logs
-
-Provider support should use a stable normalized event model rather than spreading provider-specific assumptions throughout the analyser.
+Additional parsers may be considered when a provider has inspectable local
+records and can map cleanly to the normalized model without pretending that
+unavailable telemetry is measured. Provider-specific assumptions remain
+isolated and unavailable signals remain N/A/UNAVAILABLE.
