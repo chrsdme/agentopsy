@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -46,9 +47,9 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 PARSER_VERSION = 1
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 IDENTITY_TTL_SECONDS = 15 * 60
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -63,6 +64,22 @@ class Severity(str, enum.Enum):
     CRITICAL = "CRITICAL"
     SUPER_CRITICAL = "SUPER_CRITICAL"
     EMERGENCY = "EMERGENCY"
+
+
+CONTEXT_SEVERITY_RANK = {severity: index for index, severity in enumerate((Severity.SAFE, Severity.LIGHT, Severity.HIGH, Severity.CRITICAL, Severity.SUPER_CRITICAL, Severity.EMERGENCY))}
+
+
+class EventLifecycle(str, enum.Enum):
+    """Whether an event is a presently-active condition or durable history."""
+    ACTIVE_CONDITION = "ACTIVE_CONDITION"
+    OCCURRENCE = "OCCURRENCE"
+
+
+OCCURRENCE_EVENT_CODES = frozenset({"GIANT_TOOL_RESULT", "COMMAND_REPETITION"})
+
+
+def event_lifecycle(code: str) -> EventLifecycle:
+    return EventLifecycle.OCCURRENCE if code in OCCURRENCE_EVENT_CODES else EventLifecycle.ACTIVE_CONDITION
 
 
 class ImpactLane(str, enum.Enum):
@@ -370,6 +387,32 @@ def context_severity(context_pct: Optional[float]) -> Severity:
     if pct > 0.65: return Severity.HIGH
     if pct > 0.55: return Severity.LIGHT
     return Severity.SAFE
+
+
+def provider_context_evaluation(row: Any, *, current: bool = False) -> dict[str, Any]:
+    """One provider-aware context interpretation; Claude has no invented window %."""
+    keys = row.keys() if hasattr(row, "keys") else row.keys()
+    provider = str(row["provider"]) if "provider" in keys else "codex"
+    if provider == "claude":
+        key = "current_context_tokens" if current else "peak_context_tokens"
+        tokens = safe_int(row[key] or 0) if key in keys else 0
+        if not tokens:
+            return {"severity": Severity.SAFE, "tokens": 0, "pct": None, "semantics": "N/A"}
+        if tokens >= CLAUDE_EXTREME_CONTEXT_TOKENS: severity = Severity.EMERGENCY
+        elif tokens >= CLAUDE_VERY_HIGH_CONTEXT_TOKENS: severity = Severity.CRITICAL
+        elif tokens >= CLAUDE_COSTLY_CONTEXT_TOKENS: severity = Severity.HIGH
+        else: severity = Severity.SAFE
+        return {"severity": severity, "tokens": tokens, "pct": None, "semantics": "absolute-token proxy"}
+    key = "current_context_pct" if current else "peak_context_pct"
+    pct = row[key] if key in keys else None
+    if pct is None and current and "peak_context_pct" in keys:
+        pct, key = row["peak_context_pct"], "peak_context_pct"
+    if pct is None:
+        token_key = "current_context_tokens" if current else "peak_context_tokens"
+        return {"severity": Severity.SAFE, "tokens": safe_int(row[token_key] or 0) if token_key in keys else 0, "pct": None, "semantics": "N/A"}
+    token_key = "current_context_tokens" if current else "peak_context_tokens"
+    if token_key not in keys and current and "peak_context_tokens" in keys: token_key = "peak_context_tokens"
+    return {"severity": context_severity(float(pct)), "tokens": safe_int(row[token_key] or 0) if token_key in keys else 0, "pct": float(pct), "semantics": "measured"}
 
 
 def context_status_text(severity: Severity) -> str:
@@ -730,7 +773,8 @@ class ProviderAdapter:
         return {}
 
     def parse_record(self, record: dict[str, Any], path: Path) -> dict[str, Any]:
-        return {"session_id": self.identify_session(record, path), "timestamp": self.extract_timestamp(record)}
+        sid = self.identify_session(record, path)
+        return {"session_id": sid, "stream_id": sid, "timestamp": self.extract_timestamp(record)}
 
 
 class ClaudeAdapter(ProviderAdapter):
@@ -852,6 +896,18 @@ class CodexAdapter(ProviderAdapter):
         result = super().parse_record(record, path)
         result.update(self.extract_usage(record)); result.update(self.extract_tool_event(record))
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") == "session_meta":
+            native = str(payload.get("session_id") or payload.get("id") or path.stem)
+            stream = str(payload.get("id") or native)
+            source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+            subagent = source.get("subagent") if isinstance(source.get("subagent"), dict) else {}
+            thread_source = str(payload.get("thread_source") or "")
+            subagent_kind = str(subagent.get("other") or "").lower()
+            role = "GUARDIAN" if subagent_kind == "guardian" else "APPROVAL_REVIEW" if subagent_kind in {"approval_review", "auto_review", "reviewer"} else "SUBAGENT" if thread_source == "subagent" or subagent else "MAIN"
+            result.update({"session_id": native, "stream_id": stream, "role": role,
+                           "parent_session_id": str(payload.get("parent_thread_id") or ""),
+                           "parent_stream_id": str(payload.get("parent_rollout_id") or ""),
+                           "thread_source": thread_source})
         result.update({"project": str(payload.get("cwd") or ""), "model": str(payload.get("model") or ""),
                        "effort": str(payload.get("effort") or payload.get("reasoning_effort") or ""),
                        "version": str(payload.get("cli_version") or "")})
@@ -1915,12 +1971,9 @@ def evaluate_codex_defects(s: SessionSummary) -> None:
                    f"At least {s.context80_turns} token snapshots were >=80% context.",
                    "Rotate earlier; extended dwell near the context ceiling amplifies cached-input usage.", snapshots=s.context80_turns)
 
-    if s.compactions >= 3:
-        sev = "high" if s.compactions >= 5 else "medium"
-        add_defect(s, sev, "COMPACTION_THRASH",
-                   f"The session compacted {s.compactions} times.",
-                   "Inspect whether compact→re-read→refill cycles are occurring; prefer a durable handoff and fresh chat when compaction repeats.",
-                   compactions=s.compactions)
+    # Historical report parsing has no durable before/after/refill telemetry.
+    # Do not label a count as causal THRASH; live stream classification does so
+    # only from measured telemetry in stream_compaction_outcomes().
     if s.post_compact_repeats >= 3:
         add_defect(s, "high", "POST_COMPACT_REFETCH",
                    f"Detected {s.post_compact_repeats} exact command re-runs within 5 minutes after compaction.",
@@ -2629,8 +2682,12 @@ class StateStore:
     def __init__(self, state_dir: Optional[str] = None):
         self.dir = default_state_dir(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        try: os.chmod(self.dir, 0o700)
+        except OSError: pass
         self.path = self.dir / "agentopsy.db"
         self.db = sqlite3.connect(self.path)
+        try: os.chmod(self.path, 0o600)
+        except OSError: pass
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -2645,6 +2702,7 @@ class StateStore:
         try:
             version = self.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()
             current = int(version[0]) if version else 0
+            self._migration_origin_version = current
             if current > SCHEMA_VERSION:
                 raise RuntimeError("state database is newer than this Agentopsy version")
             for target, migration in self._migration_steps():
@@ -2661,7 +2719,7 @@ class StateStore:
             self.db.commit()
 
     def _migration_steps(self) -> tuple[tuple[int, Any], ...]:
-        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3), (4, self._migration_v4))
+        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3), (4, self._migration_v4), (5, self._migration_v5))
 
     def _migration_v1(self) -> None:
         self.db.executescript("""
@@ -2725,6 +2783,62 @@ class StateStore:
             hook_event_name TEXT NOT NULL, lifecycle_source TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)""")
         self.db.execute("CREATE INDEX identity_lifecycle_lookup_idx ON identity_lifecycle(provider, native_session_id, observed_at DESC)")
 
+    def _migration_v5(self) -> None:
+        """Replace unsplittable v4 derived state with a durable v5 rebuild gate.
+
+        v4's (provider, session_id) aggregates cannot be safely partitioned
+        into rollout streams.  Keeping them would make a merged reviewer look
+        like a MAIN stream, so migration deliberately invalidates source-derived
+        state and requires one transactional replay from discoverable roots.
+        """
+        # Some early development databases recorded schema_version=1 while
+        # lacking optional v1 tables.  Materialise empty legacy shapes so this
+        # migration remains a safe upgrade rather than assuming a perfect dump.
+        self.db.execute("CREATE TABLE IF NOT EXISTS health_events (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL, severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', resolved_at TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS occurrences (session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(session_id,provider,kind,key_hash))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS record_dedup (session_id TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL, key_hash TEXT NOT NULL, PRIMARY KEY(session_id,provider,kind,key_hash))")
+        for table in ("guardian_event_lanes", "guardian_events", "telemetry_samples", "record_dedup", "occurrences", "health_events", "sessions"):
+            self.db.execute(f"ALTER TABLE {table} RENAME TO {table}_v4")
+        self.db.executescript("""
+            CREATE TABLE sessions (
+              session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '',
+              role TEXT NOT NULL DEFAULT 'MAIN', parent_session_id TEXT NOT NULL DEFAULT '', parent_stream_id TEXT NOT NULL DEFAULT '', thread_source TEXT NOT NULL DEFAULT '',
+              project TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', last_activity_at TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
+              model_turns INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, tool_result_chars INTEGER NOT NULL DEFAULT 0, max_tool_result_chars INTEGER NOT NULL DEFAULT 0,
+              input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+              peak_context_tokens INTEGER NOT NULL DEFAULT 0, context_window_tokens INTEGER NOT NULL DEFAULT 0, peak_context_pct REAL NOT NULL DEFAULT 0,
+              current_context_tokens INTEGER, current_context_pct REAL,
+              compactions INTEGER NOT NULL DEFAULT 0, repeated_reads INTEGER NOT NULL DEFAULT 0, repeated_commands INTEGER NOT NULL DEFAULT 0,
+              malformed_records INTEGER NOT NULL DEFAULT 0, health_state TEXT NOT NULL DEFAULT 'HEALTHY', health_since TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(provider, stream_id));
+            CREATE TABLE health_events (
+              id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '',
+              severity TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', resolved_at TEXT,
+              UNIQUE(provider, stream_id, code, resolved_at));
+            CREATE TABLE occurrences (session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, key_hash TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(provider, stream_id, kind, key_hash));
+            CREATE TABLE record_dedup (session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, key_hash TEXT NOT NULL, PRIMARY KEY(provider, stream_id, kind, key_hash));
+            CREATE TABLE telemetry_samples (
+              id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '', turn_index INTEGER NOT NULL,
+              context_tokens INTEGER, context_pct REAL, tool_output_chars INTEGER NOT NULL DEFAULT 0, read_hash TEXT NOT NULL DEFAULT '', command_hash TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', cached_input_tokens INTEGER, instruction_chars INTEGER, compaction INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE guardian_events (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, session_id TEXT NOT NULL, provider TEXT NOT NULL, stream_id TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL, action_safety TEXT NOT NULL, code TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', resolved_at TEXT);
+            CREATE TABLE guardian_event_lanes (event_id INTEGER NOT NULL REFERENCES guardian_events(id) ON DELETE CASCADE, lane TEXT NOT NULL, PRIMARY KEY(event_id, lane));
+            CREATE INDEX telemetry_samples_stream_idx ON telemetry_samples(provider, stream_id, id DESC);
+            CREATE INDEX guardian_events_stream_idx ON guardian_events(provider, stream_id, timestamp DESC);
+            CREATE INDEX sessions_native_idx ON sessions(provider, session_id, role, last_activity_at DESC);
+        """)
+        # Do not copy any v4 aggregate, event, dedup, or cursor.  A partial
+        # copy is worse than an empty state because it can silently authorize
+        # health/control decisions from a merged execution stream.
+        for table in ("guardian_event_lanes_v4", "guardian_events_v4", "telemetry_samples_v4", "record_dedup_v4", "occurrences_v4", "health_events_v4", "sessions_v4"):
+            self.db.execute(f"DROP TABLE {table}")
+        self.db.execute("ALTER TABLE files ADD COLUMN stream_id TEXT NOT NULL DEFAULT ''")
+        self.db.execute("DELETE FROM files")
+        self.db.execute("DELETE FROM identity_mappings")
+        self.db.execute("DELETE FROM identity_lifecycle")
+        self.db.execute("DELETE FROM service_meta WHERE key IN ('calibration_profile','last_successful_scan')")
+        if getattr(self, "_migration_origin_version", 0) >= 4:
+            self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('v5_rebuild_state','required')")
+
     def record_identity_lifecycle(self, provider: str, native_session_id: str, event: str, source: str = "") -> None:
         if provider != "codex" or not native_session_id or event not in {"SessionStart", "PreCompact", "PostCompact"}:
             raise ValueError("unsupported lifecycle identity metadata")
@@ -2771,10 +2885,13 @@ class StateStore:
         if row["session_id"]:
             # A replaced transcript can no longer be an exact live-session witness.
             self.db.execute("UPDATE identity_mappings SET active=0 WHERE provider=? AND native_session_id=? AND transcript_path=?", (row["provider"], row["session_id"], _canonical_transcript_path(str(row["path"]))))
-            self.db.execute("DELETE FROM sessions WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
-            self.db.execute("DELETE FROM occurrences WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
-            self.db.execute("DELETE FROM record_dedup WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
-            self.db.execute("DELETE FROM telemetry_samples WHERE session_id=? AND provider=?", (row["session_id"], row["provider"]))
+            stream = row["stream_id"] or row["session_id"]
+            self.db.execute("DELETE FROM sessions WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            self.db.execute("DELETE FROM occurrences WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            self.db.execute("DELETE FROM record_dedup WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            self.db.execute("DELETE FROM telemetry_samples WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            self.db.execute("DELETE FROM health_events WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            self.db.execute("DELETE FROM guardian_events WHERE stream_id=? AND provider=?", (stream, row["provider"]))
 
     def cached_provider(self, path: Path) -> Optional[str]:
         """Use durable file identity to avoid opening unchanged transcript files."""
@@ -2789,24 +2906,25 @@ class StateStore:
             return None
         return str(row["provider"])
 
-    def upsert_file(self, *, provider: str, path: Path, identity: str, size: int, mtime_ns: int, offset: int, partial: str, session_id: str, status: str) -> None:
+    def upsert_file(self, *, provider: str, path: Path, identity: str, size: int, mtime_ns: int, offset: int, partial: str, session_id: str, status: str, stream_id: str = "") -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        self.db.execute("""INSERT INTO files(provider,path,identity,size,mtime_ns,last_offset,partial_line,session_id,first_seen,last_seen,parser_version,status)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET provider=excluded.provider,identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns,last_offset=excluded.last_offset,partial_line=excluded.partial_line,session_id=excluded.session_id,last_seen=excluded.last_seen,parser_version=excluded.parser_version,status=excluded.status""",
-            (provider, str(path), identity, size, mtime_ns, offset, partial, session_id, now, now, PARSER_VERSION, status))
+        self.db.execute("""INSERT INTO files(provider,path,identity,size,mtime_ns,last_offset,partial_line,session_id,stream_id,first_seen,last_seen,parser_version,status)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET provider=excluded.provider,identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns,last_offset=excluded.last_offset,partial_line=excluded.partial_line,session_id=excluded.session_id,stream_id=excluded.stream_id,last_seen=excluded.last_seen,parser_version=excluded.parser_version,status=excluded.status""",
+            (provider, str(path), identity, size, mtime_ns, offset, partial, session_id, stream_id or session_id, now, now, PARSER_VERSION, status))
 
     def apply_record(self, provider: str, path: Path, data: dict[str, Any], malformed: bool = False) -> str:
         sid = str(data.get("session_id") or path.stem)
+        stream = str(data.get("stream_id") or sid)
         ts = str(data.get("timestamp") or "")
-        row = self.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, provider)).fetchone()
+        row = self.db.execute("SELECT * FROM sessions WHERE stream_id=? AND provider=?", (stream, provider)).fetchone()
         if row is None:
             # INSERT OR IGNORE: a concurrent scan (daemon + CLI) may race to create
             # the same session row; the later writer's UPDATE below still applies.
-            self.db.execute("INSERT OR IGNORE INTO sessions(session_id,provider,project,path,started_at,last_activity_at,health_since) VALUES(?,?,?,?,?,?,?)", (sid, provider, str(data.get("project") or ""), str(path), ts, ts, dt.datetime.now(dt.timezone.utc).isoformat()))
+            self.db.execute("INSERT OR IGNORE INTO sessions(session_id,provider,stream_id,role,parent_session_id,parent_stream_id,thread_source,project,path,started_at,last_activity_at,health_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (sid, provider, stream, str(data.get("role") or "MAIN"), str(data.get("parent_session_id") or ""), str(data.get("parent_stream_id") or ""), str(data.get("thread_source") or ""), str(data.get("project") or ""), str(path), ts, ts, dt.datetime.now(dt.timezone.utc).isoformat()))
         # Codex token snapshots are cumulative; append-only Claude values are additive.
         cumulative = provider == "codex" and data.get("input_tokens") is not None
         set_parts, args = [], []
-        for field in ("project", "model", "effort", "version"):
+        for field in ("project", "model", "effort", "version", "role", "parent_session_id", "parent_stream_id", "thread_source"):
             if data.get(field): set_parts.append(f"{field}=?"); args.append(str(data[field]))
         if ts:
             set_parts.append("last_activity_at=?"); args.append(ts)
@@ -2823,29 +2941,31 @@ class StateStore:
                 set_parts.append(f"{field}=?" if cumulative else f"{field}={field}+?"); args.append(safe_int(val))
         if malformed: set_parts.append("malformed_records=malformed_records+1")
         if set_parts:
-            args.extend([sid, provider]); self.db.execute(f"UPDATE sessions SET {','.join(set_parts)} WHERE session_id=? AND provider=?", args)
+            args.extend([stream, provider]); self.db.execute(f"UPDATE sessions SET {','.join(set_parts)} WHERE stream_id=? AND provider=?", args)
         for kind, key in (("read", data.get("read_key")), ("command", data.get("command_key"))):
             if key:
-                digest = sha1_text(str(key)); self.db.execute("INSERT INTO occurrences(session_id,provider,kind,key_hash,count) VALUES(?,?,?,?,1) ON CONFLICT(session_id,provider,kind,key_hash) DO UPDATE SET count=count+1", (sid, provider, kind, digest))
+                digest = sha1_text(str(key)); self.db.execute("INSERT INTO occurrences(session_id,provider,stream_id,kind,key_hash,count) VALUES(?,?,?,?,?,1) ON CONFLICT(provider,stream_id,kind,key_hash) DO UPDATE SET count=count+1", (sid, provider, stream, kind, digest))
                 col = "repeated_reads" if kind == "read" else "repeated_commands"
-                self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE session_id=? AND provider=? AND kind=?) WHERE session_id=? AND provider=?", (sid, provider, kind, sid, provider))
-        self.record_telemetry(provider, sid, ts, data)
-        return sid
+                self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE stream_id=? AND provider=? AND kind=?) WHERE stream_id=? AND provider=?", (stream, provider, kind, stream, provider))
+        self.record_telemetry(provider, sid, stream, ts, data)
+        return stream
 
-    def record_telemetry(self, provider: str, sid: str, timestamp: str, data: dict[str, Any]) -> None:
+    def record_telemetry(self, provider: str, sid: str, stream: str, timestamp: str, data: dict[str, Any]) -> None:
         """Persist a bounded numeric/hash-only ring; never transcript payloads."""
         meaningful = any(data.get(key) not in (None, "", 0, 0.0) for key in ("peak_context_tokens", "peak_context_pct", "tool_result_chars", "read_key", "command_key", "content_key", "cached_input_tokens", "compactions", "instruction_chars"))
         if not meaningful:
             return
-        row = self.db.execute("SELECT model_turns FROM sessions WHERE session_id=? AND provider=?", (sid, provider)).fetchone()
+        row = self.db.execute("SELECT model_turns FROM sessions WHERE stream_id=? AND provider=?", (stream, provider)).fetchone()
         stamp = timestamp if iso_to_dt(timestamp) else dt.datetime.now(dt.timezone.utc).isoformat()
-        self.db.execute("""INSERT INTO telemetry_samples(timestamp,session_id,provider,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (stamp, sid, provider, int(row[0] if row else 0), data.get("peak_context_tokens") or None, data.get("peak_context_pct") or None, safe_int(data.get("tool_result_chars")), sha1_text(str(data["read_key"])) if data.get("read_key") else "", sha1_text(str(data["command_key"])) if data.get("command_key") else "", sha1_text(str(data["content_key"])) if data.get("content_key") else "", data.get("cached_input_tokens"), data.get("instruction_chars"), int(bool(data.get("compactions")))))
-        self.db.execute("""DELETE FROM telemetry_samples WHERE session_id=? AND provider=? AND id NOT IN
-            (SELECT id FROM telemetry_samples WHERE session_id=? AND provider=? ORDER BY id DESC LIMIT 250)""", (sid, provider, sid, provider))
+        self.db.execute("""INSERT INTO telemetry_samples(timestamp,session_id,provider,stream_id,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,cached_input_tokens,instruction_chars,compaction)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (stamp, sid, provider, stream, int(row[0] if row else 0), data.get("peak_context_tokens") or None, data.get("peak_context_pct") or None, safe_int(data.get("tool_result_chars")), sha1_text(str(data["read_key"])) if data.get("read_key") else "", sha1_text(str(data["command_key"])) if data.get("command_key") else "", sha1_text(str(data["content_key"])) if data.get("content_key") else "", data.get("cached_input_tokens"), data.get("instruction_chars"), int(bool(data.get("compactions")))))
+        if data.get("peak_context_tokens") not in (None, "", 0) or data.get("peak_context_pct") not in (None, "", 0, 0.0):
+            self.db.execute("UPDATE sessions SET current_context_tokens=?, current_context_pct=? WHERE provider=? AND stream_id=?", (data.get("peak_context_tokens") or None, data.get("peak_context_pct") if data.get("peak_context_pct") not in (None, "") else None, provider, stream))
+        self.db.execute("""DELETE FROM telemetry_samples WHERE stream_id=? AND provider=? AND id NOT IN
+            (SELECT id FROM telemetry_samples WHERE stream_id=? AND provider=? ORDER BY id DESC LIMIT 250)""", (stream, provider, stream, provider))
 
-    def rolling_telemetry(self, provider: str, sid: str, now: Optional[dt.datetime] = None) -> dict[str, Any]:
-        rows = self.db.execute("SELECT * FROM telemetry_samples WHERE session_id=? AND provider=? ORDER BY id", (sid, provider)).fetchall()
+    def rolling_telemetry(self, provider: str, stream_id: str, now: Optional[dt.datetime] = None) -> dict[str, Any]:
+        rows = self.db.execute("SELECT * FROM telemetry_samples WHERE stream_id=? AND provider=? ORDER BY id", (stream_id, provider)).fetchall()
         now = now or dt.datetime.now(dt.timezone.utc)
         parsed = [(r, iso_to_dt(r["timestamp"]) or now) for r in rows]
         def summarise(samples: list[tuple[sqlite3.Row, dt.datetime]]) -> dict[str, Any]:
@@ -2867,23 +2987,79 @@ class StateStore:
             if after is not None and latest is not None: result["context_refill_after_compaction"] = max(0, int(latest) - int(after))
         return result
 
-    def mark_unique(self, provider: str, sid: str, kind: str, key: str) -> bool:
+    def mark_unique(self, provider: str, stream_id: str, kind: str, key: str, session_id: Optional[str] = None) -> bool:
         if not key: return True
-        cur = self.db.execute("INSERT OR IGNORE INTO record_dedup(session_id,provider,kind,key_hash) VALUES(?,?,?,?)", (sid, provider, kind, sha1_text(key)))
+        cur = self.db.execute("INSERT OR IGNORE INTO record_dedup(session_id,provider,stream_id,kind,key_hash) VALUES(?,?,?,?,?)", (session_id or stream_id, provider, stream_id, kind, sha1_text(key)))
         return cur.rowcount == 1
 
     def sessions(self, provider: str = "all", session: str = "") -> list[sqlite3.Row]:
+        if self.v5_rebuild_required():
+            return []
         sql, args = "SELECT * FROM sessions", []
         where = []
         if provider != "all": where.append("provider=?"); args.append(provider)
-        if session: where.append("session_id LIKE ?"); args.append(session + "%")
+        if session: where.append("(session_id LIKE ? OR stream_id LIKE ?)"); args.extend([session + "%", session + "%"])
         if where: sql += " WHERE " + " AND ".join(where)
         return self.db.execute(sql + " ORDER BY last_activity_at DESC", args).fetchall()
 
-    def event(self, provider: str, sid: str, severity: str, code: str, message: str, evidence: dict[str, Any], cooldown: int = 900) -> None:
-        now = dt.datetime.now(dt.timezone.utc); previous = self.db.execute("SELECT timestamp FROM health_events WHERE session_id=? AND provider=? AND code=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (sid, provider, code)).fetchone()
-        if previous and (now - iso_to_dt(previous[0])).total_seconds() < cooldown: return
-        self.db.execute("INSERT INTO health_events(timestamp,session_id,provider,severity,code,message,evidence) VALUES(?,?,?,?,?,?,?)", (now.isoformat(), sid, provider, severity, code, message, json.dumps(evidence, sort_keys=True)))
+    def v5_rebuild_required(self) -> bool:
+        row = self.db.execute("SELECT value FROM service_meta WHERE key='v5_rebuild_state'").fetchone()
+        return bool(row and row[0] != "complete")
+
+    def reconcile_parent_streams(self) -> None:
+        """Link child streams only where one exact MAIN parent is known."""
+        self.db.execute("""UPDATE sessions AS child SET parent_stream_id=(
+            SELECT parent.stream_id FROM sessions AS parent
+            WHERE parent.provider=child.provider AND parent.session_id=child.parent_session_id AND parent.role='MAIN'
+        ) WHERE child.parent_session_id<>'' AND child.parent_stream_id='' AND
+          1=(SELECT COUNT(*) FROM sessions AS parent WHERE parent.provider=child.provider AND parent.session_id=child.parent_session_id AND parent.role='MAIN')""")
+
+    def event(self, provider: str, stream_id: str, severity: str, code: str, message: str, evidence: dict[str, Any], cooldown: int = 900) -> None:
+        row = self.db.execute("SELECT session_id FROM sessions WHERE provider=? AND stream_id=?", (provider, stream_id)).fetchone()
+        sid = str(row[0]) if row else stream_id
+        now = dt.datetime.now(dt.timezone.utc); evidence_json = json.dumps(evidence, sort_keys=True)
+        lifecycle = event_lifecycle(code)
+        if lifecycle == EventLifecycle.OCCURRENCE:
+            # Aggregate maxima/counters can remain true forever.  Retain one
+            # exact historical observation but never represent it as active.
+            existing = self.db.execute("SELECT id FROM health_events WHERE stream_id=? AND provider=? AND code=? AND evidence=? LIMIT 1", (stream_id, provider, code, evidence_json)).fetchone()
+            if existing: return
+            resolved_at = now.isoformat()
+        else:
+            previous = self.db.execute("SELECT timestamp FROM health_events WHERE stream_id=? AND provider=? AND code=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (stream_id, provider, code)).fetchone()
+            if previous and (now - iso_to_dt(previous[0])).total_seconds() < cooldown: return
+            resolved_at = None
+        self.db.execute("INSERT INTO health_events(timestamp,session_id,provider,stream_id,severity,code,message,evidence,resolved_at) VALUES(?,?,?,?,?,?,?,?,?)", (now.isoformat(), sid, provider, stream_id, severity, code, message, evidence_json, resolved_at))
+        lanes = {"HIGH_CONTEXT": ("context_pressure",), "EXTREME_CONTEXT": ("context_pressure",), "GIANT_TOOL_RESULT": ("tool_output",), "REPEATED_READ": ("workflow",), "COMMAND_REPETITION": ("workflow",)}.get(code, ("integrity",) if code == "CONTROL_FAIL_SAFE" else ())
+        event_id = self.db.execute("INSERT INTO guardian_events(timestamp,session_id,provider,stream_id,severity,action_safety,code,evidence,resolved_at) VALUES(?,?,?,?,?,?,?,?,?)", (now.isoformat(), sid, provider, stream_id, severity, "ADVISE_ONLY", code, evidence_json, resolved_at)).lastrowid
+        for lane in lanes: self.db.execute("INSERT INTO guardian_event_lanes(event_id,lane) VALUES(?,?)", (event_id, lane))
+
+    def resolve_inactive_events(self, provider: str, stream_id: str, active_codes: set[str]) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        rows = self.db.execute("SELECT id,code FROM health_events WHERE provider=? AND stream_id=? AND resolved_at IS NULL", (provider, stream_id)).fetchall()
+        for row in rows:
+            if event_lifecycle(row["code"]) == EventLifecycle.OCCURRENCE or row["code"] not in active_codes:
+                self.db.execute("UPDATE health_events SET resolved_at=? WHERE id=?", (now, row["id"]))
+                self.db.execute("UPDATE guardian_events SET resolved_at=? WHERE provider=? AND stream_id=? AND code=? AND resolved_at IS NULL", (now, provider, stream_id, row["code"]))
+
+
+def stream_compaction_outcomes(store: StateStore, row: sqlite3.Row) -> list[dict[str, Any]]:
+    """Classify only compactions with surrounding measured stream telemetry."""
+    samples = store.db.execute("SELECT * FROM telemetry_samples WHERE provider=? AND stream_id=? ORDER BY id", (row["provider"], row["stream_id"])).fetchall()
+    markers = [index for index, sample in enumerate(samples) if sample["compaction"]]
+    if not markers:
+        return []
+    marker_times = [iso_to_dt(samples[index]["timestamp"]) for index in markers]
+    window = None
+    if len(marker_times) > 1 and marker_times[0] and marker_times[-1]: window = (marker_times[-1] - marker_times[0]).total_seconds()
+    outcomes = []
+    for index in markers:
+        before = next((safe_int(samples[i]["context_tokens"]) for i in range(index - 1, -1, -1) if samples[i]["context_tokens"] is not None), 0)
+        after = safe_int(samples[index]["context_tokens"] or 0)
+        refill = next((safe_int(samples[i]["context_tokens"]) for i in range(len(samples) - 1, index, -1) if samples[i]["context_tokens"] is not None), None)
+        repeated = sum(bool(samples[i]["command_hash"]) for i in range(index + 1, len(samples)))
+        outcomes.append(classify_compaction(before, after, refill, repeated, len(markers), compaction_window_seconds=window))
+    return outcomes
 
 
 def exact_identity_for_live_session(store: Optional[StateStore], row: sqlite3.Row) -> Optional[sqlite3.Row]:
@@ -3013,22 +3189,27 @@ class HealthPolicy:
 
 
 def evaluate_live_health(row: sqlite3.Row, policy: HealthPolicy) -> tuple[str, list[tuple[str, str, str, dict[str, Any]]]]:
-    pct = float(row["peak_context_pct"] or 0.0)
-    if row["provider"] == "claude" and not pct:
-        # Claude does not reliably report a window denominator; use a documented provisional 250k reference only for policy bands.
-        pct = min(1.0, int(row["peak_context_tokens"] or 0) / 250_000)
+    context = provider_context_evaluation(row, current=True)
+    severity, pct, semantics = context["severity"], context["pct"], context["semantics"]
+    if semantics == "N/A": return "UNKNOWN", []
     previous = row["health_state"]
-    if pct >= policy.rotation_pct: state = "ROTATION_RECOMMENDED"
+    if row["provider"] == "claude":
+        state = "ROTATION_RECOMMENDED" if context["tokens"] >= 200_000 else "CHECKPOINT_RECOMMENDED" if severity == Severity.HIGH else "HEALTHY"
+    elif pct >= policy.rotation_pct: state = "ROTATION_RECOMMENDED"
     elif pct >= policy.checkpoint_pct: state = "CHECKPOINT_RECOMMENDED"
     elif pct >= policy.watch_pct: state = "WATCH"
     elif pct < policy.recovery_pct or previous == "HEALTHY": state = "HEALTHY"
     else: state = previous  # hysteresis retains the existing band between recovery and entry thresholds.
     events = []
-    if state != "HEALTHY": events.append(("high" if state == "ROTATION_RECOMMENDED" else "medium", "HIGH_CONTEXT" if state != "ROTATION_RECOMMENDED" else "EXTREME_CONTEXT", f"Context occupancy proxy is {pct*100:.1f}% ({state.lower().replace('_', ' ')}).", {"context_pct": round(pct * 100, 1)}))
+    if state not in {"HEALTHY", "UNKNOWN"}:
+        code = "EXTREME_CONTEXT" if state == "ROTATION_RECOMMENDED" else "HIGH_CONTEXT"
+        value = f"~{human_int(context['tokens'])} tokens" if pct is None else f"{pct*100:.1f}%"
+        events.append(("high" if state == "ROTATION_RECOMMENDED" else "medium", code, f"Current context {semantics} is {value} ({state.lower().replace('_', ' ')}).", {"context_tokens": context["tokens"], "context_pct": round(pct * 100, 1) if pct is not None else None, "semantics": semantics}))
     if int(row["max_tool_result_chars"] or 0) // 4 >= GIANT_RESULT_TOKENS: events.append(("high", "GIANT_TOOL_RESULT", "A large tool result was observed.", {"tokens_proxy": int(row["max_tool_result_chars"]) // 4}))
     if int(row["repeated_reads"] or 0) >= 4: events.append(("medium", "REPEATED_READ", "A read target has repeated.", {"repeats": row["repeated_reads"]}))
     if int(row["repeated_commands"] or 0) >= 5: events.append(("medium", "COMMAND_REPETITION", "A command has repeated.", {"repeats": row["repeated_commands"]}))
-    if int(row["compactions"] or 0) >= 3: events.append(("medium", "COMPACTION_THRASH", "Repeated compactions were observed.", {"compactions": row["compactions"]}))
+    # Raw compaction count alone is not causal evidence of thrash.  The
+    # collector keeps marker/timing telemetry for measured classification.
     # The live collector has no truthful context-velocity or dwell samples yet.
     # Do not emit a compound emergency from fabricated zero-valued lanes; this
     # rule remains available for callers that actually supply independent facts.
@@ -3051,6 +3232,12 @@ class IncrementalIngestor:
         candidates = collect_candidates(self.roots, self.provider, lambda path: self.store.cached_provider(path) or classify_jsonl(path))
         with self.store.db:
             for candidate in candidates: self._ingest(candidate, metrics)
+            self.store.reconcile_parent_streams()
+            # The marker survives every crash/exception because this is inside
+            # the same transaction as the replay.  A filtered scan cannot
+            # claim a complete rebuild of providers it did not inspect.
+            if self.store.v5_rebuild_required() and self.provider == "all" and candidates:
+                self.store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('v5_rebuild_state','complete')")
             self.store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('last_successful_scan',?)", (dt.datetime.now(dt.timezone.utc).isoformat(),))
         return metrics
 
@@ -3058,7 +3245,7 @@ class IncrementalIngestor:
         path = candidate.path; stat = path.stat(); identity = f"{stat.st_dev}:{stat.st_ino}"; old = self.store.file(path)
         reset = old is not None and (old["identity"] != identity or stat.st_size < old["last_offset"])
         if old and not reset and stat.st_size == old["size"]:
-            metrics.files_unchanged += 1; self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=old["last_offset"],partial=old["partial_line"],session_id=old["session_id"],status="ok"); return
+            metrics.files_unchanged += 1; self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=old["last_offset"],partial=old["partial_line"],session_id=old["session_id"],stream_id=old["stream_id"],status="ok"); return
         if reset:
             self.store.reset_file_session(old); offset, partial = 0, ""; metrics.files_rescanned += 1
         else: offset, partial = (int(old["last_offset"]), str(old["partial_line"])) if old else (0, "")
@@ -3068,49 +3255,57 @@ class IncrementalIngestor:
         text = partial + chunk.decode("utf-8", errors="replace")
         lines = text.splitlines(keepends=True); trailing = ""
         if lines and not lines[-1].endswith(("\n", "\r")): trailing = lines.pop()
-        adapter = ADAPTERS[candidate.provider]; sid = "" if reset else str(old["session_id"] if old else "")
+        adapter = ADAPTERS[candidate.provider]; stream_id = "" if reset else str(old["stream_id"] if old else "")
+        native_sid = "" if reset else str(old["session_id"] if old else "")
         for line in lines:
             if not line.strip(): continue
             try:
                 data = adapter.parse_record(json.loads(line), path)
+                if candidate.provider == "claude":
+                    data.update({"role": "SUBAGENT" if candidate.is_subagent else "MAIN", "parent_session_id": candidate.parent_session_id if candidate.is_subagent else ""})
                 # Codex metadata normally carries the native session ID only once.
                 # Later records must stay attached to that file's established ID,
                 # rather than falling back to a filename-derived placeholder.
-                if sid and str(data.get("session_id") or "") == path.stem:
-                    data["session_id"] = sid
+                if stream_id and str(data.get("stream_id") or "") == path.stem:
+                    data["stream_id"] = stream_id
+                    data["session_id"] = native_sid or str(data.get("session_id") or path.stem)
+                native_sid = str(data.get("session_id") or native_sid or path.stem)
+                stream_id = str(data.get("stream_id") or stream_id or native_sid)
+                data["session_id"], data["stream_id"] = native_sid, stream_id
                 if candidate.provider == "claude":
-                    target_sid = str(data.get("session_id") or sid or path.stem)
+                    target_sid = stream_id
                     usage_key = str(data.pop("usage_key", ""))
-                    if usage_key and not self.store.mark_unique(candidate.provider, target_sid, "assistant_usage", usage_key):
+                    if usage_key and not self.store.mark_unique(candidate.provider, target_sid, "assistant_usage", usage_key, native_sid):
                         for field in ("input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens", "reasoning_tokens", "model_turns", "peak_context_tokens"):
                             data[field] = 0
                     calls = data.pop("tool_call_items", [])
                     if calls:
-                        data["tool_calls"] = sum(self.store.mark_unique(candidate.provider, target_sid, "tool_call", str(item)) for item in calls)
+                        data["tool_calls"] = sum(self.store.mark_unique(candidate.provider, target_sid, "tool_call", str(item), native_sid) for item in calls)
                     results = data.pop("tool_result_items", [])
                     if results:
-                        fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item))]
+                        fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item), native_sid)]
                         data["tool_result_chars"] = sum(fresh)
                         data["max_tool_result_chars"] = max(fresh, default=0)
                 elif candidate.provider == "codex":
                     usage_key = str(data.pop("usage_key", ""))
-                    if usage_key and not self.store.mark_unique(candidate.provider, str(data.get("session_id") or sid or path.stem), "token_snapshot", usage_key):
+                    if usage_key and not self.store.mark_unique(candidate.provider, stream_id, "token_snapshot", usage_key, native_sid):
                         data["model_turns"] = 0
-                sid = self.store.apply_record(candidate.provider, path, data)
+                stream_id = self.store.apply_record(candidate.provider, path, data)
             except json.JSONDecodeError:
                 metrics.parse_errors += 1
                 # Before metadata identifies a session, retain the error in scan
                 # metrics rather than inventing a path-derived session row.
-                if sid: self.store.apply_record(candidate.provider, path, {"session_id": sid}, malformed=True)
-        self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=sid or (old["session_id"] if old else path.stem),status="ok")
+                if stream_id: self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id}, malformed=True)
+        self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=native_sid or (old["session_id"] if old else path.stem),stream_id=stream_id or (old["stream_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1
-        if sid:
-            metrics.touched_sessions.add((candidate.provider, sid))
-            row = self.store.db.execute("SELECT * FROM sessions WHERE session_id=? AND provider=?", (sid, candidate.provider)).fetchone()
+        if stream_id:
+            metrics.touched_sessions.add((candidate.provider, stream_id))
+            row = self.store.db.execute("SELECT * FROM sessions WHERE stream_id=? AND provider=?", (stream_id, candidate.provider)).fetchone()
             if row:
                 state, events = evaluate_live_health(row, HealthPolicy.from_environment())
-                self.store.db.execute("UPDATE sessions SET health_state=? WHERE session_id=? AND provider=?", (state, sid, candidate.provider))
-                for severity, code, message, evidence in events: self.store.event(candidate.provider, sid, severity, code, message, evidence, cooldown=self.event_cooldown)
+                self.store.db.execute("UPDATE sessions SET health_state=? WHERE stream_id=? AND provider=?", (state, stream_id, candidate.provider))
+                for severity, code, message, evidence in events: self.store.event(candidate.provider, stream_id, severity, code, message, evidence, cooldown=self.event_cooldown)
+                self.store.resolve_inactive_events(candidate.provider, stream_id, {code for _, code, _, _ in events if event_lifecycle(code) == EventLifecycle.ACTIVE_CONDITION})
 
 
 def run_watch(args: argparse.Namespace) -> int:
@@ -3178,7 +3373,7 @@ HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Fil
 def validate_handoff(project: str) -> dict[str, Any]:
     path = Path(project) / ".ai" / "state" / "HANDOFF.md"
     result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None,
-              "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.3 does not infer agent idle/safe state or automate rotation."}
+              "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.4.1 does not infer agent idle/safe state or automate rotation."}
     if not path.is_file(): return result
     text = path.read_text(encoding="utf-8", errors="replace")
     result["missing"] = [name for name in HANDOFF_SECTIONS if not re.search(rf"(?mi)^#+\s*{re.escape(name)}\s*$", text)]
@@ -3192,21 +3387,26 @@ def render_health(rows: list[sqlite3.Row]) -> str:
     if not rows: return "No incremental session state yet. Run `agentopsy service once`."
     lines = []
     for row in rows:
-        pct = float(row["peak_context_pct"] or 0.0)
-        context = f"{pct*100:.1f}%" if pct else (f"~{human_int(row['peak_context_tokens'])} tokens" if row["peak_context_tokens"] else "unknown")
-        lines += [row["provider"].title(), f"session: {row['session_id']}", f"health: {row['health_state']}", f"context: {context}", f"peak context: {context}", f"large reads: {row['repeated_reads']}", f"repeated commands: {row['repeated_commands']}", f"last activity: {row['last_activity_at'] or '-'}", ""]
+        current_pct, peak_pct = row["current_context_pct"], float(row["peak_context_pct"] or 0.0)
+        current = f"{float(current_pct)*100:.1f}%" if current_pct is not None else (f"~{human_int(row['current_context_tokens'])} tokens (proxy)" if row["current_context_tokens"] else "N/A")
+        peak = f"{peak_pct*100:.1f}%" if peak_pct else (f"~{human_int(row['peak_context_tokens'])} tokens" if row["peak_context_tokens"] else "N/A")
+        lines += [row["provider"].title(), f"session: {row['session_id']}", f"stream: {row['stream_id']}", f"role: {row['role']}", f"health: {row['health_state']}", f"current context: {current}", f"peak context: {peak}", f"repeated reads: {row['repeated_reads']}", f"repeated commands: {row['repeated_commands']}", f"last activity: {row['last_activity_at'] or '-'}", ""]
     return "\n".join(lines).rstrip()
 
 
-def trend_payload(store: StateStore, days: int = 30) -> dict[str, Any]:
+def trend_payload(store: StateStore, days: int = 30, provider_filter: str = "all", session_filter: str = "") -> dict[str, Any]:
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
     result: dict[str, Any] = {"period_days": days, "providers": {}}
-    for provider in ("claude", "codex"):
-        rows = store.db.execute("SELECT * FROM sessions WHERE provider=? AND last_activity_at>=?", (provider, cutoff)).fetchall()
+    providers = ("claude", "codex") if provider_filter == "all" else (provider_filter,)
+    for provider in providers:
+        rows = [r for r in store.sessions(provider, session_filter) if r["last_activity_at"] >= cutoff and r["role"] == "MAIN" and int(r["model_turns"] or 0) > 0]
         peaks = [float(r["peak_context_pct"] or 0.0) for r in rows if r["peak_context_pct"]]
+        contexts = [provider_context_evaluation(r) for r in rows]
+        outcomes = [outcome for row in rows for outcome in stream_compaction_outcomes(store, row)]
         result["providers"][provider] = {"sessions": len(rows), "median_peak_context_pct": statistics.median(peaks) if peaks else None,
-            "sessions_over_65pct": sum(x >= .65 for x in peaks), "repeated_read_sessions": sum(int(r["repeated_reads"]) >= 4 for r in rows),
-            "compaction_thrash_sessions": sum(int(r["compactions"]) >= 3 for r in rows),
+            "sessions_over_65pct": sum(x >= .65 for x in peaks), "high_context_sessions": sum(CONTEXT_SEVERITY_RANK[item["severity"]] >= CONTEXT_SEVERITY_RANK[Severity.HIGH] for item in contexts), "context_semantics": "absolute-token proxy" if provider == "claude" else "measured percentage",
+            "repeated_read_sessions": sum(int(r["repeated_reads"]) >= 4 for r in rows),
+            "compaction_thrash_sessions": sum(any(item["outcome"] == "THRASH" for item in stream_compaction_outcomes(store, row)) for row in rows),
             "tool_output_chars": sum(int(r["tool_result_chars"]) for r in rows), "note": "Context/token values are transcript telemetry or explicit proxies, not billing."}
     return result
 
@@ -3222,14 +3422,15 @@ def robust_profile(values: list[float], sessions: int, turns: int = 0, tools: in
 
 
 def calibration_build(store: StateStore) -> dict[str, Any]:
-    rows = store.sessions()
+    rows = [r for r in store.sessions() if r["role"] == "MAIN" and int(r["model_turns"] or 0) > 0]
     profiles: dict[str, Any] = {}
     for provider in ("claude", "codex"):
         subset = [r for r in rows if r["provider"] == provider]
         turns, tools = sum(int(r["model_turns"]) for r in subset), sum(int(r["tool_calls"]) for r in subset)
-        metrics = {"session_duration_seconds": [0.0 for _ in subset], "model_turns": [float(r["model_turns"]) for r in subset], "context_peak_pct": [float(r["peak_context_pct"]) for r in subset if r["peak_context_pct"]], "tool_output_chars": [float(r["tool_result_chars"]) for r in subset], "max_tool_result_chars": [float(r["max_tool_result_chars"]) for r in subset], "repeated_reads": [float(r["repeated_reads"]) for r in subset], "command_repetition": [float(r["repeated_commands"]) for r in subset]}
-        profiles[provider] = {name: robust_profile(values, len(subset), turns, tools) for name, values in metrics.items()}
-    payload = {"version": 1, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "profiles": profiles, "factory_hard_ceilings_authoritative": True, "adopted": False}
+        durations = [(iso_to_dt(r["last_activity_at"]) - iso_to_dt(r["started_at"])).total_seconds() for r in subset if iso_to_dt(r["started_at"]) and iso_to_dt(r["last_activity_at"]) and iso_to_dt(r["last_activity_at"]) >= iso_to_dt(r["started_at"])]
+        metrics = {"session_duration_seconds": durations, "model_turns": [float(r["model_turns"]) for r in subset], "context_peak_pct": [float(r["peak_context_pct"]) for r in subset if r["peak_context_pct"]], "context_peak_tokens": [float(r["peak_context_tokens"]) for r in subset if r["peak_context_tokens"]], "tool_output_chars": [float(r["tool_result_chars"]) for r in subset], "max_tool_result_chars": [float(r["max_tool_result_chars"]) for r in subset], "repeated_reads": [float(r["repeated_reads"]) for r in subset], "command_repetition": [float(r["repeated_commands"]) for r in subset]}
+        profiles[provider] = {name: robust_profile(values, len(values), sum(int(r["model_turns"]) for r in subset if (name != "session_duration_seconds" or r["started_at"] and r["last_activity_at"])), sum(int(r["tool_calls"]) for r in subset)) for name, values in metrics.items()}
+    payload = {"version": 2, "schema_version": SCHEMA_VERSION, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "profiles": profiles, "population": calibration_build_fingerprint(store), "factory_hard_ceilings_authoritative": True, "adopted": False}
     store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('calibration_profile',?)", (json.dumps(payload, sort_keys=True),)); store.db.commit()
     return payload
 
@@ -3239,13 +3440,37 @@ def calibration_status(store: StateStore) -> dict[str, Any]:
     return json.loads(row[0]) if row else {"status": "INSUFFICIENT", "message": "No calibration built yet."}
 
 
+CALIBRATION_METRICS = ("session_duration_seconds", "model_turns", "context_peak_pct", "context_peak_tokens", "tool_output_chars", "max_tool_result_chars", "repeated_reads", "command_repetition")
+
+
+def calibration_adoptable(store: StateStore, payload: dict[str, Any]) -> bool:
+    """Reject hand-written, stale, or incomplete profiles even if they claim HIGH."""
+    if payload.get("version") != 2 or payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("population"), dict): return False
+    current = calibration_build_fingerprint(store)
+    if payload["population"].get("fingerprint") != current["fingerprint"] or payload["population"].get("qualified_main_streams") != current["qualified_main_streams"]: return False
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, dict): return False
+    for provider in ("claude", "codex"):
+        profile = profiles.get(provider)
+        if not isinstance(profile, dict) or set(profile) != set(CALIBRATION_METRICS): return False
+        for metric in profile.values():
+            if not isinstance(metric, dict) or metric.get("confidence") in {"INSUFFICIENT", "LOW", None} or safe_int(metric.get("samples")) <= 0: return False
+    return True
+
+
+def calibration_build_fingerprint(store: StateStore) -> dict[str, Any]:
+    rows = [r for r in store.sessions() if r["role"] == "MAIN" and int(r["model_turns"] or 0) > 0]
+    return {"qualified_main_streams": len(rows), "fingerprint": hashlib.sha256(json.dumps([(r["provider"], r["stream_id"], r["model_turns"], r["last_activity_at"]) for r in rows], sort_keys=True).encode()).hexdigest()}
+
+
 def insights_payload(store: StateStore, days: int = 30, provider: str = "all") -> dict[str, Any]:
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
-    rows = [r for r in store.sessions(provider) if r["last_activity_at"] >= cutoff]
+    rows = [r for r in store.sessions(provider) if r["last_activity_at"] >= cutoff and r["role"] == "MAIN" and int(r["model_turns"] or 0) > 0]
     if not rows: return {"period_days": days, "provider": provider, "sessions": 0, "insights": []}
-    recurring = {"repeated_reads": sum(int(r["repeated_reads"]) >= 4 for r in rows), "command_repetition": sum(int(r["repeated_commands"]) >= 5 for r in rows), "compaction_thrash": sum(int(r["compactions"]) >= 3 for r in rows), "high_context": sum(float(r["peak_context_pct"] or 0) > .65 for r in rows)}
+    outcomes = {r["stream_id"]: stream_compaction_outcomes(store, r) for r in rows}
+    recurring = {"repeated_reads": sum(int(r["repeated_reads"]) >= 4 for r in rows), "command_repetition": sum(int(r["repeated_commands"]) >= 5 for r in rows), "compaction_thrash": sum(any(item["outcome"] == "THRASH" for item in outcomes[r["stream_id"]]) for r in rows), "high_context": sum(CONTEXT_SEVERITY_RANK[provider_context_evaluation(r)["severity"]] >= CONTEXT_SEVERITY_RANK[Severity.HIGH] for r in rows)}
     weakest = max(recurring, key=recurring.get)
-    refill = sum(int(r["compactions"]) and int(r["repeated_commands"]) >= 2 for r in rows)
+    refill = sum(any(item["outcome"] == "RAPID_REFILL" for item in outcomes[r["stream_id"]]) for r in rows)
     insights = [f"Most recurrent workflow fault: {weakest.replace('_', ' ')} ({recurring[weakest]}/{len(rows)} sessions).", f"Compaction followed by repeated commands occurred in {refill}/{len(rows)} sessions.", "Use bounded reads, checkpoints, and fresh sessions at high context; these are workflow recommendations, not provider cache-expiry claims."]
     return {"period_days": days, "provider": provider, "sessions": len(rows), "recurring_faults": recurring, "weakest_marker": weakest, "compaction_refill_sessions": refill, "insights": insights}
 
@@ -3253,9 +3478,23 @@ def insights_payload(store: StateStore, days: int = 30, provider: str = "all") -
 def stale_session_preflight(row: sqlite3.Row, now: Optional[dt.datetime] = None) -> dict[str, Any]:
     now = now or dt.datetime.now(dt.timezone.utc); last = iso_to_dt(row["last_activity_at"])
     idle = (now - last).total_seconds() if last else None
-    pct = float(row["peak_context_pct"] or 0.0)
-    warning = bool(idle is not None and idle >= 3600 and (pct > .55 or int(row["peak_context_tokens"] or 0) >= 150_000))
-    return {"supported_interception": False, "idle_seconds": idle, "context_pct": pct or None, "cache_ratio": (int(row["cached_input_tokens"] or 0) / int(row["input_tokens"])) if int(row["input_tokens"] or 0) else None, "warning": warning, "message": "This session is already large and has been idle for a substantial period. Continuing may require previous context to be processed again. Consider compacting or starting fresh." if warning else "No stale-session preflight warning from observed local facts.", "note": "No provider cache-expiry claim is made."}
+    context = provider_context_evaluation(row, current=True)
+    pct = context["pct"]
+    warning = bool(idle is not None and idle >= 3600 and CONTEXT_SEVERITY_RANK[context["severity"]] >= CONTEXT_SEVERITY_RANK[Severity.HIGH])
+    return {"supported_interception": False, "idle_seconds": idle, "context_pct": pct, "context_tokens": context["tokens"], "context_semantics": context["semantics"], "cache_ratio": (int(row["cached_input_tokens"] or 0) / int(row["input_tokens"])) if int(row["input_tokens"]) else None, "warning": warning, "message": "This session is already large and has been idle for a substantial period. Continuing may require previous context to be processed again. Consider compacting or starting fresh." if warning else "No stale-session preflight warning from observed local facts.", "note": "Current context is used. No provider cache-expiry claim is made."}
+
+
+def select_main_stream(store: StateStore, provider: str, selector: str) -> sqlite3.Row:
+    """Resolve native IDs role-aware: auxiliary streams never obscure a MAIN."""
+    token = selector.strip().lower()
+    rows = store.sessions(provider, token)
+    exact_native = [r for r in rows if r["role"] == "MAIN" and r["session_id"].lower() == token]
+    exact_stream = [r for r in rows if r["stream_id"].lower() == token]
+    candidates = exact_native or exact_stream or [r for r in rows if r["role"] == "MAIN" and (r["session_id"].lower().startswith(token) or r["stream_id"].lower().startswith(token))]
+    unique = {(r["provider"], r["stream_id"]): r for r in candidates}
+    if len(unique) != 1:
+        raise ValueError("Session selector must match exactly one MAIN/native execution stream")
+    return next(iter(unique.values()))
 
 
 DEFAULT_POLICY = {"version": 1, "notification": {"enabled": True, "minimum_severity": "medium", "cooldown_seconds": 900}}
@@ -3275,13 +3514,15 @@ def guardian_replay(store: StateStore, provider: str = "all") -> list[dict[str, 
     """Read-only deterministic policy replay; no provider/session mutation."""
     timeline = []
     for row in sorted(store.sessions(provider), key=lambda item: (item["last_activity_at"], item["session_id"])):
-        severity = context_severity(float(row["peak_context_pct"] or 0.0))
+        context = provider_context_evaluation(row)
+        severity = context["severity"]
         states = [severity.value]
         if severity in {Severity.CRITICAL, Severity.SUPER_CRITICAL, Severity.EMERGENCY}: states.append("WOULD_COMPACT")
         if severity in {Severity.SUPER_CRITICAL, Severity.EMERGENCY}: states.append("WOULD_REQUIRE_HANDOFF")
         if severity == Severity.EMERGENCY: states.append("WOULD_ROTATE")
-        if int(row["compactions"] or 0) and int(row["repeated_commands"] or 0) >= 2: states.append("RAPID_REFILL")
-        timeline.append({"timestamp": row["last_activity_at"], "provider": row["provider"], "states": states, "reason": "Recorded local context/repetition facts replayed against v0.4 policy."})
+        outcomes = stream_compaction_outcomes(store, row)
+        states.extend(sorted({item["outcome"] for item in outcomes if item["outcome"] in {"RAPID_REFILL", "THRASH"}}))
+        timeline.append({"timestamp": row["last_activity_at"], "provider": row["provider"], "session_id": row["session_id"], "stream_id": row["stream_id"], "role": row["role"], "context_semantics": context["semantics"], "states": states, "reason": "Recorded provider-aware context and measured compaction telemetry replayed against policy."})
     return timeline
 
 
@@ -3290,6 +3531,13 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
     try:
         notification = policy_show(store)["notification"]
         metrics = IncrementalIngestor(store, roots, provider, event_cooldown=notification["cooldown_seconds"]).scan()
+        if store.v5_rebuild_required():
+            # A provider-filtered or interrupted replay may have produced some
+            # rows, but none are trustworthy as a complete v5 population yet.
+            # Do not evaluate health, notify, or attempt control until the
+            # durable marker is cleared by a successful all-provider replay.
+            store.db.commit()
+            return metrics
         notifier = Notifier(notify and notification["enabled"], notification["minimum_severity"])
         # Only notify for sessions touched this tick AND recently active.
         # Without the recency check, a cold start (or any scan that first
@@ -3409,6 +3657,30 @@ def _backup_file(path: Path) -> Optional[Path]:
     return backup
 
 
+def _integration_ownership_path(codex_home: Path) -> Path:
+    """Local installer state, intentionally separate from hooks.json/repositories."""
+    return codex_home / ".agentopsy-integration.json"
+
+
+def _read_integration_ownership(codex_home: Path) -> dict[str, Any]:
+    path = _integration_ownership_path(codex_home)
+    if not path.exists(): return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) and value.get("version") == 1 else {}
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    temporary = path.with_name(path.name + ".tmp-" + secrets.token_hex(8))
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+
 def integration_status(codex_home: Path) -> dict[str, Any]:
     config, hooks = codex_home / "config.toml", codex_home / "hooks.json"
     try: payload = json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else {}
@@ -3425,25 +3697,41 @@ def integration_install_codex(codex_home: Path, state_dir: Optional[str]) -> dic
     """Explicit installer: preserve existing hooks and back up each edited file."""
     config, hooks = codex_home / "config.toml", codex_home / "hooks.json"
     if not config.exists(): raise ValueError(f"Codex configuration not found: {config}")
-    _backup_file(config); _backup_file(hooks)
-    text = config.read_text(encoding="utf-8")
-    text = re.sub(r"(?m)^hooks\s*=\s*(true|false)\s*$", "hooks = true", text, count=1) if re.search(r"(?m)^hooks\s*=", text) else text + "\n[features]\nhooks = true\n"
-    config.write_text(text, encoding="utf-8")
     try: payload = json.loads(hooks.read_text(encoding="utf-8")) if hooks.exists() else {}
     except json.JSONDecodeError as exc: raise ValueError("Codex hooks.json is malformed; refusing to modify it") from exc
+    if not isinstance(payload, dict): raise ValueError("Codex hooks.json must contain an object; refusing to modify it")
+    original = config.read_text(encoding="utf-8")
+    match = re.search(r"(?m)^hooks\s*=\s*(true|false)\s*$", original)
+    previous = match.group(1) if match else "absent"
+    text = re.sub(r"(?m)^hooks\s*=\s*(true|false)\s*$", "hooks = true", original, count=1) if match else original + "\n[features]\nhooks = true\n"
     command = _codex_hook_command(state_dir)
     for event in ("SessionStart", "PreCompact", "PostCompact"):
         groups = payload.setdefault("hooks", {}).setdefault(event, [])
         if not any(command == str(item.get("command") or "") for group in groups if isinstance(group, dict) for item in group.get("hooks", []) if isinstance(item, dict)):
             groups.append({"hooks": [{"type": "command", "command": command, "timeout": 2}]})
-    hooks.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # Validation and full output construction happen before either durable file
+    # is touched, so malformed hooks never leave a half-installed config.
+    rendered_hooks = json.dumps(payload, indent=2) + "\n"
+    existing_ownership = _read_integration_ownership(codex_home)
+    ownership = existing_ownership
+    if not ownership and previous != "true":
+        ownership = {"version": 1, "hooks_feature": {"owned": True, "previous": previous, "installed_config_sha256": hashlib.sha256(text.encode()).hexdigest()}}
+    if text != original:
+        _backup_file(config); config.write_text(text, encoding="utf-8")
+    original_hooks = hooks.read_text(encoding="utf-8") if hooks.exists() else ""
+    if rendered_hooks != original_hooks:
+        _backup_file(hooks); hooks.write_text(rendered_hooks, encoding="utf-8")
+    # Persist first-install ownership only after configuration/hook validation
+    # and writes have succeeded.  Reinstalls never rewrite this prior state.
+    if ownership and ownership != existing_ownership:
+        _atomic_write_text(_integration_ownership_path(codex_home), json.dumps(ownership, sort_keys=True) + "\n")
     return integration_status(codex_home)
 
 
 def integration_remove_codex(codex_home: Path) -> dict[str, Any]:
-    hooks = codex_home / "hooks.json"
+    config, hooks = codex_home / "config.toml", codex_home / "hooks.json"
     if not hooks.exists(): return integration_status(codex_home)
-    _backup_file(hooks); payload = json.loads(hooks.read_text(encoding="utf-8")); retained = []
+    payload = json.loads(hooks.read_text(encoding="utf-8")); ownership = _read_integration_ownership(codex_home); retained = []
     for event in ("SessionStart", "PreCompact", "PostCompact"):
         retained = []
         for group in payload.get("hooks", {}).get(event, []):
@@ -3451,7 +3739,18 @@ def integration_remove_codex(codex_home: Path) -> dict[str, Any]:
             entries = [item for item in group.get("hooks", []) if not (isinstance(item, dict) and "integration hook codex" in str(item.get("command") or ""))]
             if entries: retained.append({**group, "hooks": entries})
         payload.setdefault("hooks", {})[event] = retained
-    hooks.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    rendered_hooks = json.dumps(payload, indent=2) + "\n"
+    original = config.read_text(encoding="utf-8") if config.exists() else ""
+    feature = ownership.get("hooks_feature", {}) if isinstance(ownership.get("hooks_feature"), dict) else {}
+    restore = feature.get("owned") is True and feature.get("previous") == "false" and feature.get("installed_config_sha256") == hashlib.sha256(original.encode()).hexdigest()
+    restored = re.sub(r"(?m)^hooks\s*=\s*true\s*$", "hooks = false", original, count=1) if restore else original
+    original_hooks = hooks.read_text(encoding="utf-8")
+    if restored != original:
+        _backup_file(config); config.write_text(restored, encoding="utf-8")
+    if rendered_hooks != original_hooks:
+        _backup_file(hooks); hooks.write_text(rendered_hooks, encoding="utf-8")
+    ownership_path = _integration_ownership_path(codex_home)
+    if ownership_path.exists(): ownership_path.unlink()
     return integration_status(codex_home)
 
 
@@ -3464,11 +3763,15 @@ def live_cli(argv: list[str]) -> Optional[int]:
         payload = integration_status(home) if args.action == "status" else integration_install_codex(home, args.state_dir) if args.action == "install" else integration_remove_codex(home)
         print(json.dumps(payload, indent=2)); return 0
     if argv[0] == "signals":
+        if argv[1:] == ["--help"]:
+            print("usage: agentopsy signals\n\nList the local signal registry."); return 0
         if len(argv) != 1:
             raise ValueError("agentopsy signals takes no arguments")
         print(render_signals())
         return 0
     if argv[0] == "explain":
+        if argv[1:] == ["--help"]:
+            print("usage: agentopsy explain SIGNAL_CODE\n\nExplain one local signal."); return 0
         if len(argv) != 2:
             raise ValueError("usage: agentopsy explain SIGNAL_CODE")
         print(explain_signal(argv[1]))
@@ -3483,7 +3786,9 @@ def live_cli(argv: list[str]) -> Optional[int]:
             else:
                 payload = calibration_status(store)
                 if args.action == "recommend": payload["recommendation"] = "Review robust P90/P95 baselines; factory hard safety ceilings remain authoritative."
-                if args.action == "adopt": payload["adopted"] = True; store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(payload, sort_keys=True),)); store.db.commit()
+                if args.action == "adopt":
+                    if not calibration_adoptable(store, payload): raise ValueError("Calibration is stale, malformed, incomplete, or low-confidence and cannot be adopted")
+                    payload["adopted"] = True; store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(payload, sort_keys=True),)); store.db.commit()
             print(json.dumps(payload, indent=2)); return 0
         finally: store.close()
     if argv[0] == "insights":
@@ -3498,8 +3803,7 @@ def live_cli(argv: list[str]) -> Optional[int]:
         parser = argparse.ArgumentParser(prog="agentopsy preflight"); parser.add_argument("--state-dir"); parser.add_argument("--provider", choices=["claude", "codex"], required=True); parser.add_argument("--session", required=True)
         args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
         try:
-            row = store.db.execute("SELECT * FROM sessions WHERE provider=? AND session_id LIKE ?", (args.provider, args.session + "%")).fetchone()
-            if not row: raise ValueError("No matching stored session for preflight")
+            row = select_main_stream(store, args.provider, args.session)
             print(json.dumps(stale_session_preflight(row), indent=2)); return 0
         finally: store.close()
     if argv[0] == "policy":
@@ -3531,7 +3835,7 @@ def live_cli(argv: list[str]) -> Optional[int]:
     try:
         if argv[0] in {"health", "service-status"}: print(render_health(store.sessions(args.provider, args.session)))
         elif argv[0] == "trends":
-            payload = trend_payload(store, args.days); print(json.dumps(payload, indent=2) if args.json else "\n".join(f"{p.title()}: sessions={v['sessions']} median peak context={v['median_peak_context_pct']} repeated-read sessions={v['repeated_read_sessions']}" for p,v in payload['providers'].items()))
+            payload = trend_payload(store, args.days, args.provider, args.session); print(json.dumps(payload, indent=2) if args.json else "\n".join(f"{p.title()}: sessions={v['sessions']} median peak context={v['median_peak_context_pct']} repeated-read sessions={v['repeated_read_sessions']}" for p,v in payload['providers'].items()))
         else: print(json.dumps(validate_handoff(args.project), indent=2))
         return 0
     finally: store.close()
@@ -3568,6 +3872,10 @@ def build_parser() -> argparse.ArgumentParser:
               Claude Code: $CLAUDE_CONFIG_DIR/projects or ~/.claude/projects
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
+
+            Live v0.4.1 commands:
+              service, health, trends, service-status, guardian, calibrate,
+              insights, policy, preflight, handoff, signals, explain, integration
             """
         ),
     )
@@ -3618,6 +3926,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
     args = build_parser().parse_args(argv)
     try:
+        if "--last" in argv and args.last < 1:
+            raise ValueError("--last must be at least 1")
+        if args.since and parse_relative_time(args.since) is None:
+            raise ValueError("--since must be a relative duration (for example 7d) or ISO timestamp")
         if args.watch:
             if args.session or args.last or args.sessions or args.summary or args.export_file or args.export_claude or args.export_codex:
                 raise ValueError("--watch is a standalone legacy mode; do not combine it with selection/display/export switches")

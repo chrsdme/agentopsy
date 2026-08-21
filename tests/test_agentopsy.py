@@ -51,13 +51,14 @@ class SchemaMigrationTests(unittest.TestCase):
             self.make_v1_state(state)
             store = asa.StateStore(str(state))
             self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], str(asa.SCHEMA_VERSION))
-            self.assertEqual(store.file(Path("/tmp/old.jsonl"))["session_id"], "old-session")
-            self.assertEqual(store.sessions("codex")[0]["project"], "project")
+            self.assertIsNone(store.file(Path("/tmp/old.jsonl")))
+            self.assertEqual(store.sessions("codex"), [])
+            self.assertFalse(store.v5_rebuild_required())
             self.assertEqual({row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'guardian_%'")}, {"guardian_events", "guardian_event_lanes"})
             self.assertIsNotNone(store.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='telemetry_samples'").fetchone())
             store.close()
             reopened = asa.StateStore(str(state))
-            self.assertEqual(reopened.sessions("codex")[0]["session_id"], "old-session")
+            self.assertFalse(reopened.v5_rebuild_required())
             self.assertEqual(reopened.db.execute("SELECT count(*) FROM guardian_events").fetchone()[0], 0)
             reopened.close()
 
@@ -225,7 +226,7 @@ class CalibrationTests(unittest.TestCase):
             store.close()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(asa.main(["calibrate", "recommend", "--state-dir", state]), 0)
-                self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", state]), 0)
+                self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", state]), 2)
                 self.assertEqual(asa.main(["calibrate", "reset", "--state-dir", state]), 0)
 
 
@@ -304,7 +305,7 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(first, asa.guardian_replay(store))
             self.assertIn("WOULD_COMPACT", first[0]["states"])
             self.assertIn("WOULD_ROTATE", first[0]["states"])
-            self.assertIn("RAPID_REFILL", first[0]["states"])
+            self.assertNotIn("RAPID_REFILL", first[0]["states"])
             store.close()
 
 
@@ -488,6 +489,48 @@ class IdentityBridgeTests(unittest.TestCase):
             removed = asa.integration_remove_codex(root); self.assertFalse(removed["agentopsy_hook_installed"]); self.assertTrue(removed["herdr_hook_present"])
             final = json.loads((root / "hooks.json").read_text())
             self.assertFalse(any("integration hook codex" in str(item.get("command") or "") for event in final["hooks"].values() for group in event for item in group.get("hooks", []) if isinstance(item, dict)))
+
+    def test_integration_false_flag_ownership_survives_reinstall_and_restores(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); config, hooks = root / "config.toml", root / "hooks.json"
+            config.write_text("[features]\nhooks = false\n"); hooks.write_text(json.dumps({"hooks": {}}))
+            asa.integration_install_codex(root, str(root / "state")); first_hooks = json.loads(hooks.read_text())
+            ownership = json.loads((root / ".agentopsy-integration.json").read_text())
+            asa.integration_install_codex(root, str(root / "state")); second_hooks = json.loads(hooks.read_text())
+            self.assertEqual(first_hooks, second_hooks)
+            self.assertEqual(json.loads((root / ".agentopsy-integration.json").read_text()), ownership)
+            self.assertEqual(ownership["hooks_feature"]["previous"], "false")
+            asa.integration_remove_codex(root)
+            self.assertIn("hooks = false", config.read_text()); self.assertFalse((root / ".agentopsy-integration.json").exists())
+
+    def test_integration_true_flag_is_not_owned_or_changed_on_remove(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); config, hooks = root / "config.toml", root / "hooks.json"
+            config.write_text("[features]\nhooks = true\n"); hooks.write_text(json.dumps({"hooks": {}}))
+            asa.integration_install_codex(root, str(root / "state")); first_hooks = json.loads(hooks.read_text())
+            asa.integration_install_codex(root, str(root / "state"))
+            self.assertEqual(json.loads(hooks.read_text()), first_hooks); self.assertFalse((root / ".agentopsy-integration.json").exists())
+            asa.integration_remove_codex(root)
+            self.assertIn("hooks = true", config.read_text())
+
+    def test_integration_preserves_unrelated_hooks_across_reinstall_and_remove(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); config, hooks = root / "config.toml", root / "hooks.json"
+            config.write_text("[features]\nhooks = false\n")
+            unrelated = {"hooks": {event: [{"hooks": [{"type": "command", "command": f"herdr-{event}"}]}] for event in ("SessionStart", "PreCompact", "PostCompact")}}
+            hooks.write_text(json.dumps(unrelated))
+            asa.integration_install_codex(root, None); asa.integration_install_codex(root, None); asa.integration_remove_codex(root)
+            final = json.loads(hooks.read_text())
+            self.assertEqual(final["hooks"], unrelated["hooks"]); self.assertIn("hooks = false", config.read_text())
+
+    def test_integration_external_post_install_change_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); config, hooks = root / "config.toml", root / "hooks.json"
+            config.write_text("[features]\nhooks = false\n"); hooks.write_text(json.dumps({"hooks": {}}))
+            asa.integration_install_codex(root, None)
+            config.write_text("[features]\nhooks = true\n# externally changed\n")
+            asa.integration_remove_codex(root)
+            self.assertEqual(config.read_text(), "[features]\nhooks = true\n# externally changed\n")
 
 
 class CompactVerificationTests(unittest.TestCase):
@@ -981,6 +1024,196 @@ class SelectionAndOutputTests(unittest.TestCase):
             self.assertIn("# Agentopsy Summary", text)
             self.assertIn("1. Claude — 2026-01-01 11:00–12:00 UTC", text)
             self.assertNotIn("Session health ranking", text)
+
+class V041RegressionTests(unittest.TestCase):
+    def make_v4_rebuild_state(self, state):
+        SchemaMigrationTests().make_v1_state(state)
+        db = sqlite3.connect(state / "agentopsy.db")
+        db.executescript("""
+          CREATE TABLE health_events (id INTEGER PRIMARY KEY,timestamp TEXT NOT NULL,session_id TEXT NOT NULL,provider TEXT NOT NULL,severity TEXT NOT NULL,code TEXT NOT NULL,message TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '{}',resolved_at TEXT);
+          CREATE TABLE occurrences (session_id TEXT NOT NULL,provider TEXT NOT NULL,kind TEXT NOT NULL,key_hash TEXT NOT NULL,count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(session_id,provider,kind,key_hash));
+          CREATE TABLE record_dedup (session_id TEXT NOT NULL,provider TEXT NOT NULL,kind TEXT NOT NULL,key_hash TEXT NOT NULL,PRIMARY KEY(session_id,provider,kind,key_hash));
+          CREATE TABLE guardian_events (id INTEGER PRIMARY KEY,timestamp TEXT NOT NULL,session_id TEXT NOT NULL,provider TEXT NOT NULL,severity TEXT NOT NULL,action_safety TEXT NOT NULL,code TEXT NOT NULL,evidence TEXT NOT NULL DEFAULT '{}',resolved_at TEXT);
+          CREATE TABLE guardian_event_lanes (event_id INTEGER NOT NULL,lane TEXT NOT NULL,PRIMARY KEY(event_id,lane));
+          CREATE TABLE telemetry_samples (id INTEGER PRIMARY KEY,timestamp TEXT NOT NULL,session_id TEXT NOT NULL,provider TEXT NOT NULL,turn_index INTEGER NOT NULL,context_tokens INTEGER,context_pct REAL,tool_output_chars INTEGER NOT NULL DEFAULT 0,read_hash TEXT NOT NULL DEFAULT '',command_hash TEXT NOT NULL DEFAULT '',content_hash TEXT NOT NULL DEFAULT '',cached_input_tokens INTEGER,instruction_chars INTEGER,compaction INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE identity_mappings (id INTEGER PRIMARY KEY,provider TEXT NOT NULL,native_session_id TEXT NOT NULL,transcript_path TEXT NOT NULL,pane_id TEXT NOT NULL,lifecycle_source TEXT NOT NULL DEFAULT '',observed_at TEXT NOT NULL,expires_at TEXT NOT NULL,confidence TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
+          CREATE TABLE identity_lifecycle (id INTEGER PRIMARY KEY,provider TEXT NOT NULL,native_session_id TEXT NOT NULL,hook_event_name TEXT NOT NULL,lifecycle_source TEXT NOT NULL DEFAULT '',observed_at TEXT NOT NULL);
+        """)
+        db.execute("UPDATE service_meta SET value='4' WHERE key='schema_version'")
+        db.execute("INSERT INTO service_meta VALUES('calibration_profile','{\"adopted\":true}')")
+        db.commit(); db.close()
+
+    def test_v4_rebuild_replays_streams_and_invalidates_derived_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "roots", Path(td) / "state"; root.mkdir(); self.make_v4_rebuild_state(state)
+            now = "2026-08-21T10:00:00Z"
+            def codex(path, stream, guardian=False):
+                meta = {"id": stream, "session_id": "conversation", "thread_source": "subagent" if guardian else "user", "parent_thread_id": "conversation" if guardian else "", "source": {"subagent": {"other": "guardian"}} if guardian else {}}
+                usage = {"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 25, "total_tokens": 25}, "last_token_usage": {"total_tokens": 25}, "model_context_window": 100}}}
+                path.write_text(json.dumps({"type": "session_meta", "timestamp": now, "payload": meta}) + "\n" + json.dumps(usage) + "\n")
+            codex(root / "main.jsonl", "main-rollout"); codex(root / "guardian.jsonl", "guardian-rollout", True)
+            subdir = root / "parent" / "subagents"; subdir.mkdir(parents=True)
+            (subdir / "child.jsonl").write_text(json.dumps({"type":"assistant","timestamp":now,"sessionId":"child","message":{"usage":{"input_tokens":1}}}) + "\n")
+            store = asa.StateStore(str(state))
+            self.assertTrue(store.v5_rebuild_required()); self.assertEqual(store.sessions(), [])
+            self.assertIsNone(store.file(Path("/tmp/old.jsonl")))
+            self.assertIsNone(store.db.execute("SELECT value FROM service_meta WHERE key='calibration_profile'").fetchone())
+            first = asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            rows = store.db.execute("SELECT stream_id,role,parent_stream_id,current_context_tokens FROM sessions ORDER BY stream_id").fetchall()
+            self.assertEqual(first.files_advanced, 3); self.assertFalse(store.v5_rebuild_required())
+            self.assertEqual([(r["stream_id"], r["role"]) for r in rows], [("child", "SUBAGENT"), ("guardian-rollout", "GUARDIAN"), ("main-rollout", "MAIN")])
+            guardian = next(r for r in rows if r["stream_id"] == "guardian-rollout")
+            self.assertEqual(guardian["parent_stream_id"], "main-rollout"); self.assertEqual(guardian["current_context_tokens"], 25)
+            second = asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            self.assertEqual((second.bytes_newly_parsed, second.files_advanced), (0, 0))
+            store.close()
+
+    def test_incomplete_rebuild_marker_remains_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"; self.make_v4_rebuild_state(state)
+            store = asa.StateStore(str(state))
+            self.assertTrue(store.v5_rebuild_required()); self.assertEqual(store.sessions(), [])
+            asa.IncrementalIngestor(store, [], "codex").scan()
+            self.assertTrue(store.v5_rebuild_required())
+            store.close()
+
+    def test_codex_rollouts_with_one_conversation_remain_separate_streams(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"; root.mkdir()
+            now = "2026-08-21T10:00:00Z"
+            def write(name, rollout, role):
+                payload = {"id": rollout, "session_id": "conversation", "thread_source": "subagent" if role else "user", "parent_thread_id": "conversation" if role else "", "source": {"subagent": {"other": "guardian"}} if role else {}}
+                (root / name).write_text(json.dumps({"type": "session_meta", "timestamp": now, "payload": payload}) + "\n" + json.dumps({"type": "event_msg", "timestamp": now, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}, "last_token_usage": {"total_tokens": 10}, "model_context_window": 100}}}) + "\n")
+            write("main.jsonl", "main-rollout", False); write("review.jsonl", "review-rollout", True)
+            store = asa.StateStore(str(state)); asa.IncrementalIngestor(store, [(root, "test")]).scan()
+            rows = store.db.execute("SELECT session_id,stream_id,role FROM sessions ORDER BY stream_id").fetchall()
+            self.assertEqual([(r["session_id"], r["stream_id"], r["role"]) for r in rows], [("conversation", "main-rollout", "MAIN"), ("conversation", "review-rollout", "GUARDIAN")])
+            store.close()
+
+    def test_health_renders_latest_context_separately_from_peak(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.apply_record("codex", Path("/tmp/current.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:00:00Z", "peak_context_tokens": 90, "peak_context_pct": .9})
+                store.apply_record("codex", Path("/tmp/current.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:01:00Z", "peak_context_tokens": 20, "peak_context_pct": .2})
+            text = asa.render_health(store.sessions("codex"))
+            self.assertIn("current context: 20.0%", text); self.assertIn("peak context: 90.0%", text)
+
+    def test_recovered_health_and_guardian_events_are_resolved(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.apply_record("codex", Path("/tmp/recovery.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:00:00Z", "peak_context_tokens": 90, "peak_context_pct": .9})
+                row = store.sessions("codex")[0]; state, events = asa.evaluate_live_health(row, asa.HealthPolicy())
+                for severity, code, message, evidence in events: store.event("codex", "s", severity, code, message, evidence)
+                store.apply_record("codex", Path("/tmp/recovery.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:01:00Z", "peak_context_tokens": 20, "peak_context_pct": .2})
+                row = store.sessions("codex")[0]; state, events = asa.evaluate_live_health(row, asa.HealthPolicy())
+                store.resolve_inactive_events("codex", "s", {code for _, code, _, _ in events})
+            self.assertEqual(state, "HEALTHY")
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE resolved_at IS NULL").fetchone()[0], 0)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM guardian_events WHERE resolved_at IS NULL").fetchone()[0], 0)
+            store.close()
+
+    def test_active_context_events_stay_unresolved_until_their_condition_recovers(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.event("codex", "s", "medium", "HIGH_CONTEXT", "high", {"context_pct": 70})
+                store.event("codex", "s", "high", "EXTREME_CONTEXT", "extreme", {"context_pct": 90})
+                store.resolve_inactive_events("codex", "s", {"HIGH_CONTEXT", "EXTREME_CONTEXT"})
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE resolved_at IS NULL").fetchone()[0], 2)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM guardian_events WHERE resolved_at IS NULL").fetchone()[0], 2)
+            with store.db: store.resolve_inactive_events("codex", "s", set())
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE resolved_at IS NULL").fetchone()[0], 0)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM guardian_events WHERE resolved_at IS NULL").fetchone()[0], 0)
+            store.close()
+
+    def test_occurrence_events_are_historical_idempotent_and_not_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.event("codex", "s", "high", "GIANT_TOOL_RESULT", "large", {"tokens_proxy": 10293})
+                store.event("codex", "s", "medium", "COMMAND_REPETITION", "repeat", {"repeats": 6})
+                # A no-op evaluation sees the same cumulative aggregate facts.
+                store.event("codex", "s", "high", "GIANT_TOOL_RESULT", "large", {"tokens_proxy": 10293})
+                store.event("codex", "s", "medium", "COMMAND_REPETITION", "repeat", {"repeats": 6})
+            for table in ("health_events", "guardian_events"):
+                self.assertEqual(store.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 2)
+                self.assertEqual(store.db.execute(f"SELECT count(*) FROM {table} WHERE resolved_at IS NULL").fetchone()[0], 0)
+                self.assertEqual({r[0] for r in store.db.execute(f"SELECT code FROM {table}")}, {"GIANT_TOOL_RESULT", "COMMAND_REPETITION"})
+            store.close()
+
+    def test_healthy_stream_preserves_historical_events_but_only_active_codes_remain_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.apply_record("codex", Path("/tmp/lifecycle.jsonl"), {"session_id":"s", "stream_id":"s", "timestamp":"2026-08-21T10:00:00Z", "peak_context_tokens":20, "peak_context_pct":.2})
+                # Simulate legacy unresolved historical evidence, then reevaluate.
+                store.db.execute("INSERT INTO health_events(timestamp,session_id,provider,stream_id,severity,code,message,evidence) VALUES(?,?,?,?,?,?,?,?)", ("2026-08-21T10:00:00Z","s","codex","s","high","GIANT_TOOL_RESULT","large",'{"tokens_proxy":10293}'))
+                store.db.execute("INSERT INTO guardian_events(timestamp,session_id,provider,stream_id,severity,action_safety,code,evidence) VALUES(?,?,?,?,?,?,?,?)", ("2026-08-21T10:00:00Z","s","codex","s","high","ADVISE_ONLY","GIANT_TOOL_RESULT",'{"tokens_proxy":10293}'))
+                store.resolve_inactive_events("codex", "s", set())
+            self.assertEqual(store.sessions("codex")[0]["health_state"], "HEALTHY")
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE code='GIANT_TOOL_RESULT' AND resolved_at IS NOT NULL").fetchone()[0], 1)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM guardian_events WHERE code='GIANT_TOOL_RESULT' AND resolved_at IS NOT NULL").fetchone()[0], 1)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM health_events WHERE resolved_at IS NULL").fetchone()[0], 0)
+            store.close()
+
+    def test_claude_context_is_absolute_proxy_in_replay_and_insights(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            with store.db:
+                store.apply_record("claude", Path("/tmp/claude.jsonl"), {"session_id": "c", "stream_id": "c", "timestamp": asa.dt.datetime.now(asa.dt.timezone.utc).isoformat(), "model_turns": 1, "peak_context_tokens": 400000})
+            item = asa.guardian_replay(store, "claude")[0]
+            self.assertEqual(item["states"][0], "EMERGENCY"); self.assertEqual(item["context_semantics"], "absolute-token proxy")
+            self.assertEqual(asa.insights_payload(store, provider="claude")["recurring_faults"]["high_context"], 1)
+            store.close()
+
+    def test_measured_compaction_metrics_do_not_use_counter_proxies(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state")); now = asa.dt.datetime.now(asa.dt.timezone.utc).isoformat()
+            with store.db:
+                store.apply_record("codex", Path("/tmp/compact.jsonl"), {"session_id":"s", "stream_id":"s", "timestamp":now, "model_turns":1, "peak_context_tokens":1000, "peak_context_pct":.5})
+                for index, tokens, marker in ((1, 1000, 0), (2, 100, 1), (3, 150, 0)):
+                    store.db.execute("INSERT INTO telemetry_samples(timestamp,session_id,provider,stream_id,turn_index,context_tokens,context_pct,tool_output_chars,read_hash,command_hash,content_hash,compaction) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (now,"s","codex","s",index,tokens,.5,0,"","","",marker))
+            outcome = asa.stream_compaction_outcomes(store, store.sessions("codex")[0])[0]
+            self.assertEqual(outcome["outcome"], "EFFECTIVE")
+            self.assertEqual(asa.insights_payload(store, provider="codex")["compaction_refill_sessions"], 0)
+            self.assertEqual(asa.classify_compaction(1000, 100, 950, 0, 1)["outcome"], "RAPID_REFILL")
+            self.assertEqual(asa.classify_compaction(1000, 900, 950, 2, 5, compaction_window_seconds=300)["outcome"], "THRASH")
+            store.close()
+
+    def test_preflight_native_main_ignores_guardian_and_uses_current_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"; store = asa.StateStore(str(state)); now = "2026-08-21T10:00:00Z"
+            with store.db:
+                store.apply_record("codex", Path("/tmp/main.jsonl"), {"session_id":"native", "stream_id":"main", "role":"MAIN", "timestamp":now, "peak_context_tokens":181000, "peak_context_pct":.603, "model_turns":1})
+                store.apply_record("codex", Path("/tmp/main.jsonl"), {"session_id":"native", "stream_id":"main", "role":"MAIN", "timestamp":"2026-08-21T10:01:00Z", "peak_context_tokens":100000, "peak_context_pct":.333})
+                store.apply_record("codex", Path("/tmp/guardian.jsonl"), {"session_id":"native", "stream_id":"guardian", "role":"GUARDIAN", "timestamp":now, "peak_context_tokens":10, "peak_context_pct":.1})
+            selected = asa.select_main_stream(store, "codex", "native")
+            self.assertEqual(selected["stream_id"], "main"); self.assertAlmostEqual(asa.stale_session_preflight(selected)["context_pct"], .333)
+            store.close()
+
+    def test_fabricated_calibration_profile_cannot_be_adopted(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"; store = asa.StateStore(str(state)); store.close()
+            fabricated = {"version": 2, "schema_version": asa.SCHEMA_VERSION, "population": {"qualified_main_streams": 0, "fingerprint": "forged"}, "profiles": {provider: {"session_duration_seconds": {"confidence":"HIGH", "samples":1}} for provider in ("claude", "codex")}}
+            db = sqlite3.connect(state / "agentopsy.db"); db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('calibration_profile',?)", (json.dumps(fabricated),)); db.commit(); db.close()
+            with contextlib.redirect_stdout(io.StringIO()): self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", str(state)]), 2)
+
+    def test_help_and_selector_validation(self):
+        self.assertEqual(asa.main(["signals", "--help"]), 0)
+        self.assertEqual(asa.main(["explain", "--help"]), 0)
+        self.assertEqual(asa.main(["--last", "0"]), 2)
+        self.assertEqual(asa.main(["--since", "not-a-time"]), 2)
+
+    def test_malformed_hook_install_is_atomic(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td); config, hooks = home / "config.toml", home / "hooks.json"
+            config.write_text("[features]\nhooks = false\n"); hooks.write_text("{")
+            before, hooks_before = config.read_bytes(), hooks.read_bytes()
+            with self.assertRaises(ValueError): asa.integration_install_codex(home, None)
+            self.assertEqual(config.read_bytes(), before); self.assertEqual(hooks.read_bytes(), hooks_before)
+            self.assertFalse((home / ".agentopsy-integration.json").exists())
 
 
 if __name__ == "__main__":

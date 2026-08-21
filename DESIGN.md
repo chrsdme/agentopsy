@@ -297,6 +297,20 @@ and fifty-turn views without retaining transcript payloads or unbounded event
 history. Provider classification is cached against file identity, size/offset,
 and parser version so unchanged service polls do not reopen transcript files.
 
+## v0.4.1 execution-stream safety
+
+Schema v5 keys derived state by `(provider, stream_id)`, while retaining the
+provider-native conversation/session ID independently. Each stream records a
+role (`MAIN`, `SUBAGENT`, `GUARDIAN`, or `APPROVAL_REVIEW`) and optional parent
+session/stream link. A v4 upgrade invalidates source-derived rows and requires
+one transactional replay from currently discoverable provider transcripts;
+it never guesses stream roles from a legacy aggregate. The durable rebuild
+marker fail-closes health, analytics, and control until that replay completes.
+Default health, control, and
+workflow analytics select `MAIN` streams; subagents and Guardian/reviewer
+streams are retained for forensic inspection. File reset deletes only the
+affected stream's derived facts, so sibling rollouts converge independently.
+
 ## v0.4 review-debt audit
 
 The v0.3 cached provider-classification, durable file identity, cold-start

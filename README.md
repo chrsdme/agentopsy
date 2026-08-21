@@ -709,10 +709,19 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.4.0` is the current release, **Context Guardian**. It includes the
+`v0.4.1` is the current release, **Context Guardian safety repair**. It includes the
 incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.
+
+Incremental state uses a provider-neutral execution stream: the native
+conversation/session ID, rollout ID, role (`MAIN`, `SUBAGENT`, `GUARDIAN`, or
+`APPROVAL_REVIEW`),
+and parent relation are stored separately. Health and control use MAIN stream
+telemetry only by default; auxiliary streams remain available for forensic
+cost analysis. Current context and historical peak context are rendered
+separately. Missing percentages remain N/A (or an explicitly labelled absolute
+context proxy), never a synthetic zero.
 
 See [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
 
