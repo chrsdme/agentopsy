@@ -311,6 +311,16 @@ workflow analytics select `MAIN` streams; subagents and Guardian/reviewer
 streams are retained for forensic inspection. File reset deletes only the
 affected stream's derived facts, so sibling rollouts converge independently.
 
+## v0.4.2 calibration applicability
+
+Calibration records the existing provider capability for each metric. A metric
+that cannot be measured with its required semantics is `UNAVAILABLE`, `N/A`,
+and has no numeric baseline; it is excluded from adoption confidence checks.
+For example, Claude context occupancy remains a useful absolute-token proxy,
+but cannot supply a context *percentage* baseline without a universal window
+denominator. Applicable metrics still require their computed confidence, and
+adoption rebuilds and validates the profile against the current population.
+
 ## v0.4 review-debt audit
 
 The v0.3 cached provider-classification, durable file identity, cold-start
