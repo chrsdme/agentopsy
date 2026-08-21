@@ -47,7 +47,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 PARSER_VERSION = 1
 SCHEMA_VERSION = 5
 IDENTITY_TTL_SECONDS = 15 * 60
@@ -3421,7 +3421,28 @@ def robust_profile(values: list[float], sessions: int, turns: int = 0, tools: in
     return {"confidence": confidence, "samples": len(values), "p50": median, "p75": q(.75), "p90": q(.90), "p95": q(.95), "mad": mad}
 
 
-def calibration_build(store: StateStore) -> dict[str, Any]:
+CALIBRATION_PROFILE_VERSION = 3
+CALIBRATION_METRICS = ("session_duration_seconds", "model_turns", "context_peak_pct", "context_peak_tokens", "tool_output_chars", "max_tool_result_chars", "repeated_reads", "command_repetition")
+CALIBRATION_METRIC_SIGNALS = {
+    "session_duration_seconds": "WALL_CLOCK_DURATION", "model_turns": "MODEL_TURNS",
+    "context_peak_pct": "SESSION_CONTEXT_OCCUPANCY", "context_peak_tokens": "CONTEXT_TOKENS_WINDOW",
+    "tool_output_chars": "TOOL_CALLS_RESULTS", "max_tool_result_chars": "TOOL_RESULT_SIZE",
+    "repeated_reads": "REPEATED_READS", "command_repetition": "REPEATED_COMMANDS",
+}
+
+
+def calibration_metric_capability(provider: str, metric: str) -> ProviderCapability:
+    """Return whether a provider can supply a calibration metric, never a fabricated value."""
+    capability = signal_capability(CALIBRATION_METRIC_SIGNALS[metric], provider)
+    # Claude's context occupancy is deliberately an absolute-token proxy.  A
+    # percentage baseline needs a provider-reported denominator, so it is not
+    # applicable even though the broader occupancy signal is useful as a proxy.
+    if metric == "context_peak_pct" and capability is not ProviderCapability.EXACT:
+        return ProviderCapability.UNAVAILABLE
+    return capability
+
+
+def calibration_profiles(store: StateStore) -> dict[str, Any]:
     rows = [r for r in store.sessions() if r["role"] == "MAIN" and int(r["model_turns"] or 0) > 0]
     profiles: dict[str, Any] = {}
     for provider in ("claude", "codex"):
@@ -3429,8 +3450,19 @@ def calibration_build(store: StateStore) -> dict[str, Any]:
         turns, tools = sum(int(r["model_turns"]) for r in subset), sum(int(r["tool_calls"]) for r in subset)
         durations = [(iso_to_dt(r["last_activity_at"]) - iso_to_dt(r["started_at"])).total_seconds() for r in subset if iso_to_dt(r["started_at"]) and iso_to_dt(r["last_activity_at"]) and iso_to_dt(r["last_activity_at"]) >= iso_to_dt(r["started_at"])]
         metrics = {"session_duration_seconds": durations, "model_turns": [float(r["model_turns"]) for r in subset], "context_peak_pct": [float(r["peak_context_pct"]) for r in subset if r["peak_context_pct"]], "context_peak_tokens": [float(r["peak_context_tokens"]) for r in subset if r["peak_context_tokens"]], "tool_output_chars": [float(r["tool_result_chars"]) for r in subset], "max_tool_result_chars": [float(r["max_tool_result_chars"]) for r in subset], "repeated_reads": [float(r["repeated_reads"]) for r in subset], "command_repetition": [float(r["repeated_commands"]) for r in subset]}
-        profiles[provider] = {name: robust_profile(values, len(values), sum(int(r["model_turns"]) for r in subset if (name != "session_duration_seconds" or r["started_at"] and r["last_activity_at"])), sum(int(r["tool_calls"]) for r in subset)) for name, values in metrics.items()}
-    payload = {"version": 2, "schema_version": SCHEMA_VERSION, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "profiles": profiles, "population": calibration_build_fingerprint(store), "factory_hard_ceilings_authoritative": True, "adopted": False}
+        profile: dict[str, Any] = {}
+        for name, values in metrics.items():
+            capability = calibration_metric_capability(provider, name)
+            if capability is ProviderCapability.UNAVAILABLE:
+                profile[name] = {"capability": capability.value, "confidence": "N/A", "samples": 0}
+            else:
+                profile[name] = {"capability": capability.value, **robust_profile(values, len(values), sum(int(r["model_turns"]) for r in subset if (name != "session_duration_seconds" or r["started_at"] and r["last_activity_at"])), sum(int(r["tool_calls"]) for r in subset))}
+        profiles[provider] = profile
+    return profiles
+
+
+def calibration_build(store: StateStore) -> dict[str, Any]:
+    payload = {"version": CALIBRATION_PROFILE_VERSION, "schema_version": SCHEMA_VERSION, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "profiles": calibration_profiles(store), "population": calibration_build_fingerprint(store), "factory_hard_ceilings_authoritative": True, "adopted": False}
     store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('calibration_profile',?)", (json.dumps(payload, sort_keys=True),)); store.db.commit()
     return payload
 
@@ -3440,22 +3472,36 @@ def calibration_status(store: StateStore) -> dict[str, Any]:
     return json.loads(row[0]) if row else {"status": "INSUFFICIENT", "message": "No calibration built yet."}
 
 
-CALIBRATION_METRICS = ("session_duration_seconds", "model_turns", "context_peak_pct", "context_peak_tokens", "tool_output_chars", "max_tool_result_chars", "repeated_reads", "command_repetition")
-
-
 def calibration_adoptable(store: StateStore, payload: dict[str, Any]) -> bool:
     """Reject hand-written, stale, or incomplete profiles even if they claim HIGH."""
-    if payload.get("version") != 2 or payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("population"), dict): return False
+    return calibration_adoption_reason(store, payload) is None
+
+
+def calibration_adoption_reason(store: StateStore, payload: dict[str, Any]) -> Optional[str]:
+    """Return the fail-closed reason a calibration profile cannot be adopted."""
+    expected_keys = {"version", "schema_version", "built_at", "profiles", "population", "factory_hard_ceilings_authoritative", "adopted"}
+    if not isinstance(payload, dict) or set(payload) != expected_keys: return "Calibration profile structure is malformed."
+    if payload.get("version") != CALIBRATION_PROFILE_VERSION or payload.get("schema_version") != SCHEMA_VERSION or not isinstance(payload.get("built_at"), str) or iso_to_dt(payload["built_at"]) is None: return "Calibration profile version or timestamp is invalid."
+    if payload.get("factory_hard_ceilings_authoritative") is not True or not isinstance(payload.get("adopted"), bool) or not isinstance(payload.get("population"), dict): return "Calibration profile safety fields are invalid."
     current = calibration_build_fingerprint(store)
-    if payload["population"].get("fingerprint") != current["fingerprint"] or payload["population"].get("qualified_main_streams") != current["qualified_main_streams"]: return False
+    if payload["population"] != current: return "Calibration population fingerprint is stale or malformed."
     profiles = payload.get("profiles")
-    if not isinstance(profiles, dict): return False
+    if not isinstance(profiles, dict): return "Calibration profiles are malformed."
+    expected_profiles = calibration_profiles(store)
     for provider in ("claude", "codex"):
         profile = profiles.get(provider)
-        if not isinstance(profile, dict) or set(profile) != set(CALIBRATION_METRICS): return False
-        for metric in profile.values():
-            if not isinstance(metric, dict) or metric.get("confidence") in {"INSUFFICIENT", "LOW", None} or safe_int(metric.get("samples")) <= 0: return False
-    return True
+        if not isinstance(profile, dict) or set(profile) != set(CALIBRATION_METRICS): return f"{provider.title()} calibration profile is incomplete or malformed."
+        for name in CALIBRATION_METRICS:
+            metric = profile[name]
+            expected = expected_profiles[provider][name]
+            if metric != expected: return f"{provider.title()} {name} calibration metric is malformed or does not match current evidence."
+            if expected["capability"] == ProviderCapability.UNAVAILABLE.value:
+                if set(metric) != {"capability", "confidence", "samples"} or metric["confidence"] != "N/A" or metric["samples"] != 0:
+                    return f"{provider.title()} {name} unavailable metric is malformed."
+                continue
+            if expected["confidence"] in {"INSUFFICIENT", "LOW"}:
+                return f"{provider.title()} applicable {name} metric has {expected['confidence']} confidence."
+    return None
 
 
 def calibration_build_fingerprint(store: StateStore) -> dict[str, Any]:
@@ -3787,7 +3833,8 @@ def live_cli(argv: list[str]) -> Optional[int]:
                 payload = calibration_status(store)
                 if args.action == "recommend": payload["recommendation"] = "Review robust P90/P95 baselines; factory hard safety ceilings remain authoritative."
                 if args.action == "adopt":
-                    if not calibration_adoptable(store, payload): raise ValueError("Calibration is stale, malformed, incomplete, or low-confidence and cannot be adopted")
+                    reason = calibration_adoption_reason(store, payload)
+                    if reason: raise ValueError(f"Calibration cannot be adopted: {reason}")
                     payload["adopted"] = True; store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(payload, sort_keys=True),)); store.db.commit()
             print(json.dumps(payload, indent=2)); return 0
         finally: store.close()
@@ -3873,7 +3920,7 @@ def build_parser() -> argparse.ArgumentParser:
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
 
-            Live v0.4.1 commands:
+            Live v0.4.2 commands:
               service, health, trends, service-status, guardian, calibrate,
               insights, policy, preflight, handoff, signals, explain, integration
             """

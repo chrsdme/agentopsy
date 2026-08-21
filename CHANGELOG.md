@@ -2,6 +2,16 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.4.2] - 2026-08-21
+
+### Fixed
+
+- Calibration profiles now record provider capability per metric. Claude's
+  context percentage is explicitly unavailable because its occupancy is an
+  absolute-token proxy, so it is skipped during adoption rather than treated
+  as insufficient evidence; applicable low-confidence metrics still block.
+- Package metadata now matches the runtime version.
+
 ## [0.4.1] - 2026-08-21
 
 ### Fixed

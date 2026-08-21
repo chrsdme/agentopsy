@@ -123,6 +123,20 @@ The installer copies the single executable to:
 
 Make sure `~/.local/bin` is on your `PATH`.
 
+### Native Windows
+
+On Windows, install and run the supported core CLI with:
+
+```powershell
+py -m pip install .
+agentopsy --version
+# or, without installing:
+py agentopsy.py
+```
+
+`install.sh`, user systemd service setup, and Herdr/tmux integration are not
+native-Windows installation paths.
+
 ### Install as a Python project
 
 ```bash
@@ -412,7 +426,9 @@ agentopsy --project my-project --since 7d --summary
 - explainable causal-risk promotions, qualitative trend, contributing lanes,
   and predicted next risk state without speculative token forecasts.
 - local, reviewable robust calibration: `agentopsy calibrate status`, `build`,
-  `recommend`, `adopt`, and `reset`; factory safety ceilings remain in force.
+  `recommend`, `adopt`, and `reset`; unavailable provider metrics are explicit
+  and skipped while applicable low-confidence metrics block adoption; factory
+  safety ceilings remain in force.
 - deterministic personal workflow insights: `agentopsy insights --days N
   --provider claude|codex`, based only on local session-health aggregates.
 - stale-session advisory: `agentopsy preflight --provider PROVIDER --session ID`;
@@ -709,7 +725,7 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.4.1` is the current release, **Context Guardian safety repair**. It includes the
+`v0.4.2` is the current maintenance candidate. It includes the
 incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.

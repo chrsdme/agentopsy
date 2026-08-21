@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import contextlib
 import io
@@ -203,6 +204,44 @@ class CausalRiskTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
+    def populate_adoptable_calibration(self, store):
+        now = asa.dt.datetime.now(asa.dt.timezone.utc)
+        for provider in ("claude", "codex"):
+            for index in range(30):
+                timestamp = (now + asa.dt.timedelta(seconds=index + 1)).isoformat()
+                store.db.execute("""INSERT INTO sessions(session_id,provider,stream_id,role,started_at,last_activity_at,model_turns,tool_calls,tool_result_chars,max_tool_result_chars,peak_context_tokens,peak_context_pct,repeated_reads,repeated_commands)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (f"{provider}-{index}", provider, f"{provider}-{index}", "MAIN", now.isoformat(), timestamp, 70, 34, 100, 10, 1000, .5 if provider == "codex" else 0, 1, 1))
+        store.db.commit()
+
+    def test_calibration_adoption_skips_unavailable_claude_percentage_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state")); self.populate_adoptable_calibration(store)
+            payload = asa.calibration_build(store)
+            claude_pct = payload["profiles"]["claude"]["context_peak_pct"]
+            self.assertEqual(claude_pct, {"capability": "UNAVAILABLE", "confidence": "N/A", "samples": 0})
+            self.assertNotIn("p50", claude_pct)
+            self.assertTrue(asa.calibration_adoptable(store, payload))
+            store.close()
+
+    def test_calibration_rejects_low_confidence_applicable_metrics_and_stale_or_fabricated_profiles(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state")); self.populate_adoptable_calibration(store)
+            payload = asa.calibration_build(store)
+            for provider, metric in (("claude", "model_turns"), ("codex", "context_peak_pct")):
+                for confidence in ("LOW", "INSUFFICIENT"):
+                    altered = json.loads(json.dumps(payload)); altered["profiles"][provider][metric]["confidence"] = confidence
+                    self.assertFalse(asa.calibration_adoptable(store, altered))
+            stale = json.loads(json.dumps(payload)); stale["population"]["fingerprint"] = "stale"
+            self.assertFalse(asa.calibration_adoptable(store, stale))
+            fabricated = json.loads(json.dumps(payload)); fabricated["profiles"]["claude"]["context_peak_pct"] = {"capability": "UNAVAILABLE", "confidence": "HIGH", "samples": 1}
+            self.assertFalse(asa.calibration_adoptable(store, fabricated))
+            store.close()
+
+    def test_runtime_and_package_versions_match(self):
+        match = re.search(r'^version\s*=\s*"([^"]+)"$', (HERE / "pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), asa.VERSION)
+
     def test_robust_profile_reports_quantiles_confidence_and_stability(self):
         low = asa.robust_profile([1, 2, 3], 3)
         self.assertEqual(low["confidence"], "LOW")
