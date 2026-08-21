@@ -2,6 +2,25 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.4.1] - 2026-08-21
+
+### Fixed
+
+- SQLite schema v5 separates a provider's native conversation ID from its
+  execution-stream/rollout ID. Streams have explicit `MAIN`, `SUBAGENT`, or
+  `GUARDIAN` roles and parent links, so Codex auto-review streams cannot merge
+  with their parent rollout.
+- A v4-to-v5 upgrade invalidates unsplittable derived aggregates/cursors and
+  replays discoverable provider transcripts under a durable fail-closed marker;
+  v4 calibration profiles are discarded rather than adopted under v5 semantics.
+- Live health uses latest current telemetry; historical peak remains a
+  separate forensic value. Missing context percentages are N/A or explicitly
+  labelled proxies, never silently SAFE.
+- Default trend, calibration, and insight populations are workflow MAIN
+  streams with activity; auxiliary and incomplete rows remain inspectable.
+- Installer input validation is performed before files are modified, and
+  install/remove records ownership of the Codex hooks feature flag.
+
 ## [0.4.0] - 2026-08-20
 
 ### Changed
