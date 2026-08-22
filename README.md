@@ -653,6 +653,34 @@ Unchanged files are `stat()`ed only; grown files are sought from their persisted
 offset; truncated/replaced files safely rebuild just that file. SQLite stores
 derived counters and bounded fingerprints, not transcript bodies.
 
+## Claude runtime telemetry bridge (optional)
+
+Claude Code's status-line hook can supply live runtime evidence transcripts
+alone don't have: the model's raw context window size and current token
+counters, straight from the running CLI.
+
+```
+agentopsy integration status  claude   # inspect the current statusLine
+agentopsy integration install claude   # install Agentopsy's bridge (refuses to
+                                        # overwrite a foreign statusLine)
+agentopsy integration remove  claude   # remove only Agentopsy-owned config
+agentopsy runtime status               # inspect stored per-session snapshots
+```
+
+The bridge process itself only reads one JSON payload from stdin, whitelists a
+bounded set of fields, and atomically writes a small per-session file — it
+never touches SQLite, prompts, transcript bodies, or tool output. The normal
+scan loop resolves each sample by **exact** session ID + transcript path
+match and stores a bounded snapshot per stream. Model context capacity and
+the separate auto-compact operational window are always kept as two distinct
+values; the auto-compact window is only populated from directly trustworthy
+evidence, never inferred from model size. See `DESIGN.md` for the full data
+flow and capability semantics.
+
+For Claude Code 2.1.239 only, Agentopsy conservatively treats an empirically
+observed all-zero status-line usage shape as unavailable current-context
+evidence; this is not a universal Claude zero-token rule.
+
 ---
 
 # Herdr and provider control
@@ -725,7 +753,7 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.4.2` is the current maintenance candidate. It includes the
+`v0.5.0` is the current maintenance candidate. It includes the
 incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.
