@@ -29,6 +29,7 @@ import datetime as dt
 import enum
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -37,6 +38,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import statistics
 import sys
@@ -47,7 +49,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 PARSER_VERSION = 1
 SCHEMA_VERSION = 5
 IDENTITY_TTL_SECONDS = 15 * 60
@@ -2892,6 +2894,8 @@ class StateStore:
             self.db.execute("DELETE FROM telemetry_samples WHERE stream_id=? AND provider=?", (stream, row["provider"]))
             self.db.execute("DELETE FROM health_events WHERE stream_id=? AND provider=?", (stream, row["provider"]))
             self.db.execute("DELETE FROM guardian_events WHERE stream_id=? AND provider=?", (stream, row["provider"]))
+            if row["provider"] == "claude":
+                self.db.execute("DELETE FROM service_meta WHERE key=?", (_claude_runtime_meta_key(stream),))
 
     def cached_provider(self, path: Path) -> Optional[str]:
         """Use durable file identity to avoid opening unchanged transcript files."""
@@ -3035,12 +3039,13 @@ class StateStore:
         for lane in lanes: self.db.execute("INSERT INTO guardian_event_lanes(event_id,lane) VALUES(?,?)", (event_id, lane))
 
     def resolve_inactive_events(self, provider: str, stream_id: str, active_codes: set[str]) -> None:
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        base = dt.datetime.now(dt.timezone.utc)
         rows = self.db.execute("SELECT id,code FROM health_events WHERE provider=? AND stream_id=? AND resolved_at IS NULL", (provider, stream_id)).fetchall()
-        for row in rows:
+        for offset, row in enumerate(rows):
             if event_lifecycle(row["code"]) == EventLifecycle.OCCURRENCE or row["code"] not in active_codes:
-                self.db.execute("UPDATE health_events SET resolved_at=? WHERE id=?", (now, row["id"]))
-                self.db.execute("UPDATE guardian_events SET resolved_at=? WHERE provider=? AND stream_id=? AND code=? AND resolved_at IS NULL", (now, provider, stream_id, row["code"]))
+                resolved_at = (base + dt.timedelta(microseconds=offset)).isoformat()
+                self.db.execute("UPDATE health_events SET resolved_at=? WHERE id=?", (resolved_at, row["id"]))
+                self.db.execute("UPDATE guardian_events SET resolved_at=? WHERE provider=? AND stream_id=? AND code=? AND resolved_at IS NULL", (resolved_at, provider, stream_id, row["code"]))
 
 
 def stream_compaction_outcomes(store: StateStore, row: sqlite3.Row) -> list[dict[str, Any]]:
@@ -3368,6 +3373,1005 @@ class HerdrAdapter:
     def wait_until_safe(self, _session_id: str) -> bool: return False
 
 
+CLAUDE_RUNTIME_FORMAT_VERSION = 2
+CLAUDE_RUNTIME_INBOX_MAX_BYTES = 16_384
+CLAUDE_RUNTIME_STDIN_MAX_BYTES = 65_536
+
+# Versions for which CLAUDE-RUNTIME-01's empirical cross-validation was actually
+# performed (statusLine token totals matched /context before and after manual
+# /compact; the historical cumulative-total bug was not observed; the model
+# context denominator and the auto-compact denominator were shown to be
+# intentionally distinct). This set is DELIBERATELY conservative: it must only
+# ever be expanded by repeating that empirical validation against a new
+# version, never by assuming forward compatibility (">= 2.1.239" is exactly
+# the mistake this guards against -- a later release can silently regress the
+# semantics this feature depends on). An unvalidated version can still supply
+# useful OBSERVED telemetry; it can never be promoted to EXACT.
+CLAUDE_RUNTIME_EXACT_VERSIONS = {"2.1.239"}
+
+# Claude Code 2.1.239 has also emitted one empirically observed status-line
+# shape that looks arithmetically complete but does not represent backed
+# current-usage telemetry: every current-usage component, both totals, and
+# used_percentage are zero. This is deliberately a narrow compatibility quirk,
+# not a general "zero tokens are unavailable" rule and not an assumption about
+# newer versions.
+CLAUDE_RUNTIME_ZERO_ONLY_UNAVAILABLE_VERSIONS = {"2.1.239"}
+
+
+def _claude_runtime_inbox_dir(state_dir: Optional[str] = None) -> Path:
+    return default_state_dir(state_dir) / "claude-runtime"
+
+
+def _claude_runtime_reject_nonfinite(constant_name: str) -> None:
+    # json.loads accepts bare NaN/Infinity/-Infinity literals by default,
+    # which would otherwise reach numeric extraction as an out-of-band float.
+    # Rejecting at the parse boundary (via parse_constant) means no
+    # downstream numeric check ever needs to special-case them.
+    raise ValueError(f"non-finite JSON constant {constant_name!r} is not permitted in Claude runtime telemetry")
+
+
+def _claude_runtime_reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # CR3-04: json.loads's default behavior is last-key-wins for a duplicate
+    # object key, which would let a payload smuggle two different values
+    # under the same key past anything that only inspects the resulting dict
+    # once (e.g. a payload logged/displayed with the first occurrence but
+    # parsed with the second). Reject outright instead -- object_pairs_hook
+    # is invoked once per JSON object at EVERY nesting depth, so this applies
+    # recursively to nested objects (context_window, current_usage, ...) with
+    # no extra code.
+    seen: set[str] = set()
+    result: dict[str, Any] = {}
+    for key, val in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON object key {key!r} is not permitted in Claude runtime telemetry")
+        seen.add(key)
+        result[key] = val
+    return result
+
+
+def _claude_runtime_json_loads(text: str) -> Any:
+    """The one JSON parse entry point for anything Claude-runtime-related that
+    crosses a trust boundary (bridge stdin, inbox files). Disables NaN/
+    Infinity/-Infinity literal acceptance (CR2-01) so a non-finite constant
+    can never reach numeric validation as a plausible-looking float, and
+    rejects duplicate object keys at every nesting depth (CR3-04) rather than
+    silently taking json.loads's default last-key-wins value."""
+    return json.loads(text, parse_constant=_claude_runtime_reject_nonfinite, object_pairs_hook=_claude_runtime_reject_duplicate_keys)
+
+
+# Bridge-generated inbox filenames always match this shape exactly:
+# <20-digit zero-padded receipt_ns>-<32 hex char session digest>-<8 hex char nonce>.json
+# Cheap to test with a single regex, before any JSON parsing is attempted
+# (CR2-08): a name that doesn't match this shape is definitionally not a
+# genuine Agentopsy-written observation and never needs its content read.
+_CLAUDE_RUNTIME_INBOX_FILENAME_RE = re.compile(r"^(\d{20})-[0-9a-f]{32}-[0-9a-f]{8}\.json$")
+
+
+def _claude_runtime_inbox_filename_receipt(name: str) -> Optional[int]:
+    """Parse the receipt_ns embedded in a bridge-generated filename, or None
+    if the name doesn't match the expected shape. Used to cross-check against
+    the (also validated) body receipt_ns -- CR2-03: filename and body must
+    agree exactly, or the observation is rejected as tampered."""
+    m = _CLAUDE_RUNTIME_INBOX_FILENAME_RE.match(name)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+# One filename per session would let an older writer's os.replace silently
+# destroy a newer sample that arrived first (CR-07): two concurrent statusLine
+# invocations for the same session have no ordering guarantee on which
+# replaces which. Per-observation filenames, ordered by a trusted local
+# receipt embedded in the name, preserve every observation until ingestion
+# consumes it -- ingestion then does the ordering, not the filesystem.
+def _claude_runtime_inbox_filename(session_id: str, receipt_ns: int) -> str:
+    """A safe, collision-resistant, sortable filename derived from session
+    identity and a trusted local receipt, never raw path input."""
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    return f"{receipt_ns:020d}-{digest}-{secrets.token_hex(4)}.json"
+
+
+# Bounded mailbox: at a 20s default scan interval, a single Claude session
+# firing the status line every few seconds still produces well under 100
+# samples between scans; 500 gives ample headroom for a slow/paused scan loop
+# across many concurrent sessions while keeping a hard ceiling on disk usage
+# (each file <= CLAUDE_RUNTIME_INBOX_MAX_BYTES, so the mailbox is bounded to a
+# few MB even at the cap).
+CLAUDE_RUNTIME_INBOX_MAX_FILES = 500
+# A receipt more than this far in the future relative to wall-clock "now" is
+# treated as suspicious/tampered rather than trusted to live indefinitely.
+CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS = 60
+
+
+# CR2-01: strict numeric validation for every Claude-runtime telemetry field.
+# `type(value) is int` rejects bool (a subclass of int in Python), float,
+# numeric strings, and any other int-like-but-not-int value; no int()
+# coercion or rounding is ever applied, so 1000000.9 / "44865" / True can
+# never quietly become a valid-looking integer. json.loads' own NaN/Infinity
+# literal support is disabled at both parse sites (see
+# CLAUDE_RUNTIME_JSON_PARSE_KWARGS) so those can never reach this function as
+# a float in the first place.
+def _claude_runtime_bounded_int(value: Any) -> Optional[int]:
+    if type(value) is not int:
+        return None
+    return value if 0 <= value <= 100_000_000 else None
+
+
+# used_percentage is Claude Code's own rounded integer percentage (0-100
+# inclusive); it is a distinct, narrower range from token counts.
+def _claude_runtime_bounded_percentage(value: Any) -> Optional[int]:
+    if type(value) is not int:
+        return None
+    return value if 0 <= value <= 100 else None
+
+
+def _claude_statusline_extract(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Whitelist bounded runtime telemetry only. No prompts/transcripts/tool output/source code."""
+    if not isinstance(payload, dict):
+        return None
+    session_id = payload.get("session_id")
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return None
+    try:
+        canonical_path = _canonical_transcript_path(transcript_path)
+    except ValueError:
+        return None
+    model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
+    ctx = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
+    current_usage = ctx.get("current_usage") if isinstance(ctx.get("current_usage"), dict) else {}
+    _bounded_int = _claude_runtime_bounded_int
+
+    # A present-but-invalid used_percentage is nulled out here, not treated as
+    # grounds to discard the whole sample -- CR3-01 makes a directly-valid,
+    # reconciling used_percentage a REQUIRED item for EXACT (see
+    # _claude_runtime_derive), so an absent-or-invalid value already blocks
+    # EXACT on its own; discarding the whole observation would additionally
+    # and needlessly throw away still-truthful OBSERVED-tier reported fields.
+    used_percentage = _claude_runtime_bounded_percentage(ctx.get("used_percentage"))
+
+    sample = {
+        "format_version": CLAUDE_RUNTIME_FORMAT_VERSION,
+        "session_id": session_id.strip(),
+        "transcript_path": canonical_path,
+        "claude_code_version": str(payload.get("version") or "")[:64],
+        "model_id": str(model.get("id") or "")[:128],
+        "model_display_name": str(model.get("display_name") or "")[:128],
+        "context_window_size": _bounded_int(ctx.get("context_window_size")),
+        "used_percentage": used_percentage,
+        "total_input_tokens": _bounded_int(ctx.get("total_input_tokens")),
+        "total_output_tokens": _bounded_int(ctx.get("total_output_tokens")),
+        "current_usage": {
+            "input_tokens": _bounded_int(current_usage.get("input_tokens")),
+            "output_tokens": _bounded_int(current_usage.get("output_tokens")),
+            "cache_creation_input_tokens": _bounded_int(current_usage.get("cache_creation_input_tokens")),
+            "cache_read_input_tokens": _bounded_int(current_usage.get("cache_read_input_tokens")),
+        } if current_usage else None,
+        # Retained only as an untrusted display hint; latest-wins ordering must
+        # never depend on this -- see receipt_ns, generated locally below.
+        "observed_at": _identity_now().isoformat(),
+    }
+    return sample
+
+
+def claude_statusline_bridge_main(argv: Optional[list[str]] = None, *, stdin: Optional[Any] = None, state_dir: Optional[str] = None) -> int:
+    """Status-line bridge entry point: read one JSON payload from stdin, whitelist
+    and validate it, atomically write a small per-session inbox file, and return
+    quickly. Never opens SQLite. Never raises past this function -- a malformed
+    or unreadable payload must not break Claude Code's status-line UI."""
+    try:
+        source = stdin if stdin is not None else sys.stdin.buffer
+        raw = source.read(CLAUDE_RUNTIME_STDIN_MAX_BYTES + 1)
+        if raw is None or len(raw) > CLAUDE_RUNTIME_STDIN_MAX_BYTES:
+            return 0
+        payload = _claude_runtime_json_loads(raw.decode("utf-8"))
+        sample = _claude_statusline_extract(payload)
+        if sample is None:
+            return 0
+        # Trusted local receipt: generated here, never taken from the payload.
+        # Lives both in the filename (sortable enumeration) and the file body
+        # (what the merge actually compares).
+        sample["receipt_ns"] = time.time_ns()
+        inbox = _claude_runtime_inbox_dir(state_dir)
+        if default_state_dir(state_dir).is_symlink() or inbox.is_symlink():
+            # CR2-07: best-effort same-user confinement, not a privilege
+            # boundary -- refuse to write through a symlinked state-dir/inbox
+            # path rather than silently following it.
+            return 0
+        inbox.mkdir(parents=True, exist_ok=True)
+        try: os.chmod(inbox, 0o700)
+        except OSError: pass
+        name = _claude_runtime_inbox_filename(sample["session_id"], sample["receipt_ns"])
+        dest = inbox / name
+        text = json.dumps(sample, sort_keys=True)
+        if len(text.encode("utf-8")) > CLAUDE_RUNTIME_INBOX_MAX_BYTES:
+            return 0
+        tmp = inbox / (name + ".tmp-" + secrets.token_hex(8))
+        try:
+            tmp.write_text(text + "\n", encoding="utf-8")
+            try: os.chmod(tmp, 0o600)
+            except OSError: pass
+            os.replace(tmp, dest)
+        finally:
+            if tmp.exists():
+                try: tmp.unlink()
+                except OSError: pass
+    except Exception:
+        pass
+    return 0
+
+
+def _claude_runtime_inbox_extract(payload: Any, *, max_receipt_ns: Optional[int] = None, filename_receipt_ns: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """Whitelist-revalidate the flat shape the bridge itself writes to the inbox.
+    The inbox is written by a process this code invokes but does not fully
+    control the input of (the bridge's own validation could regress, or a file
+    could be tampered with on disk), so this must never trust the file verbatim.
+    receipt_ns MUST be present and a plain int: it is the only trusted ordering
+    signal, generated by the bridge itself, never derived from the payload's
+    own (untrusted) observed_at claim.
+
+    CR2-03: a body receipt_ns beyond max_receipt_ns (a trusted wall-clock
+    bound, not an incoming claim) is rejected outright -- it must never
+    participate in ordering or be persisted, so a poisoned future receipt can
+    never permanently block later genuine observations via latest-wins. When
+    filename_receipt_ns is supplied (parsed from a genuine bridge filename
+    shape), it must agree with the body's receipt_ns exactly, or the
+    observation is treated as tampered and rejected."""
+    if not isinstance(payload, dict):
+        return None
+    session_id = payload.get("session_id")
+    transcript_path = payload.get("transcript_path")
+    receipt_ns = payload.get("receipt_ns")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return None
+    if type(receipt_ns) is not int or receipt_ns < 0:
+        return None
+    if max_receipt_ns is not None and receipt_ns > max_receipt_ns:
+        return None
+    if filename_receipt_ns is not None and filename_receipt_ns != receipt_ns:
+        return None
+    try:
+        canonical_path = _canonical_transcript_path(transcript_path)
+    except ValueError:
+        return None
+    current_usage = payload.get("current_usage")
+    _bounded_int = _claude_runtime_bounded_int
+
+    # See matching comment in _claude_statusline_extract -- a present-but-
+    # invalid used_percentage is nulled out here, not grounds to discard the
+    # whole observation; CR3-01's EXACT gate already requires a directly-
+    # valid, reconciling used_percentage.
+    used_percentage = _claude_runtime_bounded_percentage(payload.get("used_percentage"))
+
+    return {
+        "format_version": CLAUDE_RUNTIME_FORMAT_VERSION,
+        "session_id": session_id.strip(),
+        "transcript_path": canonical_path,
+        "receipt_ns": receipt_ns,
+        "claude_code_version": str(payload.get("claude_code_version") or "")[:64],
+        "model_id": str(payload.get("model_id") or "")[:128],
+        "model_display_name": str(payload.get("model_display_name") or "")[:128],
+        "context_window_size": _bounded_int(payload.get("context_window_size")),
+        "used_percentage": used_percentage,
+        "total_input_tokens": _bounded_int(payload.get("total_input_tokens")),
+        "total_output_tokens": _bounded_int(payload.get("total_output_tokens")),
+        "current_usage": {
+            "input_tokens": _bounded_int(current_usage.get("input_tokens")),
+            "output_tokens": _bounded_int(current_usage.get("output_tokens")),
+            "cache_creation_input_tokens": _bounded_int(current_usage.get("cache_creation_input_tokens")),
+            "cache_read_input_tokens": _bounded_int(current_usage.get("cache_read_input_tokens")),
+        } if isinstance(current_usage, dict) else None,
+        # Untrusted display hint only -- never used for ordering.
+        "observed_at": str(payload.get("observed_at") or "")[:64] or None,
+    }
+
+
+# CR2-08: the scan-work bound is independent of, and set well above, the
+# retained-mailbox-size bound (CLAUDE_RUNTIME_INBOX_MAX_FILES). It caps how
+# many DIRECTORY ENTRIES one call inspects at all (including junk that costs
+# only a filename-shape regex check, never JSON parsing) -- not how many
+# valid samples are retained. A same-user flood beyond this bound can delay
+# processing across ticks (undefended starvation is possible and is
+# documented here rather than pretending otherwise); it can never make one
+# tick materialize or parse an unbounded number of entries.
+CLAUDE_RUNTIME_INBOX_SCAN_MAX_ENTRIES = 5000
+
+
+def _read_claude_runtime_inbox(state_dir: Optional[str] = None) -> list[tuple[Path, dict[str, Any]]]:
+    """Read and whitelist-revalidate inbox samples, enforcing bounded mailbox
+    hygiene (CR-08) and integrity (CR2-03/CR2-07/CR2-08):
+
+    - streams the directory via os.scandir rather than materializing every
+      entry up front, and inspects at most CLAUDE_RUNTIME_INBOX_SCAN_MAX_ENTRIES
+      entries per call regardless of how many are actually present (bounded
+      per-tick work, independent of the smaller retained-sample cap below);
+    - a name that doesn't match the genuine bridge-generated filename shape is
+      identified and unlinked via a cheap regex check ALONE, before any JSON
+      parsing is attempted;
+    - symlinked entries (and a symlinked inbox directory itself) are never
+      followed, only unlinked -- best-effort same-user confinement, not a
+      privilege boundary;
+    - oversize/malformed/structurally-invalid files are quarantined (removed)
+      immediately rather than skipped forever;
+    - a body receipt_ns beyond the trusted wall-clock future-skew bound is
+      rejected and can never be persisted or participate in ordering, closing
+      off future-receipt poisoning even though mtime skew is also checked;
+    - the filename's embedded receipt must agree exactly with the validated
+      body receipt_ns, or the observation is treated as tampered;
+    - the total RETAINED-VALID count is capped at CLAUDE_RUNTIME_INBOX_MAX_FILES,
+      evicting the OLDEST-by-receipt *valid* entries first (applied only after
+      validation/quarantine, so a junk burst can never starve genuinely newer
+      valid samples by occupying eviction-exempt slots).
+
+    Returns (file_path, sample) pairs ordered oldest-receipt-first so the
+    caller can process the whole batch in trusted chronological order."""
+    inbox = _claude_runtime_inbox_dir(state_dir)
+    samples: list[tuple[Path, dict[str, Any]]] = []
+    if default_state_dir(state_dir).is_symlink() or inbox.is_symlink():
+        return samples  # CR2-07: never write through or read through a symlinked state-dir/inbox dir
+    if not inbox.is_dir():
+        return samples
+    now = _identity_now()
+    now_ns = time.time_ns()
+    max_receipt_ns = now_ns + CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS * 1_000_000_000
+    candidate_names: list[str] = []
+    try:
+        with os.scandir(inbox) as it:
+            for i, entry in enumerate(it):
+                if i >= CLAUDE_RUNTIME_INBOX_SCAN_MAX_ENTRIES:
+                    break  # CR2-08: bounded scan work per call, regardless of directory size
+                if not entry.name.endswith(".json"):
+                    continue
+                if _CLAUDE_RUNTIME_INBOX_FILENAME_RE.match(entry.name) is None:
+                    # Not a genuine bridge-generated filename shape: cheap to
+                    # reject, no JSON parsing needed. Quarantine on sight.
+                    try:
+                        os.unlink(entry.path)  # os.unlink never follows symlinks
+                    except OSError:
+                        pass
+                    continue
+                candidate_names.append(entry.name)
+    except OSError:
+        return samples
+    for name in sorted(candidate_names):
+        entry = inbox / name
+        filename_receipt_ns = _claude_runtime_inbox_filename_receipt(name)
+        try:
+            if entry.is_symlink():
+                entry.unlink(); continue
+            st = entry.lstat()
+            if st.st_size > CLAUDE_RUNTIME_INBOX_MAX_BYTES:
+                entry.unlink(); continue
+            mtime = dt.datetime.fromtimestamp(st.st_mtime, dt.timezone.utc)
+            if (mtime - now).total_seconds() > CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS:
+                entry.unlink(); continue
+            payload = _claude_runtime_json_loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            try: entry.unlink()
+            except OSError: pass
+            continue
+        sample = _claude_runtime_inbox_extract(payload, max_receipt_ns=max_receipt_ns, filename_receipt_ns=filename_receipt_ns)
+        if sample is None:
+            # Unrecognisable/malformed/structurally-invalid/tampered content
+            # (including a future-poisoned or filename-mismatched receipt):
+            # quarantine (remove) immediately rather than leaving it to
+            # accumulate or retrying it indefinitely.
+            try: entry.unlink()
+            except OSError: pass
+            continue
+        samples.append((entry, sample))
+    samples.sort(key=lambda item: item[1]["receipt_ns"])
+    if len(samples) > CLAUDE_RUNTIME_INBOX_MAX_FILES:
+        # Cap AFTER validation/quarantine, not before: capping first would let a
+        # burst of junk filenames with high receipt prefixes starve genuinely
+        # newer valid samples by occupying eviction-exempt slots. Evict the
+        # oldest-by-receipt *valid* entries so junk never outranks real data.
+        stale = samples[: len(samples) - CLAUDE_RUNTIME_INBOX_MAX_FILES]
+        samples = samples[len(samples) - CLAUDE_RUNTIME_INBOX_MAX_FILES:]
+        for entry, _sample in stale:
+            try: entry.unlink()
+            except OSError: pass
+    return samples
+
+
+def _claude_runtime_meta_key(stream_id: str) -> str:
+    return f"claude_runtime:{stream_id}"
+
+
+def resolve_claude_runtime_sample(store: StateStore, sample: dict[str, Any]) -> tuple[Optional[sqlite3.Row], str]:
+    """Exact, non-fuzzy identity resolution: role='MAIN' AND session_id AND
+    canonical transcript_path must all match exactly one existing Claude
+    session row. No pane, no TTL, no control capability -- this path only
+    ever feeds telemetry.
+
+    role='MAIN' is required because Claude's status line empirically reports
+    the parent/MAIN session's identity even while a subagent is actively
+    running (validated against a captured Claude Code 2.1.239 before/after-
+    compaction runtime fixture); without this constraint a SUBAGENT row
+    sharing the same session_id/path could be resolved and made exact, which
+    v1 must never do.
+
+    Returns (row_or_None, reason) where reason is one of:
+    "resolved", "unresolved" (zero matches), "ambiguous" (more than one match)."""
+    session_id = str(sample.get("session_id") or "")
+    try:
+        transcript_path = _canonical_transcript_path(str(sample.get("transcript_path") or ""))
+    except ValueError:
+        return None, "unresolved"
+    if not session_id:
+        return None, "unresolved"
+    rows = store.db.execute(
+        "SELECT * FROM sessions WHERE provider='claude' AND role='MAIN' AND session_id=? AND path=?",
+        (session_id, transcript_path),
+    ).fetchall()
+    if len(rows) == 0:
+        return None, "unresolved"
+    if len(rows) > 1:
+        return None, "ambiguous"
+    return rows[0], "resolved"
+
+
+def _claude_runtime_version_validated(claude_code_version: Any) -> bool:
+    """A malformed/missing/unvalidated version can never contribute EXACT
+    context telemetry -- only the explicitly, empirically validated set can."""
+    return isinstance(claude_code_version, str) and claude_code_version in CLAUDE_RUNTIME_EXACT_VERSIONS
+
+
+def _claude_runtime_is_zero_only_unavailable_usage(
+    sample: dict[str, Any], usage: Any, *, usage_complete: bool,
+    total_input_tokens: Optional[int], total_output_tokens: Optional[int],
+    used_percentage: Any, window_valid: bool,
+) -> bool:
+    """Recognise only Claude Code 2.1.239's observed all-zero status-line
+    transition. A complete usage object with any nonzero component is outside
+    this quirk; zero values are otherwise valid provider values."""
+    claude_code_version = sample.get("claude_code_version")
+    return (
+        type(claude_code_version) is str
+        and claude_code_version in CLAUDE_RUNTIME_ZERO_ONLY_UNAVAILABLE_VERSIONS
+        and usage_complete
+        and window_valid
+        and total_input_tokens == 0
+        and total_output_tokens == 0
+        and type(used_percentage) is int
+        and used_percentage == 0
+        and all(usage[field] == 0 for field in (
+            "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+        ))
+    )
+
+
+def _claude_runtime_bounded_reported_occupancy(current_input_tokens: Optional[int], window: Optional[int]) -> Optional[float]:
+    """CR3-02 round-trip safety: the parser rejects a stored occupancy outside
+    [0.0, 1.2] and fails the whole snapshot closed. The writer must therefore
+    never emit a ratio it computes here that its own reader would reject --
+    otherwise a merely-reported (not validated) pair of totals could silently
+    discard an entire persisted snapshot on the next read."""
+    if current_input_tokens is None or window is None or window <= 0:
+        return None
+    ratio = current_input_tokens / window
+    if not (0.0 <= ratio <= 1.2):
+        return None
+    return ratio
+
+
+def _claude_runtime_derive(sample: dict[str, Any]) -> dict[str, Any]:
+    """Derive denominator-based facts. CR3-01: current_context_input_tokens
+    may only become EXACT when the COMPLETE validated evidence set holds --
+    not merely internal self-consistency of the token breakdown:
+
+      1. claude_code_version is explicitly validated (version_validated)
+      2. current_usage is complete (usage_complete)
+      3. token counters are internally consistent (counters_consistent --
+         the sum identity alone; does NOT depend on used_percentage)
+      4. context_window_size is directly present and strictly valid
+         (window_valid)
+      5. used_percentage is directly present and strictly valid
+         (percentage_present_and_valid -- absence is NOT sufficient; a
+         missing used_percentage must never be treated as "nothing to
+         cross-check")
+      6. derived input occupancy reconciles with used_percentage
+         (percentage_reconciles)
+
+    counters_consistent (item 3) and percentage_reconciles (item 6) are kept
+    as SEPARATE facts on purpose: an absent or invalid used_percentage must
+    never retroactively make the token-sum identity itself look inconsistent
+    (which would wrongly downgrade reported_total_input_tokens, an
+    at-most-OBSERVED field, to UNAVAILABLE). Never fabricates the auto-compact
+    window.
+
+    MODEL CONTEXT OCCUPANCY NUMERATOR = total_input_tokens
+    = input_tokens + cache_creation_input_tokens + cache_read_input_tokens.
+    output_tokens is deliberately excluded: Claude Code's own documented
+    used_percentage is calculated from input tokens only, so folding
+    total_output_tokens into the numerator here would silently diverge from
+    the provider's own definition of "context window occupancy"."""
+    window = sample.get("context_window_size")
+    usage = sample.get("current_usage")
+    # CR2-01: type(x) is int strictly -- isinstance(True, int) is True in
+    # Python (bool is a subclass of int), so a naive isinstance check here
+    # would let {"input_tokens": True, ...} satisfy usage_complete.
+    usage_complete = isinstance(usage, dict) and all(type(usage.get(f)) is int for f in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    current_input_tokens = sample.get("total_input_tokens")
+    total_output = sample.get("total_output_tokens")
+    if type(current_input_tokens) is not int: current_input_tokens = None
+    if type(total_output) is not int: total_output = None
+    if type(window) is not int: window = None
+    window_valid = window is not None and window > 0
+    counters_consistent = False
+    if usage_complete and current_input_tokens is not None and total_output is not None:
+        # Empirical fixture (v0.4.2 probe evidence): total_input_tokens + last
+        # output_tokens should equal the sum of the current_usage breakdown.
+        # This check validates internal consistency of the reported counters;
+        # it does not mean output_tokens enters the occupancy numerator below.
+        parts = [usage["input_tokens"], usage["output_tokens"], usage["cache_creation_input_tokens"], usage["cache_read_input_tokens"]]
+        counters_consistent = (current_input_tokens + usage["output_tokens"]) == sum(parts)
+    occupancy_pct = None
+    if counters_consistent and current_input_tokens is not None and window_valid:
+        occupancy_pct = current_input_tokens / window  # input tokens only, per Claude Code's used_percentage definition
+    # CR3-01 items 5/6: used_percentage must be DIRECTLY present and strictly
+    # valid, and must reconcile with the derived occupancy -- absence is
+    # explicitly NOT permission to skip this cross-check for EXACT purposes.
+    reported_pct = sample.get("used_percentage")
+    percentage_present_and_valid = type(reported_pct) is int and 0 <= reported_pct <= 100
+    if _claude_runtime_is_zero_only_unavailable_usage(
+        sample, usage, usage_complete=usage_complete,
+        total_input_tokens=current_input_tokens, total_output_tokens=total_output,
+        used_percentage=reported_pct, window_valid=window_valid,
+    ):
+        # Do not let this known provider/version-specific transition use its
+        # synthetically complete zero counters as positive validation evidence.
+        # This intentionally matches the evidence strength of current_usage=null
+        # without treating arbitrary zero-valued usage as unavailable.
+        usage_complete = False
+        counters_consistent = False
+        occupancy_pct = None
+    percentage_reconciles = (
+        percentage_present_and_valid
+        and occupancy_pct is not None
+        and abs(occupancy_pct * 100 - reported_pct) <= 2
+    )
+    version_validated = _claude_runtime_version_validated(sample.get("claude_code_version"))
+    # The complete evidence set required for EXACT (CR3-01, all six items).
+    validated = (
+        version_validated
+        and usage_complete
+        and counters_consistent
+        and window_valid
+        and percentage_present_and_valid
+        and percentage_reconciles
+    )
+    return {
+        # Validated current-context INPUT measurement: only set when the full
+        # six-item evidence chain holds. This is what may ever be labelled
+        # EXACT. Deliberately does not include total_output_tokens.
+        "current_context_input_tokens": current_input_tokens if validated else None,
+        "model_context_occupancy_pct": occupancy_pct if validated else None,
+        # Raw reported totals, retained separately as at-most-OBSERVED evidence
+        # even when they cannot be validated as an exact current-context value.
+        "reported_total_input_tokens": current_input_tokens,
+        "reported_total_output_tokens": total_output,
+        "reported_model_context_occupancy_pct": _claude_runtime_bounded_reported_occupancy(current_input_tokens, window),
+        "model_context_window_tokens": window if window_valid else None,
+        "window_valid": window_valid,
+        "usage_complete": usage_complete,
+        "counters_consistent": counters_consistent,
+        "percentage_present_and_valid": percentage_present_and_valid,
+        "percentage_reconciles": percentage_reconciles,
+        "version_validated": version_validated,
+        "validated": validated,
+    }
+
+
+# CR2-06: a conservative, EXPLICIT combine function over the full
+# ProviderCapability enum -- not a bare rank dict, because PROXY and PARTIAL
+# are not naturally totally ordered against each other anywhere else in this
+# project (PROXY = a documented stand-in quantity for a different metric;
+# PARTIAL = the same metric with some fields missing -- genuinely orthogonal
+# reduced-fidelity tiers, not comparable in strength). Both are always weaker
+# than OBSERVED and stronger than UNAVAILABLE, so that much is a real order;
+# only the PROXY-vs-PARTIAL edge has no honest answer. This feature (Claude
+# runtime telemetry) never actually produces a PROXY or PARTIAL value itself,
+# so that edge is unreachable in practice here -- but _claude_runtime_capability_combine
+# must still return a fixed, deterministic, non-raising answer for it rather
+# than pretending a total order exists or letting min()/KeyError leak an
+# implementation detail. The tie is broken by a fixed precedence
+# (PARTIAL before PROXY) documented here as arbitrary-but-fixed, purely so the
+# function is total; no code path in this feature relies on that choice.
+_CAPABILITY_TIER = {
+    ProviderCapability.UNAVAILABLE.value: 0,
+    ProviderCapability.PROXY.value: 1,
+    ProviderCapability.PARTIAL.value: 1,  # tied with PROXY: no natural order between them
+    ProviderCapability.OBSERVED.value: 2,
+    ProviderCapability.EXACT.value: 3,
+}
+# Fixed, arbitrary-but-documented tie-break used ONLY when the two operands
+# are PROXY and PARTIAL specifically (same tier, no natural order).
+_CAPABILITY_TIE_BREAK_WEAKER = ProviderCapability.PARTIAL.value
+
+
+def _claude_runtime_capability_combine(a: str, b: str) -> str:
+    """The critical invariant a derived capability must never violate: it can
+    never be stronger than either operand. Total over every ProviderCapability
+    member -- never raises KeyError for a valid enum value; an unrecognized
+    string is treated as UNAVAILABLE (fail closed) rather than raising."""
+    unavailable = ProviderCapability.UNAVAILABLE.value
+    # Normalize any unrecognized string to UNAVAILABLE outright -- fail
+    # closed rather than ever returning a value that isn't a real enum member.
+    a = a if a in _CAPABILITY_TIER else unavailable
+    b = b if b in _CAPABILITY_TIER else unavailable
+    rank_a, rank_b = _CAPABILITY_TIER[a], _CAPABILITY_TIER[b]
+    if rank_a != rank_b:
+        return a if rank_a < rank_b else b
+    if rank_a == 1 and {a, b} == {ProviderCapability.PROXY.value, ProviderCapability.PARTIAL.value}:
+        return _CAPABILITY_TIE_BREAK_WEAKER
+    return a  # equal tier, not the PROXY/PARTIAL edge case (e.g. a == b): either operand is correct
+
+
+def _claude_runtime_capability(derived: dict[str, Any]) -> dict[str, str]:
+    """Capability is a pure function of the evidence facts, and always describes
+    the field it is attached to -- a field that is None is never labelled
+    anything but UNAVAILABLE, so capability text and value presence never
+    disagree with each other.
+
+    Three independently-graded evidence tiers:
+
+    IDENTITY (session_id, transcript_path, model_id, claude_code_version):
+      directly reported by a resolved statusLine payload -> EXACT.
+
+    MODEL WINDOW (model_context_window_tokens): context_window_size is a
+      directly reported runtime field ("maximum context window size in
+      tokens") -- not derived from the historically problematic
+      current-context counters, so a valid direct value is EXACT outright.
+      Never inferred from model name/table/autoCompactWindow/percentage.
+
+    CURRENT CONTEXT INPUT (current_context_input_tokens): CR3-01 -- EXACT
+      requires the COMPLETE evidence set (derived["validated"]): empirically
+      validated version, complete usage, internally consistent counters, a
+      directly-valid context window, a directly-valid used_percentage, AND
+      derived occupancy reconciling with that percentage. Internal
+      self-consistency of the token breakdown alone is never sufficient --
+      that is exactly the historical semantic-bug class this guards against.
+      Complete-but-not-fully-evidenced (e.g. missing/invalid used_percentage,
+      or an unvalidated version) -> at most OBSERVED; incomplete/inconsistent
+      usage -> UNAVAILABLE.
+
+    MODEL OCCUPANCY (model_context_occupancy_pct / reported_model_context_occupancy_pct):
+      a DERIVED value (current-context-input / window) and must never be
+      labelled more strongly than its weakest operand -- both EXACT -> EXACT;
+      current-context-input OBSERVED + window EXACT -> OBSERVED; either
+      operand UNAVAILABLE -> UNAVAILABLE."""
+    usage_complete, counters_consistent, version_validated = derived["usage_complete"], derived["counters_consistent"], derived["version_validated"]
+    validated = derived.get("validated", False)
+    window_cap = ProviderCapability.EXACT.value if derived.get("window_valid") else ProviderCapability.UNAVAILABLE.value
+    if validated:
+        current_input_cap = ProviderCapability.EXACT.value
+    elif usage_complete and counters_consistent:
+        current_input_cap = ProviderCapability.OBSERVED.value
+    else:
+        current_input_cap = ProviderCapability.UNAVAILABLE.value
+    validated_occupancy_cap = ProviderCapability.EXACT.value if validated else ProviderCapability.UNAVAILABLE.value
+    # Derived occupancy fields: never exceed the weaker of their two operands.
+    reported_occupancy_cap = ProviderCapability.OBSERVED.value if (usage_complete and counters_consistent) else ProviderCapability.UNAVAILABLE.value
+    validated_occupancy_cap = _claude_runtime_capability_combine(validated_occupancy_cap, window_cap)
+    reported_occupancy_cap = _claude_runtime_capability_combine(reported_occupancy_cap, window_cap)
+    return {
+        "session_id": ProviderCapability.EXACT.value,
+        "transcript_path": ProviderCapability.EXACT.value,
+        "model_id": ProviderCapability.EXACT.value,
+        "claude_code_version": ProviderCapability.EXACT.value,
+        "model_context_window_tokens": window_cap,
+        "current_context_input_tokens": current_input_cap if current_input_cap == ProviderCapability.EXACT.value else ProviderCapability.UNAVAILABLE.value,
+        "model_context_occupancy_pct": validated_occupancy_cap,
+        "reported_total_input_tokens": ProviderCapability.OBSERVED.value if (usage_complete and counters_consistent) else ProviderCapability.UNAVAILABLE.value,
+        "reported_total_output_tokens": ProviderCapability.OBSERVED.value if isinstance(derived.get("reported_total_output_tokens"), int) else ProviderCapability.UNAVAILABLE.value,
+        "reported_model_context_occupancy_pct": reported_occupancy_cap,
+        "auto_compact_window_tokens": ProviderCapability.UNAVAILABLE.value,
+        "auto_compact_occupancy_pct": ProviderCapability.UNAVAILABLE.value,
+    }
+
+
+def _claude_runtime_valid_optional_str(value: Any, max_len: int = 4096) -> bool:
+    return value is None or (isinstance(value, str) and len(value) <= max_len)
+
+
+def _claude_runtime_valid_optional_int(value: Any) -> bool:
+    # CR3-02: a persisted token-count field must satisfy the same bound the
+    # live extraction path enforces (_claude_runtime_bounded_int) -- a
+    # negative or pathologically oversized value is semantically invalid
+    # (never something the writer itself would produce), not just
+    # syntactically an int.
+    return value is None or _claude_runtime_bounded_int(value) is not None
+
+
+def _claude_runtime_valid_optional_finite_float(value: Any, *, lo: float = 0.0, hi: float = 1.2) -> bool:
+    # CR3-02: occupancy is a stored fraction (0.0-1.0) -- negative is never
+    # semantically valid, and 1.2 tolerates the writer's own legitimate
+    # near-boundary overflow (current-context tokens can transiently exceed
+    # the window right at/before a compaction), while firmly rejecting a
+    # pathological value like 1.5. Never NaN/Infinity, always a real float
+    # type, never bool/int masquerading as one.
+    if value is None:
+        return True
+    if type(value) is not float:
+        return False
+    if math.isnan(value) or math.isinf(value):
+        return False
+    return lo <= value <= hi
+
+
+def _claude_runtime_valid_capability_value(value: Any) -> bool:
+    return isinstance(value, str) and value in _CAPABILITY_TIER
+
+
+def _claude_runtime_valid_optional_receipt_ns(value: Any) -> bool:
+    # CR3-02: regime_started_at shares receipt_ns's shape/semantics (a
+    # trusted wall-clock nanosecond timestamp), not a token count -- it must
+    # never be run through the 100M token-count bound, and must obey the
+    # same non-negative / not-implausibly-future constraints receipt_ns itself
+    # is held to elsewhere in this module.
+    if value is None:
+        return True
+    if type(value) is not int or value < 0:
+        return False
+    return value <= time.time_ns() + CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS * 1_000_000_000
+
+
+def _claude_runtime_valid_regime(value: Any) -> bool:
+    if not (isinstance(value, list) and len(value) == 2):
+        return False
+    model_id, window = value
+    if not _claude_runtime_valid_optional_str(value=model_id, max_len=128):
+        return False
+    return window is None or (type(window) is int and 0 <= window <= 100_000_000)
+
+
+def _parse_claude_runtime_snapshot(raw_value: Optional[str]) -> dict[str, Any]:
+    """Centralised, STRUCTURALLY EXHAUSTIVE parser for the claude_runtime:*
+    service_meta value (CR2-02). Never raises. If ANY field that merge, peak
+    max/min, ordering, formatting, capability derivation, regime logic, or
+    status rendering later consumes fails validation, the ENTIRE prior
+    snapshot is discarded and treated as absent -- partial trust of malformed
+    persisted state is exactly the class of bug that let a stray string reach
+    `int > str` in a later comparison. A corrupted row can neither crash
+    ingestion/status/reset/a daemon tick nor block a new valid observation
+    from replacing it (an empty {} never satisfies the older-receipt guard in
+    store_claude_runtime_sample, so the next genuine sample always wins)."""
+    if not raw_value:
+        return {}
+    try:
+        value = _claude_runtime_json_loads(raw_value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+
+    # --- identity / bookkeeping ---
+    if value.get("format_version") != CLAUDE_RUNTIME_FORMAT_VERSION:
+        return {}
+    if not isinstance(value.get("stream_id"), str):
+        return {}
+    if not _claude_runtime_valid_optional_str(value.get("session_id")):
+        return {}
+    if not _claude_runtime_valid_optional_str(value.get("transcript_path"), max_len=8192):
+        return {}
+    if not _claude_runtime_valid_optional_str(value.get("claude_code_version"), max_len=64):
+        return {}
+    if not _claude_runtime_valid_optional_str(value.get("model_id"), max_len=128):
+        return {}
+    if not _claude_runtime_valid_optional_str(value.get("model_display_name"), max_len=128):
+        return {}
+
+    # --- receipt / timestamps: receipt_ns is the only trusted ordering
+    # signal and MUST be a plain, non-negative, not-implausibly-future int ---
+    receipt_ns = value.get("receipt_ns")
+    if type(receipt_ns) is not int or receipt_ns < 0:
+        return {}
+    if receipt_ns > time.time_ns() + CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS * 1_000_000_000:
+        return {}  # CR2-03: a future-poisoned persisted receipt must fail closed too
+    # CR3-02: observed_at/last_validated_at, when present, must be usable
+    # timestamps per the project's real timestamp parser -- not merely
+    # syntactically a string. "not-a-timestamp" must fail closed here rather
+    # than being carried forward as a plausible-looking display value.
+    for ts_key in ("observed_at", "last_validated_at"):
+        ts_value = value.get(ts_key)
+        if ts_value is not None and (not isinstance(ts_value, str) or iso_to_dt(ts_value) is None):
+            return {}
+
+    # --- latest counters ---
+    if not _claude_runtime_valid_optional_int(value.get("current_context_input_tokens")):
+        return {}
+    if not _claude_runtime_valid_optional_int(value.get("model_context_window_tokens")):
+        return {}
+    if not _claude_runtime_valid_optional_finite_float(value.get("model_context_occupancy_pct")):
+        return {}
+
+    # --- reported (at-most-OBSERVED) counters ---
+    if not _claude_runtime_valid_optional_int(value.get("reported_total_input_tokens")):
+        return {}
+    if not _claude_runtime_valid_optional_int(value.get("reported_total_output_tokens")):
+        return {}
+    if not _claude_runtime_valid_optional_finite_float(value.get("reported_model_context_occupancy_pct")):
+        return {}
+
+    # --- peak counters ---
+    if not _claude_runtime_valid_optional_int(value.get("peak_current_context_input_tokens")):
+        return {}
+    if not _claude_runtime_valid_optional_finite_float(value.get("peak_model_context_occupancy_pct")):
+        return {}
+
+    # --- auto-compact fields: CR3-02 REQUIRES these to always be None for
+    # v1 -- this feature never emits an auto-compact measurement, so a
+    # tampered service_meta snapshot claiming otherwise (e.g.
+    # auto_compact_window_tokens=1) must fail closed rather than let a
+    # fabricated value silently become populated. ---
+    if value.get("auto_compact_window_tokens") is not None:
+        return {}
+    if value.get("auto_compact_occupancy_pct") is not None:
+        return {}
+    if value.get("peak_auto_compact_occupancy_pct") is not None:
+        return {}
+
+    # --- evidence booleans ---
+    for flag_key in ("usage_complete", "counters_consistent", "version_validated"):
+        flag_value = value.get(flag_key)
+        if flag_value is not None and type(flag_value) is not bool:
+            return {}
+
+    # --- regime shape ---
+    regime = value.get("regime")
+    if regime is not None and not _claude_runtime_valid_regime(regime):
+        return {}
+    if not _claude_runtime_valid_optional_receipt_ns(value.get("regime_started_at")):
+        return {}
+
+    # --- capability map: every value must be an actual ProviderCapability ---
+    capability = value.get("capability")
+    if capability is not None:
+        if not isinstance(capability, dict):
+            return {}
+        for cap_value in capability.values():
+            if not _claude_runtime_valid_capability_value(cap_value):
+                return {}
+
+    # --- provenance/integrity notes: bounded list of strings only ---
+    notes = value.get("provenance_notes")
+    if notes is not None:
+        if not (isinstance(notes, list) and len(notes) <= 16 and all(isinstance(n, str) and len(n) <= 2048 for n in notes)):
+            return {}
+
+    return value
+
+
+def store_claude_runtime_sample(store: StateStore, row: sqlite3.Row, sample: dict[str, Any], *, receipt_ns: Optional[int] = None) -> None:
+    """Merge one resolved runtime sample into the bounded per-stream service_meta
+    snapshot. Latest-observation-wins uses the caller-supplied trusted receipt
+    (never the incoming payload's own observed_at). Peak fields only advance
+    within the SAME telemetry regime -- (model_id, model_context_window_tokens)
+    -- a regime change resets peaks rather than merging incompatible values."""
+    stream_id = str(row["stream_id"])
+    key = _claude_runtime_meta_key(stream_id)
+    existing_row = store.db.execute("SELECT value FROM service_meta WHERE key=?", (key,)).fetchone()
+    existing = _parse_claude_runtime_snapshot(existing_row[0] if existing_row else None)
+    receipt_ns = receipt_ns if receipt_ns is not None else time.time_ns()
+    # CR3-03: this is the final merge boundary and must be independently safe
+    # even when called directly, without going through the normal inbox
+    # reader's validation. type(x) is int strictly (never bool -- bool is a
+    # subclass of int in Python), non-negative, and within the same trusted
+    # wall-clock future-skew bound receipt_ns is held to everywhere else
+    # (CR2-03) -- a caller-supplied bool/float/string/negative/future receipt
+    # must never be persisted or participate in ordering.
+    if type(receipt_ns) is not int or receipt_ns < 0:
+        return
+    max_receipt_ns = time.time_ns() + CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS * 1_000_000_000
+    if receipt_ns > max_receipt_ns:
+        return
+    if isinstance(existing.get("receipt_ns"), int) and receipt_ns < existing["receipt_ns"]:
+        return  # an older receipt cannot replace a newer current snapshot
+    derived = _claude_runtime_derive(sample)
+    regime = [sample.get("model_id"), derived.get("model_context_window_tokens")]
+    existing_regime = existing.get("regime")
+    regime_changed = existing_regime is not None and existing_regime != regime
+    new_regime = existing_regime is None or regime_changed
+    peak_tokens = existing.get("peak_current_context_input_tokens")
+    peak_pct = existing.get("peak_model_context_occupancy_pct")
+    if new_regime:
+        peak_tokens, peak_pct = derived.get("current_context_input_tokens"), derived.get("model_context_occupancy_pct")
+    else:
+        if isinstance(derived.get("current_context_input_tokens"), int):
+            peak_tokens = max(peak_tokens or 0, derived["current_context_input_tokens"])
+        if isinstance(derived.get("model_context_occupancy_pct"), float):
+            peak_pct = max(peak_pct or 0.0, derived["model_context_occupancy_pct"])
+    observed_at = sample.get("observed_at") if isinstance(sample.get("observed_at"), str) else None
+    snapshot = {
+        "format_version": CLAUDE_RUNTIME_FORMAT_VERSION,
+        "receipt_ns": receipt_ns,
+        "observed_at": observed_at,
+        "session_id": sample.get("session_id"),
+        "transcript_path": sample.get("transcript_path"),
+        "stream_id": stream_id,
+        "claude_code_version": sample.get("claude_code_version"),
+        "model_id": sample.get("model_id"),
+        "model_display_name": sample.get("model_display_name"),
+        "current_context_input_tokens": derived.get("current_context_input_tokens"),
+        "peak_current_context_input_tokens": peak_tokens,
+        "reported_total_input_tokens": derived.get("reported_total_input_tokens"),
+        "reported_total_output_tokens": derived.get("reported_total_output_tokens"),
+        "reported_model_context_occupancy_pct": derived.get("reported_model_context_occupancy_pct"),
+        "model_context_window_tokens": derived.get("model_context_window_tokens"),
+        "model_context_occupancy_pct": derived.get("model_context_occupancy_pct"),
+        "peak_model_context_occupancy_pct": peak_pct,
+        "auto_compact_window_tokens": None,
+        "auto_compact_occupancy_pct": None,
+        "peak_auto_compact_occupancy_pct": None,
+        "usage_complete": derived.get("usage_complete"),
+        "counters_consistent": derived.get("counters_consistent"),
+        "version_validated": derived.get("version_validated"),
+        "regime": regime,
+        "regime_started_at": receipt_ns if new_regime else existing.get("regime_started_at", receipt_ns),
+        "last_validated_at": observed_at if derived.get("current_context_input_tokens") is not None else existing.get("last_validated_at"),
+        "capability": _claude_runtime_capability(derived),
+        "provenance_notes": [
+            "current_context_input_tokens, when present, is validated for the session identity "
+            "Claude Code reported; Claude's status line does not partition delegated/subagent "
+            "consumption, so this value may include work performed by a delegated subagent. It is "
+            "total_input_tokens only (input_tokens + cache_creation_input_tokens + "
+            "cache_read_input_tokens); total_output_tokens is tracked separately as "
+            "reported_total_output_tokens and never enters model_context_occupancy_pct, matching "
+            "Claude Code's own documented used_percentage definition (input tokens only).",
+            f"EXACT capability requires claude_code_version to be in the empirically validated "
+            f"set {sorted(CLAUDE_RUNTIME_EXACT_VERSIONS)}; other versions are at most OBSERVED "
+            "even when internally self-consistent. model_context_window_tokens is a directly "
+            "reported provider field (not derived from current-context counters) and is EXACT "
+            "whenever validly present, independent of claude_code_version. Derived occupancy "
+            "fields are never labelled more strongly than their weakest operand.",
+        ],
+    }
+    store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES(?,?)", (key, json.dumps(snapshot, sort_keys=True)))
+
+
+CLAUDE_RUNTIME_INBOX_UNRESOLVED_MAX_AGE_SECONDS = 30 * 60
+
+
+def ingest_claude_runtime_inbox(store: StateStore, state_dir: Optional[str] = None) -> dict[str, int]:
+    """Read the bounded inbox, resolve each sample by exact identity, and merge
+    resolved samples into service_meta IN TRUSTED-RECEIPT ORDER (oldest first).
+    Processing the whole ordered batch through the same merge function -- rather
+    than only ever looking at the newest sample -- is what lets a model/window
+    regime change (CR-09) that occurs mid-batch be applied at the right point in
+    the sequence. Never writes SQLite from the bridge itself; this is the only
+    path that opens the database for runtime telemetry.
+
+    The inbox is a mailbox, not durable history: a resolved sample is deleted
+    once merged into service_meta (the durable copy), and an unresolved sample
+    -- e.g. the status line fired before the transcript was first discovered --
+    is retried on later scans but evicted once stale (using the trusted local
+    receipt, never the untrusted payload observed_at), so the directory never
+    grows unbounded and a session reset can't resurrect a stale snapshot."""
+    metrics = {"samples_read": 0, "resolved": 0, "unresolved": 0, "ambiguous": 0}
+    now_ns = time.time_ns()
+    stale_ns = CLAUDE_RUNTIME_INBOX_UNRESOLVED_MAX_AGE_SECONDS * 1_000_000_000
+    with store.db:
+        for entry, sample in _read_claude_runtime_inbox(state_dir):
+            metrics["samples_read"] += 1
+            row, reason = resolve_claude_runtime_sample(store, sample)
+            if row is None:
+                metrics[reason] += 1
+                if now_ns - sample["receipt_ns"] > stale_ns:
+                    try: entry.unlink()
+                    except OSError: pass
+                continue
+            store_claude_runtime_sample(store, row, sample, receipt_ns=sample["receipt_ns"])
+            metrics["resolved"] += 1
+            try: entry.unlink()
+            except OSError: pass
+    return metrics
+
+
 HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Files Changed", "Verification", "Open Problems", "Do Not Repeat", "Exact Next Action", "Relevant References")
 
 def validate_handoff(project: str) -> dict[str, Any]:
@@ -3584,6 +4588,8 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
             # durable marker is cleared by a successful all-provider replay.
             store.db.commit()
             return metrics
+        if provider in ("all", "claude"):
+            ingest_claude_runtime_inbox(store, state_dir)
         notifier = Notifier(notify and notification["enabled"], notification["minimum_severity"])
         # Only notify for sessions touched this tick AND recently active.
         # Without the recency check, a cold start (or any scan that first
@@ -3718,10 +4724,18 @@ def _read_integration_ownership(codex_home: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) and value.get("version") == 1 else {}
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str, *, mode: Optional[int] = None) -> None:
+    """Write-then-replace, optionally with an explicit mode. When mode is
+    given, it is applied to the TEMP file before os.replace, not chmod'd onto
+    the destination afterward -- chmod-after-replace leaves a window where
+    the file briefly exists at the umask-derived mode of a freshly created
+    temp file, defeating a caller that needs it private (e.g. 0600) from the
+    instant it becomes visible at its final path (CR2-05)."""
     temporary = path.with_name(path.name + ".tmp-" + secrets.token_hex(8))
     try:
         temporary.write_text(text, encoding="utf-8")
+        if mode is not None:
+            os.chmod(temporary, mode)
         os.replace(temporary, path)
     finally:
         if temporary.exists(): temporary.unlink()
@@ -3800,14 +4814,487 @@ def integration_remove_codex(codex_home: Path) -> dict[str, Any]:
     return integration_status(codex_home)
 
 
+def _claude_settings_path(claude_home: Path) -> Path:
+    return claude_home / "settings.json"
+
+
+def _claude_integration_ownership_path(claude_home: Path) -> Path:
+    return claude_home / ".agentopsy-integration.json"
+
+
+def _claude_integration_pre_image_path(claude_home: Path) -> Path:
+    # CR2-04: a PRIVATE, separate artifact holding the original settings.json
+    # bytes verbatim -- never embedded in the ownership sidecar, since
+    # settings.json can contain sensitive configuration/environment values
+    # and the sidecar's contents are not treated as equally sensitive.
+    return claude_home / ".agentopsy-integration.settings-preimage"
+
+
+def _claude_integration_symlinked_paths(claude_home: Path) -> list[Path]:
+    # CR3-05: best-effort same-user configuration integrity (not a privilege
+    # boundary) -- a symlink at any of the three Claude-integration config
+    # paths must be detected BEFORE mutation and before any read that would
+    # otherwise silently follow it (read_text/json.loads/hashlib all follow
+    # symlinks transparently). os.path.islink never follows the link itself,
+    # so this is safe to call unconditionally.
+    candidates = [_claude_settings_path(claude_home), _claude_integration_ownership_path(claude_home), _claude_integration_pre_image_path(claude_home)]
+    return [p for p in candidates if os.path.islink(p)]
+
+
+def _read_claude_integration_ownership(claude_home: Path) -> tuple[str, dict[str, Any]]:
+    """Read Claude ownership metadata without conflating absent and invalid.
+
+    Callers that mutate configuration must use only the returned mapping from
+    the ``VALID`` state.  Status also needs to report a present-but-unusable
+    sidecar honestly as a manual-recovery condition, rather than treating it
+    like no sidecar was ever installed.
+    """
+    path = _claude_integration_ownership_path(claude_home)
+    if os.path.islink(path):
+        return "INVALID", {}  # CR3-05: never follow it
+    if not path.exists():
+        return "MISSING", {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "INVALID", {}
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return "INVALID", {}
+    feature = value.get("statusline")
+    if not isinstance(feature, dict) or feature.get("owned") is not True:
+        return "INVALID", {}
+    required_strings = ("expected_owned_settings_sha256", "installed_command_sha256")
+    if any(not isinstance(feature.get(key), str) or not feature[key] for key in required_strings):
+        return "INVALID", {}
+    if type(feature.get("original_existed")) is not bool:
+        return "INVALID", {}
+    return "VALID", value
+
+
+def _claude_statusline_command(state_dir: Optional[str]) -> str:
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} runtime bridge claude"
+    return command + (f" --state-dir {shlex.quote(state_dir)}" if state_dir else "")
+
+
+def _claude_statusline_is_agentopsy_owned(current_command: str, ownership: dict[str, Any]) -> bool:
+    """CR-05: ownership is proven only by a three-way agreement -- never by a
+    substring/text match against the command, which a foreign command could
+    trivially spoof (e.g. '/usr/bin/foreign --label "runtime bridge claude"').
+
+    A statusLine is Agentopsy-owned only when:
+      1. ownership metadata exists and parses at the expected version, AND
+      2. it records an installed_command_sha256, AND
+      3. that hash matches sha256(current_command) exactly.
+
+    No ownership metadata means foreign/unknown, full stop, regardless of what
+    the command text looks like."""
+    feature = ownership.get("statusline") if isinstance(ownership.get("statusline"), dict) else None
+    if not feature or not feature.get("owned"):
+        return False
+    installed_hash = feature.get("installed_command_sha256")
+    if not isinstance(installed_hash, str) or not installed_hash:
+        return False
+    return installed_hash == hashlib.sha256(current_command.encode()).hexdigest()
+
+
+def claude_integration_status(claude_home: Path) -> dict[str, Any]:
+    """CR3-07: `owned`/`agentopsy_statusline_installed`/`foreign_statusline_present`
+    keep their existing meaning unchanged (install/remove branch on them) --
+    the new `state` field adds an EXPLICIT diagnostic on top, so a caller
+    that only wants "is this a healthy, unconflicted install" has one field
+    to check rather than needing to know the reconciliation logic below.
+    Never raises: every read that could fail (settings, ownership, pre-image)
+    is guarded, and a failure degrades to a diagnostic state -- install and
+    remove both return this function's result directly, so an exception here
+    would surface as a false failure of an otherwise-successful mutation.
+
+    States:
+      NOT_INSTALLED               -- no statusLine present at all
+      FOREIGN                     -- a statusLine is present but not Agentopsy-owned
+      SYMLINK_CONFLICT            -- settings.json/ownership/pre-image is a symlink
+      STALE_OR_MALFORMED_OWNERSHIP -- ownership claims owned=True but lacks the
+                                      bounded metadata this version requires
+      SETTINGS_MISSING_WHILE_OWNED -- ownership says owned, but settings.json
+                                      does not exist on disk
+      EXTERNAL_EDIT_CONFLICT      -- settings.json exists but its hash no
+                                      longer matches the expected-owned hash
+      PREIMAGE_MISSING            -- original existed at install time but its
+                                      private pre-image file is now missing
+      PREIMAGE_CORRUPT            -- the pre-image file exists but fails its
+                                      recorded integrity hash
+      OWNED_OK                    -- owned, consistent, and (if applicable)
+                                      the pre-image is present and verified"""
+    settings = _claude_settings_path(claude_home)
+    symlinked = _claude_integration_symlinked_paths(claude_home)
+    if symlinked:
+        return {"provider": "claude", "statusline_present": False,
+                "agentopsy_statusline_installed": False, "foreign_statusline_present": False,
+                "configuration": str(settings), "owned": False, "state": "SYMLINK_CONFLICT"}
+    settings_exists = settings.exists()
+    try:
+        payload = json.loads(settings.read_text(encoding="utf-8")) if settings_exists else {}
+    except Exception:
+        payload = {}
+    status_line = payload.get("statusLine") if isinstance(payload, dict) else None
+    command = str(status_line.get("command") or "") if isinstance(status_line, dict) else ""
+    ownership_state, ownership = _read_claude_integration_ownership(claude_home)
+    if ownership_state == "INVALID":
+        return {"provider": "claude", "statusline_present": status_line is not None,
+                "agentopsy_statusline_installed": False,
+                "foreign_statusline_present": status_line is not None,
+                "configuration": str(settings), "owned": False,
+                "state": "STALE_OR_MALFORMED_OWNERSHIP"}
+    owned = status_line is not None and _claude_statusline_is_agentopsy_owned(command, ownership)
+    result = {"provider": "claude", "statusline_present": status_line is not None,
+              "agentopsy_statusline_installed": owned,
+              "foreign_statusline_present": status_line is not None and not owned,
+              "configuration": str(settings), "owned": owned}
+    ownership_feature = ownership.get("statusline", {}) if isinstance(ownership.get("statusline"), dict) else {}
+    if not settings_exists and ownership_feature.get("owned"):
+        # Ownership metadata claims Agentopsy owns this configuration, but
+        # settings.json itself is gone -- this is a conflict, not "nothing
+        # was ever installed": must not be reported as ordinary NOT_INSTALLED.
+        result["state"] = "SETTINGS_MISSING_WHILE_OWNED"
+        return result
+    if status_line is None:
+        result["state"] = "NOT_INSTALLED"
+        return result
+    if not owned:
+        result["state"] = "FOREIGN"
+        return result
+    feature = ownership_feature
+    expected_hash = feature.get("expected_owned_settings_sha256")
+    if not isinstance(expected_hash, str) or not expected_hash:
+        result["state"] = "STALE_OR_MALFORMED_OWNERSHIP"
+        return result
+    try:
+        current_hash = hashlib.sha256(settings.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    except OSError:
+        result["state"] = "STALE_OR_MALFORMED_OWNERSHIP"
+        return result
+    if current_hash != expected_hash:
+        result["state"] = "EXTERNAL_EDIT_CONFLICT"
+        return result
+    if feature.get("original_existed"):
+        pre_image_path = _claude_integration_pre_image_path(claude_home)
+        pre_image_ref = feature.get("pre_image_ref")
+        original_sha256 = feature.get("original_sha256")
+        if not isinstance(pre_image_ref, str) or pre_image_ref != pre_image_path.name or not pre_image_path.exists():
+            result["state"] = "PREIMAGE_MISSING"
+            return result
+        try:
+            pre_image_text = pre_image_path.read_text(encoding="utf-8")
+        except OSError:
+            result["state"] = "PREIMAGE_MISSING"
+            return result
+        if not isinstance(original_sha256, str) or hashlib.sha256(pre_image_text.encode("utf-8")).hexdigest() != original_sha256:
+            result["state"] = "PREIMAGE_CORRUPT"
+            return result
+    result["state"] = "OWNED_OK"
+    return result
+
+
+class _ClaudeIntegrationArtifact:
+    """One file participating in a transactional multi-file publish. `text`
+    is the new content (None means "delete this file", only meaningful if it
+    previously existed). `mode`, when given, is applied to the temp file
+    before the atomic replace (CR2-05: never chmod-after-replace, which
+    leaves a window at the umask-derived mode).
+
+    CR3-06: `legacy_backup` defaults to False -- the Claude integration
+    transaction already has its own private, exact pre-image artifact as the
+    recovery source, so _publish must NOT also invoke the legacy
+    _backup_file() timestamped-copy path for these artifacts; doing so would
+    leave a redundant plaintext `settings.json.agentopsy-backup-*` copy
+    behind after every successful install/reinstall/remove. Set True only
+    for a caller that has no other recovery artifact and genuinely needs the
+    legacy safety net (this feature's own callers never do)."""
+    __slots__ = ("path", "text", "mode", "legacy_backup")
+    def __init__(self, path: Path, text: Optional[str], mode: Optional[int] = None, legacy_backup: bool = False):
+        self.path, self.text, self.mode, self.legacy_backup = path, text, mode, legacy_backup
+
+
+def _claude_integration_transactional_write(claude_home: Path, artifacts: list[_ClaudeIntegrationArtifact]) -> None:
+    """CR-06 (generalized to N files for CR2-04's third artifact): independent
+    os.replace calls across multiple files cannot be made atomic -- a crash
+    between them would leave some updated and others stale. This stages every
+    artifact's prospective content (and its prior state, including absence
+    and mode) fully in memory first, then publishes in order; if any
+    publication after the first fails, every already-published artifact is
+    rolled back to its exact prior state (unlinked if it did not exist
+    before), so the whole set is either fully updated or fully unchanged from
+    the caller's perspective.
+
+    CR3-06: publishing does NOT invoke the legacy _backup_file() timestamped-
+    copy mechanism unless an artifact explicitly opts in via legacy_backup --
+    the Claude integration's own private pre-image IS the recovery artifact,
+    so a redundant plaintext settings.json.agentopsy-backup-* copy must never
+    be created as a side effect of install/reinstall/remove."""
+    prior: list[tuple[_ClaudeIntegrationArtifact, bool, Optional[str], Optional[int]]] = []
+    for art in artifacts:
+        existed = art.path.exists()
+        before_text = art.path.read_text(encoding="utf-8") if existed else None
+        before_mode = art.path.stat().st_mode if existed else None
+        prior.append((art, existed, before_text, before_mode))
+
+    def _publish(art: _ClaudeIntegrationArtifact, existed_before: bool) -> None:
+        if art.text is None:
+            if existed_before: art.path.unlink()
+            return
+        if existed_before and art.legacy_backup: _backup_file(art.path)
+        _atomic_write_text(art.path, art.text, mode=art.mode)
+
+    def _restore(art: _ClaudeIntegrationArtifact, existed_before: bool, mode_before: Optional[int], before_text: Optional[str]) -> None:
+        if not existed_before:
+            if art.path.exists(): art.path.unlink()
+            return
+        _atomic_write_text(art.path, before_text, mode=stat.S_IMODE(mode_before) if mode_before is not None else None)
+
+    published: list[tuple[_ClaudeIntegrationArtifact, bool, Optional[str], Optional[int]]] = []
+    try:
+        for art, existed, before_text, before_mode in prior:
+            if art.text != before_text:
+                _publish(art, existed)
+            published.append((art, existed, before_text, before_mode))
+    except Exception as publish_exc:
+        failures = []
+        for art, existed, before_text, before_mode in published:
+            try:
+                _restore(art, existed, before_mode, before_text)
+            except OSError as restore_exc:
+                failures.append(f"{art.path}: {restore_exc}")
+        if failures:
+            # Do NOT swallow a failed rollback (CR-06): surface it loudly
+            # rather than silently leaving a half-published set of artifacts.
+            # The private settings pre-image (.agentopsy-integration.settings-
+            # preimage) is the recovery artifact for the Claude integration --
+            # it is never touched by this rollback failure path itself, so it
+            # should still exist on disk for manual recovery when the failed
+            # artifact is settings.json.
+            raise RuntimeError(
+                "Failed to roll back the following artifacts after a failed publish, and "
+                "automatic rollback also failed for them: " + "; ".join(failures) +
+                ". The private settings pre-image (.agentopsy-integration.settings-preimage), "
+                "if present, is the recovery source and must be restored to settings.json "
+                "manually before retrying."
+            ) from publish_exc
+        raise
+
+
+def claude_integration_install(claude_home: Path, state_dir: Optional[str]) -> dict[str, Any]:
+    """Explicit installer: never overwrite a foreign statusLine (CR-05
+    ownership check). Validate fully before any write; all artifacts are
+    published/rolled back together (CR-06).
+
+    CR2-04: settings.json is allowed to be ABSENT (first install then simply
+    means "no statusLine key to preserve, and remove should restore
+    absence"). On first install, a PRIVATE byte-exact pre-image of the
+    original settings.json is written to a separate artifact -- never
+    embedded in the ownership sidecar, since settings.json can hold sensitive
+    configuration. The ownership sidecar records only bounded metadata:
+    whether the original existed, its SHA-256 and mode, a reference to the
+    pre-image file, and the expected-owned-settings/installed-command hashes
+    used to verify state on remove. A reinstall NEVER touches the original
+    pre-image/metadata -- only the expected-owned-settings hash and the
+    installed-command hash are refreshed to describe what was just written.
+
+    CR3-05: refuses before any mutation (and before any read that would
+    follow it) if settings.json, the ownership sidecar, or the pre-image is
+    itself a symlink -- best-effort same-user configuration integrity, not a
+    privilege boundary. Never replaces the symlink with os.replace, never
+    follows it to read/hash a target's contents."""
+    symlinked = _claude_integration_symlinked_paths(claude_home)
+    if symlinked:
+        raise ValueError(f"Refusing to install: {', '.join(str(p) for p in symlinked)} is a symlink; resolve this conflict manually before installing.")
+    settings = _claude_settings_path(claude_home)
+    settings_existed = settings.exists()
+    original = settings.read_text(encoding="utf-8") if settings_existed else ""
+    try: payload = json.loads(original) if original.strip() else {}
+    except json.JSONDecodeError as exc: raise ValueError("Claude settings.json is malformed; refusing to modify it") from exc
+    if not isinstance(payload, dict): raise ValueError("Claude settings.json must contain an object; refusing to modify it")
+    command = _claude_statusline_command(state_dir)
+    existing = payload.get("statusLine")
+    existing_command = str(existing.get("command") or "") if isinstance(existing, dict) else ""
+    ownership_state, ownership = _read_claude_integration_ownership(claude_home)
+    if ownership_state == "INVALID":
+        raise ValueError("Claude integration ownership metadata is stale or malformed; refusing to install without manual recovery.")
+    if existing is not None and not _claude_statusline_is_agentopsy_owned(existing_command, ownership):
+        # Foreign/unknown statusLine: refuse outright, zero mutation. Ownership
+        # metadata -- not command text -- is the only thing that can excuse this.
+        raise ValueError("A non-Agentopsy statusLine is already configured; refusing to overwrite it. Remove it manually or chain it yourself before installing.")
+    new_status_line = {"type": "command", "command": command}
+    installed_hash = hashlib.sha256(command.encode()).hexdigest()
+    already_owned = existing is not None and _claude_statusline_is_agentopsy_owned(existing_command, ownership)
+    if already_owned and existing == new_status_line:
+        return claude_integration_status(claude_home)  # idempotent reinstall, no write needed
+    new_payload = {**payload, "statusLine": new_status_line}
+    rendered = json.dumps(new_payload, indent=2) + "\n"
+    # Hash EXACTLY what we are about to publish (the rendered string), never
+    # a value re-read from disk afterward -- a re-read could disagree over a
+    # trailing-newline/encoding detail and make every future remove refuse.
+    expected_owned_settings_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    ownership_path = _claude_integration_ownership_path(claude_home)
+    pre_image_path = _claude_integration_pre_image_path(claude_home)
+    prior_statusline = ownership.get("statusline", {}) if isinstance(ownership.get("statusline"), dict) else {}
+    settings_mode = stat.S_IMODE(settings.stat().st_mode) if settings_existed else None
+    # CR3-06 fault-recovery ordering: publish the private pre-image (when this
+    # is a fresh install writing one) BEFORE settings.json itself, so that if
+    # publishing settings then fails, the pre-image -- the sole recovery
+    # artifact -- is already durably on disk rather than depending on a
+    # same-transaction publish that never got the chance to run.
+    settings_artifact = _ClaudeIntegrationArtifact(settings, rendered, mode=settings_mode)
+    artifacts: list[_ClaudeIntegrationArtifact] = []
+    if already_owned:
+        # Reinstall: NEVER replace the original pre-Agentopsy pre-image/
+        # metadata -- only the hashes describing the currently-installed
+        # Agentopsy configuration change.
+        new_ownership = {
+            "version": 1,
+            "statusline": {
+                "owned": True,
+                "original_existed": prior_statusline.get("original_existed"),
+                "original_sha256": prior_statusline.get("original_sha256"),
+                "original_mode": prior_statusline.get("original_mode"),
+                "pre_image_ref": prior_statusline.get("pre_image_ref"),
+                "expected_owned_settings_sha256": expected_owned_settings_sha256,
+                "installed_command_sha256": installed_hash,
+            },
+        }
+        # The pre-image itself is untouched: no artifact for it in this branch.
+        artifacts.append(settings_artifact)
+    else:
+        pre_image_ref = pre_image_path.name
+        new_ownership = {
+            "version": 1,
+            "statusline": {
+                "owned": True,
+                "original_existed": settings_existed,
+                "original_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest() if settings_existed else None,
+                "original_mode": stat.S_IMODE(settings.stat().st_mode) if settings_existed else None,
+                "pre_image_ref": pre_image_ref if settings_existed else None,
+                "expected_owned_settings_sha256": expected_owned_settings_sha256,
+                "installed_command_sha256": installed_hash,
+            },
+        }
+        if settings_existed:
+            artifacts.append(_ClaudeIntegrationArtifact(pre_image_path, original, mode=0o600))
+        artifacts.append(settings_artifact)
+    new_ownership_text = json.dumps(new_ownership, sort_keys=True) + "\n"
+    artifacts.append(_ClaudeIntegrationArtifact(ownership_path, new_ownership_text, mode=0o600))
+    _claude_integration_transactional_write(claude_home, artifacts)
+    return claude_integration_status(claude_home)
+
+
+def claude_integration_remove(claude_home: Path) -> dict[str, Any]:
+    """Remove only the Agentopsy-owned statusLine (CR-05 ownership check).
+
+    CR2-04: before restoring anything, verifies THREE things: ownership
+    metadata is well-formed and owned, the current statusLine command hash
+    matches, and the FULL current settings.json file hash matches the
+    expected-owned-settings hash recorded at install/reinstall time. If the
+    full-file hash disagrees, the file was edited outside Agentopsy in some
+    way beyond just the statusLine (or is byte-different in ANY way, e.g. a
+    reformat) -- removal is refused outright, zero mutation, rather than
+    restoring a stale pre-image over a legitimate-but-unexpected user change.
+    If everything matches, the exact original bytes and mode are restored
+    atomically (or the file is removed entirely if it did not originally
+    exist), then the ownership sidecar and private pre-image are deleted.
+
+    CR3-05: refuses before any mutation (and before any read/hash that would
+    follow it) if settings.json, the ownership sidecar, or the pre-image is
+    itself a symlink."""
+    symlinked = _claude_integration_symlinked_paths(claude_home)
+    if symlinked:
+        raise ValueError(f"Refusing to remove: {', '.join(str(p) for p in symlinked)} is a symlink; resolve this conflict manually before removing.")
+    settings = _claude_settings_path(claude_home)
+    ownership_state, ownership = _read_claude_integration_ownership(claude_home)
+    if ownership_state == "INVALID":
+        raise ValueError("Claude integration ownership metadata is stale or malformed; refusing destructive removal without manual recovery.")
+    feature = ownership.get("statusline", {}) if isinstance(ownership.get("statusline"), dict) else {}
+    if not feature.get("owned"):
+        return claude_integration_status(claude_home)
+    settings_exists = settings.exists()
+    current_text = settings.read_text(encoding="utf-8") if settings_exists else ""
+    try: payload = json.loads(current_text) if current_text.strip() else {}
+    except json.JSONDecodeError:
+        raise ValueError("Claude settings.json is malformed; refusing to modify it")
+    current = payload.get("statusLine") if isinstance(payload, dict) else None
+    current_command = str(current.get("command") or "") if isinstance(current, dict) else ""
+    if not _claude_statusline_is_agentopsy_owned(current_command, ownership):
+        raise ValueError("The statusLine was modified outside Agentopsy since installation; refusing to remove it destructively.")
+    expected_hash = feature.get("expected_owned_settings_sha256")
+    current_hash = hashlib.sha256(current_text.encode("utf-8")).hexdigest() if settings_exists else None
+    if not isinstance(expected_hash, str) or current_hash != expected_hash:
+        # Full-file hash disagreement: treat as an external edit/conflict.
+        # Deliberately refuses removal after ANY unowned settings edit rather
+        # than restoring a stale full pre-image over legitimate user changes.
+        raise ValueError("settings.json does not match Agentopsy's expected owned state (an external edit was made beyond the statusLine); refusing to remove it destructively.")
+
+    original_existed = feature.get("original_existed")
+    ownership_path = _claude_integration_ownership_path(claude_home)
+    pre_image_path = _claude_integration_pre_image_path(claude_home)
+    pre_image_ref = feature.get("pre_image_ref")
+
+    if original_existed:
+        original_sha256 = feature.get("original_sha256")
+        original_mode = feature.get("original_mode")
+        if not isinstance(pre_image_ref, str) or pre_image_ref != pre_image_path.name or not pre_image_path.exists():
+            raise ValueError("The original settings.json pre-image is missing; refusing to remove destructively without a byte-exact restoration source.")
+        pre_image_text = pre_image_path.read_text(encoding="utf-8")
+        if not isinstance(original_sha256, str) or hashlib.sha256(pre_image_text.encode("utf-8")).hexdigest() != original_sha256:
+            raise ValueError("The original settings.json pre-image failed integrity verification; refusing to remove destructively.")
+        restore_mode = stat.S_IMODE(original_mode) if isinstance(original_mode, int) else None
+        artifacts = [
+            _ClaudeIntegrationArtifact(settings, pre_image_text, mode=restore_mode),
+            _ClaudeIntegrationArtifact(ownership_path, None),
+            _ClaudeIntegrationArtifact(pre_image_path, None),
+        ]
+    else:
+        # Original settings.json did not exist: successful remove restores
+        # absence, since the current owned file already exactly matched
+        # Agentopsy's expected state (verified above).
+        artifacts = [
+            _ClaudeIntegrationArtifact(settings, None),
+            _ClaudeIntegrationArtifact(ownership_path, None),
+        ]
+        if isinstance(pre_image_ref, str) and pre_image_path.exists():
+            artifacts.append(_ClaudeIntegrationArtifact(pre_image_path, None))
+    _claude_integration_transactional_write(claude_home, artifacts)
+    return claude_integration_status(claude_home)
+
+
 def live_cli(argv: list[str]) -> Optional[int]:
-    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration"}: return None
+    if not argv or argv[0] not in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration", "runtime"}: return None
     if argv[0] == "integration":
-        parser = argparse.ArgumentParser(prog="agentopsy integration"); parser.add_argument("action", choices=["status", "install", "remove", "hook"]); parser.add_argument("provider", choices=["codex"]); parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", "~/.codex")); parser.add_argument("--state-dir")
-        args = parser.parse_args(argv[1:]); home = Path(os.path.expanduser(args.codex_home))
+        parser = argparse.ArgumentParser(prog="agentopsy integration"); parser.add_argument("action", choices=["status", "install", "remove", "hook"]); parser.add_argument("provider", choices=["codex", "claude"]); parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", "~/.codex")); parser.add_argument("--claude-home", default=os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")); parser.add_argument("--state-dir")
+        args = parser.parse_args(argv[1:])
+        if args.provider == "claude":
+            if args.action == "hook": raise ValueError("agentopsy integration hook is only defined for codex")
+            home = Path(os.path.expanduser(args.claude_home))
+            payload = claude_integration_status(home) if args.action == "status" else claude_integration_install(home, args.state_dir) if args.action == "install" else claude_integration_remove(home)
+            print(json.dumps(payload, indent=2)); return 0
+        home = Path(os.path.expanduser(args.codex_home))
         if args.action == "hook": return identity_hook_main(args.provider, args.state_dir)
         payload = integration_status(home) if args.action == "status" else integration_install_codex(home, args.state_dir) if args.action == "install" else integration_remove_codex(home)
         print(json.dumps(payload, indent=2)); return 0
+    if argv[0] == "runtime":
+        if len(argv) >= 3 and argv[1] == "bridge" and argv[2] == "claude":
+            parser = argparse.ArgumentParser(prog="agentopsy runtime bridge claude"); parser.add_argument("--state-dir")
+            args = parser.parse_args(argv[3:])
+            return claude_statusline_bridge_main(state_dir=args.state_dir)
+        if len(argv) >= 2 and argv[1] == "status":
+            parser = argparse.ArgumentParser(prog="agentopsy runtime status"); parser.add_argument("--state-dir")
+            args = parser.parse_args(argv[2:])
+            store = StateStore(args.state_dir)
+            try:
+                rows = store.db.execute("SELECT key,value FROM service_meta WHERE key LIKE 'claude_runtime:%'").fetchall()
+                snapshots = []
+                for r in rows:
+                    snap = _parse_claude_runtime_snapshot(r["value"])
+                    snapshots.append(snap if snap else {"key": r["key"], "status": "INVALID"})
+                print(json.dumps(snapshots, indent=2)); return 0
+            finally: store.close()
+        raise ValueError("usage: agentopsy runtime bridge claude | agentopsy runtime status")
     if argv[0] == "signals":
         if argv[1:] == ["--help"]:
             print("usage: agentopsy signals\n\nList the local signal registry."); return 0
@@ -3920,7 +5407,7 @@ def build_parser() -> argparse.ArgumentParser:
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
 
-            Live v0.4.2 commands:
+            Live v0.5.0 commands:
               service, health, trends, service-status, guardian, calibrate,
               insights, policy, preflight, handoff, signals, explain, integration
             """
@@ -3963,7 +5450,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # service_main directly, so route the symlinked invocation the same way.
     if Path(sys.argv[0]).name in {"agentopsyd", "agentopsyd.py"}:
         return service_main(argv)
-    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration"}:
+    if argv and argv[0] in {"service", "health", "trends", "service-status", "handoff", "signals", "explain", "calibrate", "insights", "preflight", "policy", "guardian", "integration", "runtime"}:
         try:
             return live_cli(argv)
         except SystemExit:

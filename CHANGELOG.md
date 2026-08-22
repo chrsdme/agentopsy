@@ -2,6 +2,58 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- Claude Code live runtime telemetry integration, with an `integration
+  status`/`install`/`remove` lifecycle for the status-line bridge and a new
+  `runtime status` command to inspect stored per-session snapshots.
+- A privacy-filtered status-line bridge and bounded, permission-restricted
+  runtime inbox: the bridge reads one JSON payload from stdin, whitelists a
+  bounded set of fields, and never touches SQLite, prompts, transcript
+  bodies, or tool output.
+- MAIN-session exact identity resolution (session ID + transcript path) for
+  matching runtime samples to the correct execution stream, with
+  capability/provenance-aware runtime fields throughout.
+- Model context window capacity and current input-context occupancy are
+  represented separately from the operational auto-compact window; occupancy
+  is computed from input tokens only, with output tokens tracked separately
+  and never entering occupancy.
+- Exact current-context telemetry is gated by an empirically validated set of
+  Claude Code versions/evidence, with safe null handling and normal recovery
+  across a post-compact transition.
+- An empirical, version-scoped guard treats an observed all-zero status-line
+  usage shape from Claude Code 2.1.239 as insufficient evidence for exact
+  current-context telemetry, rather than a universal zero-token rule.
+
+### Fixed
+
+- `health_events` resolution could assign the same `resolved_at` to multiple
+  unresolved events sharing provider/stream/code, violating
+  `UNIQUE(provider, stream_id, code, resolved_at)`. Resolution now assigns
+  distinct microsecond-offset timestamps per row.
+
+### Hardening
+
+- Integration ownership is proven only by an exact three-way match
+  (metadata, recorded hash, and current command hash), never by a
+  substring/text match that a foreign command could spoof.
+- Settings changes made by the integration installer/remover are
+  transactional with pre-image capture, and fail closed on any inconsistency.
+- Runtime inbox and ownership artifacts use restrictive filesystem
+  permissions.
+- Runtime input rejects malformed, duplicate-key, non-finite, type-invalid,
+  and future/pathological values before being trusted.
+
+### Known limitations
+
+- Live Claude runtime telemetry attaches to MAIN sessions only, because the
+  Claude status-line hook does not provide a separate delegated-subagent
+  runtime identity.
+- `auto_compact_window_tokens` remains intentionally unavailable in this
+  runtime integration rather than being inferred from model context size.
+
 ## [0.4.2] - 2026-08-21
 
 ### Fixed
