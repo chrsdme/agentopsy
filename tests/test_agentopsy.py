@@ -1678,6 +1678,23 @@ class ClaudeRuntimeBridgeTests(unittest.TestCase):
                 "semantic_unknown_fields_present", "semantic_unknown_context_fingerprint", "semantic_unknown_usage_fingerprint", "observed_at", "receipt_ns"})
             self.assertIsInstance(data["receipt_ns"], int)
 
+    def test_documented_remaining_percentage_is_structurally_known_but_not_consumed(self):
+        payload = _sample_statusline_payload(transcript_path="/tmp/s1.jsonl")
+        sample = asa._claude_statusline_extract(payload)
+        self.assertFalse(sample["semantic_unknown_fields_present"])
+        self.assertIn("remaining_percentage", sample["context_window_fields"])
+        self.assertNotIn("remaining_percentage", sample)  # structural recognition only
+
+    def test_remaining_percentage_is_optional_but_future_context_fields_remain_unknown(self):
+        payload = _sample_statusline_payload(transcript_path="/tmp/s1.jsonl")
+        payload["context_window"].pop("remaining_percentage")
+        self.assertFalse(asa._claude_statusline_extract(payload)["semantic_unknown_fields_present"])
+        payload["context_window"]["future_context_field"] = "must-not-persist"
+        sample = asa._claude_statusline_extract(payload)
+        self.assertTrue(sample["semantic_unknown_fields_present"])
+        self.assertNotIn("future_context_field", str(sample))
+        self.assertNotIn("must-not-persist", str(sample))
+
     def test_missing_optional_fields_still_produce_a_sample(self):
         with tempfile.TemporaryDirectory() as td:
             path = str(Path(td) / "s1.jsonl")

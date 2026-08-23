@@ -4420,7 +4420,7 @@ CLAUDE_RUNTIME_INBOX_UNRESOLVED_MAX_AGE_SECONDS = 30 * 60
 CLAUDE_RUNTIME_SEMANTIC_MAX_FINGERPRINTS_PER_PROFILE = 16
 CLAUDE_RUNTIME_SEMANTIC_STREAM_TTL_SECONDS = 30 * 24 * 60 * 60
 CLAUDE_RUNTIME_SEMANTIC_MAX_STREAMS = 2048
-_CLAUDE_RUNTIME_CONTEXT_FIELDS = frozenset({"context_window_size", "current_usage", "total_input_tokens", "total_output_tokens", "used_percentage"})
+_CLAUDE_RUNTIME_CONTEXT_FIELDS = frozenset({"context_window_size", "current_usage", "remaining_percentage", "total_input_tokens", "total_output_tokens", "used_percentage"})
 _CLAUDE_RUNTIME_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"})
 
 
