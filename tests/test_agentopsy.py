@@ -2368,14 +2368,19 @@ class ClaudeRuntimeVersionEvidenceTests(unittest.TestCase):
         store.close()
         return snap
 
-    def test_validated_version_with_complete_consistent_sample_is_exact(self):
-        with tempfile.TemporaryDirectory() as td:
-            self.assertIn("2.1.239", asa.CLAUDE_RUNTIME_EXACT_VERSIONS)
-            sample = _claude_runtime_sample("s1", str(Path(td) / "s1.jsonl"), claude_code_version="2.1.239")
-            snap = self._snapshot(td, sample)
-            self.assertEqual(snap["capability"]["current_context_input_tokens"], "EXACT")
-            self.assertEqual(snap["capability"]["model_context_occupancy_pct"], "EXACT")
-            self.assertIsNotNone(snap["current_context_input_tokens"])
+    def test_qualified_versions_with_complete_consistent_sample_are_exact(self):
+        for version in ("2.1.239", "2.1.241"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as td:
+                self.assertIn(version, asa.CLAUDE_RUNTIME_EXACT_VERSIONS)
+                sample = _claude_runtime_sample("s1", str(Path(td) / "s1.jsonl"), claude_code_version=version)
+                snap = self._snapshot(td, sample)
+                self.assertEqual(snap["capability"]["current_context_input_tokens"], "EXACT")
+                self.assertEqual(snap["capability"]["model_context_occupancy_pct"], "EXACT")
+                self.assertIsNotNone(snap["current_context_input_tokens"])
+
+    def test_2_1_240_is_not_qualified(self):
+        self.assertNotIn("2.1.240", asa.CLAUDE_RUNTIME_EXACT_VERSIONS)
+        self.assertNotIn("2.1.240", asa.CLAUDE_RUNTIME_ZERO_ONLY_UNAVAILABLE_VERSIONS)
 
     def test_arbitrary_future_version_same_values_is_observed_not_exact(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2589,7 +2594,7 @@ class ClaudeRuntimeNullUsageTests(unittest.TestCase):
             store.close()
 
     def test_zero_shape_classification_through_bridge_and_snapshot(self):
-        """Keep the A-D diagnostic matrix as the 2.1.239 zero-only regression."""
+        """Keep the A-D diagnostic matrix for every qualified zero-only version."""
         zero_usage = {
             "input_tokens": 0, "output_tokens": 0,
             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -2612,41 +2617,84 @@ class ClaudeRuntimeNullUsageTests(unittest.TestCase):
                   "exact": False, "usage_complete": False, "counters_consistent": False,
                   "reported_input_cap": "UNAVAILABLE", "reported_occupancy_cap": "UNAVAILABLE"},
         }
-        for name, expected in variants.items():
-            with self.subTest(variant=name), tempfile.TemporaryDirectory() as td:
+        for version in ("2.1.239", "2.1.241"):
+            for name, expected in variants.items():
+                with self.subTest(version=version, variant=name), tempfile.TemporaryDirectory() as td:
+                    path = str(Path(td) / "s1.jsonl")
+                    store = self._store(td); self._seed_session(store, "s1", path)
+                    payload = _sample_statusline_payload(transcript_path=path)
+                    payload["version"] = version
+                    payload["context_window"].update({
+                        "total_input_tokens": 0, "total_output_tokens": expected["total_output_tokens"],
+                        "used_percentage": expected["used_percentage"],
+                        "current_usage": expected["current_usage"],
+                    })
+                    if name in {"C", "D"}:
+                        del payload["context_window"]["current_usage"]
+                    asa.claude_statusline_bridge_main(stdin=io.BytesIO(json.dumps(payload).encode()), state_dir=td)
+                    self.assertEqual(asa.ingest_claude_runtime_inbox(store, td)["resolved"], 1)
+                    snap = json.loads(store.db.execute("SELECT value FROM service_meta WHERE key=?", (asa._claude_runtime_meta_key("s1"),)).fetchone()[0])
+                    self.assertEqual(snap["reported_total_input_tokens"], 0)
+                    self.assertEqual(snap["reported_total_output_tokens"], expected["total_output_tokens"])
+                    self.assertEqual(snap["reported_model_context_occupancy_pct"], 0.0)
+                    self.assertEqual(snap["current_context_input_tokens"], 0 if expected["exact"] else None)
+                    self.assertEqual(snap["model_context_occupancy_pct"], 0.0 if expected["exact"] else None)
+                    self.assertEqual(snap["usage_complete"], expected["usage_complete"])
+                    self.assertEqual(snap["counters_consistent"], expected["counters_consistent"])
+                    if expected["exact"]:
+                        self.assertIsNotNone(snap["last_validated_at"])
+                    else:
+                        self.assertIsNone(snap["last_validated_at"])
+                    self.assertEqual(snap["capability"]["current_context_input_tokens"], "EXACT" if expected["exact"] else "UNAVAILABLE")
+                    self.assertEqual(snap["capability"]["model_context_occupancy_pct"], "EXACT" if expected["exact"] else "UNAVAILABLE")
+                    self.assertEqual(snap["capability"]["reported_total_input_tokens"], expected["reported_input_cap"])
+                    self.assertEqual(snap["capability"]["reported_model_context_occupancy_pct"], expected["reported_occupancy_cap"])
+                    if name == "A":
+                        self.assertIsNone(snap["peak_current_context_input_tokens"])
+                        self.assertIsNone(snap["peak_model_context_occupancy_pct"])
+                        self.assertEqual(snap["model_context_window_tokens"], 1000000)
+                        self.assertEqual(snap["capability"]["model_context_window_tokens"], "EXACT")
+                    store.close()
+
+    def test_zero_only_transition_recovers_to_exact_for_qualified_versions(self):
+        zero_usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        }
+        recoveries = {
+            "2.1.239": (46856, 246, 5, {"input_tokens": 2, "output_tokens": 246,
+                                         "cache_creation_input_tokens": 46854, "cache_read_input_tokens": 0}),
+            "2.1.241": (41802, 13, 4, {"input_tokens": 2, "output_tokens": 13,
+                                         "cache_creation_input_tokens": 41800, "cache_read_input_tokens": 0}),
+        }
+        for version, (input_total, output_total, used_percentage, current_usage) in recoveries.items():
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as td:
                 path = str(Path(td) / "s1.jsonl")
                 store = self._store(td); self._seed_session(store, "s1", path)
-                payload = _sample_statusline_payload(transcript_path=path)
-                payload["context_window"].update({
-                    "total_input_tokens": 0, "total_output_tokens": expected["total_output_tokens"],
-                    "used_percentage": expected["used_percentage"],
-                    "current_usage": expected["current_usage"],
-                })
-                if name in {"C", "D"}:
-                    del payload["context_window"]["current_usage"]
-                asa.claude_statusline_bridge_main(stdin=io.BytesIO(json.dumps(payload).encode()), state_dir=td)
-                self.assertEqual(asa.ingest_claude_runtime_inbox(store, td)["resolved"], 1)
+                transition = _claude_runtime_sample("s1", path, claude_code_version=version,
+                    total_input_tokens=0, total_output_tokens=0, used_percentage=0, current_usage=zero_usage)
+                row, _ = asa.resolve_claude_runtime_sample(store, transition)
+                asa.store_claude_runtime_sample(store, row, transition, receipt_ns=1000)
+                store.db.commit()
+                transitional = json.loads(store.db.execute("SELECT value FROM service_meta WHERE key=?", (asa._claude_runtime_meta_key("s1"),)).fetchone()[0])
+                self.assertIsNone(transitional["current_context_input_tokens"])
+                self.assertIsNone(transitional["model_context_occupancy_pct"])
+                self.assertFalse(transitional["usage_complete"])
+                self.assertFalse(transitional["counters_consistent"])
+                self.assertEqual(transitional["capability"]["current_context_input_tokens"], "UNAVAILABLE")
+                self.assertEqual(transitional["capability"]["model_context_occupancy_pct"], "UNAVAILABLE")
+                recovery = _claude_runtime_sample("s1", path, claude_code_version=version,
+                    total_input_tokens=input_total, total_output_tokens=output_total,
+                    used_percentage=used_percentage, current_usage=current_usage)
+                asa.store_claude_runtime_sample(store, row, recovery, receipt_ns=2000)
+                store.db.commit()
                 snap = json.loads(store.db.execute("SELECT value FROM service_meta WHERE key=?", (asa._claude_runtime_meta_key("s1"),)).fetchone()[0])
-                self.assertEqual(snap["reported_total_input_tokens"], 0)
-                self.assertEqual(snap["reported_total_output_tokens"], expected["total_output_tokens"])
-                self.assertEqual(snap["reported_model_context_occupancy_pct"], 0.0)
-                self.assertEqual(snap["current_context_input_tokens"], 0 if expected["exact"] else None)
-                self.assertEqual(snap["model_context_occupancy_pct"], 0.0 if expected["exact"] else None)
-                self.assertEqual(snap["usage_complete"], expected["usage_complete"])
-                self.assertEqual(snap["counters_consistent"], expected["counters_consistent"])
-                if expected["exact"]:
-                    self.assertIsNotNone(snap["last_validated_at"])
-                else:
-                    self.assertIsNone(snap["last_validated_at"])
-                self.assertEqual(snap["capability"]["current_context_input_tokens"], "EXACT" if expected["exact"] else "UNAVAILABLE")
-                self.assertEqual(snap["capability"]["model_context_occupancy_pct"], "EXACT" if expected["exact"] else "UNAVAILABLE")
-                self.assertEqual(snap["capability"]["reported_total_input_tokens"], expected["reported_input_cap"])
-                self.assertEqual(snap["capability"]["reported_model_context_occupancy_pct"], expected["reported_occupancy_cap"])
-                if name == "A":
-                    self.assertIsNone(snap["peak_current_context_input_tokens"])
-                    self.assertIsNone(snap["peak_model_context_occupancy_pct"])
-                    self.assertEqual(snap["model_context_window_tokens"], 1000000)
-                    self.assertEqual(snap["capability"]["model_context_window_tokens"], "EXACT")
+                self.assertEqual(snap["current_context_input_tokens"], input_total)
+                self.assertEqual(snap["model_context_occupancy_pct"], input_total / 1000000)
+                self.assertEqual(snap["capability"]["current_context_input_tokens"], "EXACT")
+                self.assertEqual(snap["capability"]["model_context_occupancy_pct"], "EXACT")
+                self.assertTrue(snap["usage_complete"])
+                self.assertTrue(snap["counters_consistent"])
                 store.close()
 
     def test_zero_only_guard_does_not_reject_a_nonzero_usage_component(self):

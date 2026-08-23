@@ -753,7 +753,7 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.5.0` is the current maintenance candidate. It includes the
+`v0.5.1` is the current maintenance candidate. It includes the
 incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.
