@@ -665,6 +665,9 @@ agentopsy integration install claude   # install Agentopsy's bridge (refuses to
                                         # overwrite a foreign statusLine)
 agentopsy integration remove  claude   # remove only Agentopsy-owned config
 agentopsy runtime status               # inspect stored per-session snapshots
+agentopsy runtime evidence claude      # inspect privacy-safe semantic aggregates
+agentopsy runtime evidence claude --json
+agentopsy runtime evidence claude --version 2.1.241 --model claude-sonnet-5
 ```
 
 The bridge process itself only reads one JSON payload from stdin, whitelists a
@@ -677,7 +680,22 @@ values; the auto-compact window is only populated from directly trustworthy
 evidence, never inferred from model size. See `DESIGN.md` for the full data
 flow and capability semantics.
 
-For Claude Code 2.1.239 only, Agentopsy conservatively treats an empirically
+`runtime evidence claude` is an evidence journal, not a compatibility verdict.
+It aggregates only provider/version/model/window profiles, structural field-name
+fingerprints, counter-identity outcomes, and bounded transition observations.
+It never retains statusLine JSON, usage JSON, prompt/response/tool text,
+transcript bodies or paths, or session IDs in aggregate rows. Unknown versions
+are recorded but remain fail-closed: the explicit runtime qualification allowlist
+is authoritative and evidence cannot promote a version. There is no `/compact`
+attribution in this journal; zero/null transitions are observations only.
+The bounded transition cursor reports **cursor epochs observed**, not an exact
+all-time distinct-stream count: a stream that returns after cursor expiry starts
+a new epoch rather than retaining an unbounded identifier history.
+Existing local state is migrated from schema v5 to v6 automatically; this adds
+only the small aggregate/fingerprint/cursor tables and does not alter runtime
+qualification behaviour.
+
+For Claude Code 2.1.239 and 2.1.241 only, Agentopsy conservatively treats an empirically
 observed all-zero status-line usage shape as unavailable current-context
 evidence; this is not a universal Claude zero-token rule.
 
@@ -753,7 +771,7 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.5.1` is the current maintenance candidate. It includes the
+`v0.6.0` is the current feature release. It includes the
 incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.

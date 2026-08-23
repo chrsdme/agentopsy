@@ -1674,7 +1674,8 @@ class ClaudeRuntimeBridgeTests(unittest.TestCase):
             self.assertEqual(data["session_id"], "s1")
             self.assertEqual(set(data.keys()), {"format_version", "session_id", "transcript_path", "claude_code_version",
                 "model_id", "model_display_name", "context_window_size", "used_percentage", "total_input_tokens",
-                "total_output_tokens", "current_usage", "observed_at", "receipt_ns"})
+                "total_output_tokens", "current_usage", "context_window_fields", "current_usage_fields", "current_usage_kind",
+                "semantic_unknown_fields_present", "semantic_unknown_context_fingerprint", "semantic_unknown_usage_fingerprint", "observed_at", "receipt_ns"})
             self.assertIsInstance(data["receipt_ns"], int)
 
     def test_missing_optional_fields_still_produce_a_sample(self):
@@ -4155,6 +4156,125 @@ class V042RuntimeRegressionTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 metrics = asa.service_once(str(Path(td) / "state"), "claude", roots=[], notify=False)
             self.assertEqual(metrics.parse_errors, 0)
+
+
+class ClaudeRuntimeSemanticEvidenceTests(unittest.TestCase):
+    def _store(self, td): return asa.StateStore(str(Path(td) / "state"))
+    def _row(self, store, td, stream="stream-1"):
+        path = str(Path(td) / f"{stream}.jsonl")
+        store.db.execute("INSERT INTO sessions(session_id,provider,stream_id,role,path,started_at,last_activity_at) VALUES(?,?,?,?,?,?,?)", (stream, "claude", stream, "MAIN", path, "2026-08-21T20:00:00Z", "2026-08-21T20:00:00Z")); store.db.commit()
+        return store.db.execute("SELECT * FROM sessions WHERE provider='claude' AND stream_id=?", (stream,)).fetchone(), path
+
+    def test_aggregate_unknown_version_and_profile_separation(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td)
+            a = _claude_runtime_sample("stream-1", path, claude_code_version="2.1.242")
+            b = _claude_runtime_sample("stream-1", path, claude_code_version="2.1.242", model_id="claude-haiku-4.5", context_window_size=200000)
+            asa.record_claude_runtime_semantic_evidence(store, row, a, asa.time.time_ns()); asa.record_claude_runtime_semantic_evidence(store, row, b, asa.time.time_ns() + 1)
+            rows = store.db.execute("SELECT * FROM claude_runtime_semantic_evidence ORDER BY model_id").fetchall()
+            self.assertEqual(len(rows), 2); self.assertNotIn("2.1.242", asa.CLAUDE_RUNTIME_EXACT_VERSIONS)
+            self.assertEqual(rows[1]["complete_nonzero_count"], 1); self.assertEqual(rows[1]["counter_identity_pass"], 1)
+            store.close()
+
+    def test_zero_null_recovery_transitions_and_privacy(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); base = asa.time.time_ns()
+            normal = _claude_runtime_sample("stream-1", path, context_window_fields=["context_window_size", "current_usage", "total_input_tokens", "used_percentage"], current_usage_fields=["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"], current_usage_kind="object")
+            zero = _claude_runtime_sample("stream-1", path, total_input_tokens=0, total_output_tokens=0, used_percentage=0, current_usage={"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}, context_window_fields=["context_window_size", "current_usage", "total_input_tokens"], current_usage_fields=["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"], current_usage_kind="object")
+            null = _claude_runtime_sample("stream-1", path, current_usage=None, current_usage_kind="null", context_window_fields=["current_usage"], current_usage_fields=[])
+            for i, sample in enumerate((normal, zero, normal, null, normal)): asa.record_claude_runtime_semantic_evidence(store, row, sample, base + i * 1_000_000_000)
+            evidence = store.db.execute("SELECT * FROM claude_runtime_semantic_evidence").fetchone()
+            self.assertEqual((evidence["normal_to_zero"], evidence["zero_to_normal"], evidence["normal_to_null"], evidence["null_to_normal"]), (1, 1, 1, 1))
+            persisted = " ".join(str(x) for r in store.db.execute("SELECT * FROM claude_runtime_semantic_evidence").fetchall() for x in r)
+            persisted += " " + " ".join(str(x) for r in store.db.execute("SELECT * FROM claude_runtime_semantic_fingerprints").fetchall() for x in r)
+            for secret in ("stream-1", path, "prompt text", "tool output", "assistant response"): self.assertNotIn(secret, persisted)
+            store.close()
+
+    def test_fingerprint_bound_and_cli_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); base = asa.time.time_ns()
+            for i in range(asa.CLAUDE_RUNTIME_SEMANTIC_MAX_FINGERPRINTS_PER_PROFILE + 3):
+                sample = _claude_runtime_sample("stream-1", path, context_window_fields=["context_window_size", f"future_{i}"], current_usage_fields=[], current_usage_kind="missing")
+                asa.record_claude_runtime_semantic_evidence(store, row, sample, base + i)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM claude_runtime_semantic_fingerprints").fetchone()[0], asa.CLAUDE_RUNTIME_SEMANTIC_MAX_FINGERPRINTS_PER_PROFILE)
+            payload = asa.claude_runtime_semantic_evidence(store)
+            self.assertTrue(payload["evidence_only"]); self.assertIn("Samples", asa.render_claude_runtime_semantic_evidence(payload))
+            store.close()
+
+    def test_v5_copy_upgrade_is_idempotent_and_cli_json_is_read_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"; state.mkdir(); db = sqlite3.connect(state / "agentopsy.db")
+            db.execute("CREATE TABLE service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("INSERT INTO service_meta VALUES('schema_version','5')"); db.commit(); db.close()
+            store = asa.StateStore(str(state)); self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], "6"); store.close()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out): self.assertEqual(asa.live_cli(["runtime", "evidence", "claude", "--state-dir", str(state), "--json"]), 0)
+            self.assertTrue(json.loads(out.getvalue())["evidence_only"])
+
+    def test_replay_receipt_is_not_counted_twice_after_pre_unlink_crash_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); sample = _claude_runtime_sample("stream-1", path); receipt = asa.time.time_ns()
+            with store.db:
+                self.assertTrue(asa.store_claude_runtime_sample(store, row, sample, receipt_ns=receipt)); asa.record_claude_runtime_semantic_evidence(store, row, sample, receipt)
+            # Simulate process death before unlink: the identical inbox file is retried.
+            with store.db:
+                self.assertFalse(asa.store_claude_runtime_sample(store, row, sample, receipt_ns=receipt))
+            self.assertEqual(store.db.execute("SELECT samples_total FROM claude_runtime_semantic_evidence").fetchone()[0], 1); store.close()
+
+    def test_profile_boundary_reseeds_transition_cursor(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); base = asa.time.time_ns()
+            zero_usage = {"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+            # Version, model, and window changes each deliberately reseed.
+            cases = [({"claude_code_version":"2.1.242"}), ({"model_id":"claude-haiku-4.5", "context_window_size":200000}), ({"context_window_size":200000})]
+            for i, change in enumerate(cases):
+                asa.record_claude_runtime_semantic_evidence(store, row, _claude_runtime_sample("stream-1", path), base + i * 10)
+                asa.record_claude_runtime_semantic_evidence(store, row, _claude_runtime_sample("stream-1", path, **change, total_input_tokens=0, total_output_tokens=0, used_percentage=0, current_usage=zero_usage), base + i * 10 + 1)
+            self.assertEqual(store.db.execute("SELECT sum(normal_to_zero) FROM claude_runtime_semantic_evidence").fetchone()[0], 0)
+            store.close()
+
+    def test_unknown_names_are_opaque_but_fingerprint_discriminating_and_stable(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); base = asa.time.time_ns()
+            def sample(names): return _claude_runtime_sample("stream-1", path, context_window_fields=["context_window_size", *names], current_usage_fields=[])
+            asa.record_claude_runtime_semantic_evidence(store, row, sample(["future_a"]), base)
+            asa.record_claude_runtime_semantic_evidence(store, row, sample(["future_b"]), base + 1)
+            asa.record_claude_runtime_semantic_evidence(store, row, sample(["future_b", "future_a"]), base + 2)
+            asa.record_claude_runtime_semantic_evidence(store, row, sample(["future_a", "future_b"]), base + 3)
+            fps = store.db.execute("SELECT context_window_fingerprint,count,context_window_fields FROM claude_runtime_semantic_fingerprints ORDER BY context_window_fingerprint").fetchall()
+            self.assertEqual(len(fps), 3); self.assertIn(2, [r["count"] for r in fps])
+            persisted = " ".join(str(x) for r in fps for x in r)
+            for secret in ("future_a", "future_b"): self.assertNotIn(secret, persisted)
+            store.close()
+
+    def test_cursor_epoch_count_is_explicitly_not_distinct_stream_count_after_eviction(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td); sample = _claude_runtime_sample("stream-1", path); base = asa.time.time_ns()
+            asa.record_claude_runtime_semantic_evidence(store, row, sample, base)
+            store.db.execute("DELETE FROM claude_runtime_semantic_streams")
+            asa.record_claude_runtime_semantic_evidence(store, row, sample, base + 1)
+            self.assertEqual(store.db.execute("SELECT stream_cursor_epochs_seen FROM claude_runtime_semantic_evidence").fetchone()[0], 2); store.close()
+
+    def test_qualified_zero_shape_is_journaled_before_capability_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self._store(td); row, path = self._row(store, td)
+            zero = _claude_runtime_sample("stream-1", path, claude_code_version="2.1.241", total_input_tokens=0, total_output_tokens=0, used_percentage=0, current_usage={"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0})
+            asa.record_claude_runtime_semantic_evidence(store, row, zero, asa.time.time_ns())
+            self.assertEqual(store.db.execute("SELECT complete_all_zero_count FROM claude_runtime_semantic_evidence").fetchone()[0], 1)
+            derived = asa._claude_runtime_derive(zero); self.assertFalse(derived["usage_complete"]); self.assertIsNone(derived["current_context_input_tokens"])
+            store.close()
+
+    def test_two_independent_sqlite_connections_preserve_counts_and_integrity(self):
+        with tempfile.TemporaryDirectory() as td:
+            store1 = self._store(td); row1, path = self._row(store1, td); store2 = asa.StateStore(str(Path(td) / "state"))
+            row2 = store2.db.execute("SELECT * FROM sessions WHERE provider='claude' AND stream_id='stream-1'").fetchone(); base = asa.time.time_ns()
+            with store1.db:
+                store1.db.execute("BEGIN IMMEDIATE"); asa.record_claude_runtime_semantic_evidence(store1, row1, _claude_runtime_sample("stream-1", path), base)
+            with store2.db:
+                store2.db.execute("BEGIN IMMEDIATE"); asa.record_claude_runtime_semantic_evidence(store2, row2, _claude_runtime_sample("stream-1", path), base + 1)
+            self.assertEqual(store1.db.execute("SELECT samples_total FROM claude_runtime_semantic_evidence").fetchone()[0], 2)
+            self.assertEqual(store1.db.execute("PRAGMA integrity_check").fetchone()[0], "ok"); self.assertEqual(store1.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            store2.close(); store1.close()
 
 
 if __name__ == "__main__":

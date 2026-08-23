@@ -2,6 +2,35 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.6.0] - 2026-08-23
+
+### Added
+
+- Privacy-safe Claude runtime semantic evidence journal. Resolved status-line
+  samples contribute aggregate evidence before their runtime inbox file is
+  deleted, keyed by provider, Claude Code version, model, and context window.
+- Structural usage-shape, counter-identity, window/numeric/percentage, and
+  field-set evidence. Unknown fields are detectable through opaque structural
+  fingerprints without retaining their names or values.
+- Bounded transition observations with profile-boundary isolation and bounded,
+  hashed stream cursor epochs. Observations are not `/compact` attribution.
+- Replay-safe ingestion and concurrency-safe SQLite UPSERT aggregation.
+- Read-only inspection command: `agentopsy runtime evidence claude` (with
+  `--version`, `--model`, and `--json`).
+
+### Changed
+
+- SQLite schema 5 -> 6 for the durable semantic evidence tables. Parser and
+  Claude runtime interchange format versions are unchanged.
+
+### Privacy and compatibility
+
+- No raw prompts, responses, tool output, statusLine payloads, transcript
+  bodies, or raw usage JSON are persisted by the journal. Unknown and
+  unqualified versions may accumulate neutral evidence but remain fail-closed;
+  explicit qualification rules are unchanged. In particular, 2.1.240 remains
+  unqualified and no automatic compatibility inference is performed.
+
 ## [0.5.1] - 2026-08-23
 
 ### Fixed
