@@ -49,7 +49,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 PARSER_VERSION = 1
 SCHEMA_VERSION = 5
 IDENTITY_TTL_SECONDS = 15 * 60
@@ -3387,15 +3387,15 @@ CLAUDE_RUNTIME_STDIN_MAX_BYTES = 65_536
 # the mistake this guards against -- a later release can silently regress the
 # semantics this feature depends on). An unvalidated version can still supply
 # useful OBSERVED telemetry; it can never be promoted to EXACT.
-CLAUDE_RUNTIME_EXACT_VERSIONS = {"2.1.239"}
+CLAUDE_RUNTIME_EXACT_VERSIONS = {"2.1.239", "2.1.241"}
 
-# Claude Code 2.1.239 has also emitted one empirically observed status-line
-# shape that looks arithmetically complete but does not represent backed
-# current-usage telemetry: every current-usage component, both totals, and
-# used_percentage are zero. This is deliberately a narrow compatibility quirk,
-# not a general "zero tokens are unavailable" rule and not an assumption about
-# newer versions.
-CLAUDE_RUNTIME_ZERO_ONLY_UNAVAILABLE_VERSIONS = {"2.1.239"}
+# Claude Code 2.1.239 and 2.1.241 have also emitted one empirically observed
+# status-line shape that looks arithmetically complete but does not represent
+# backed current-usage telemetry: every current-usage component, both totals,
+# and used_percentage are zero. This is deliberately a narrow compatibility
+# quirk, not a general "zero tokens are unavailable" rule and not an
+# assumption about newer versions.
+CLAUDE_RUNTIME_ZERO_ONLY_UNAVAILABLE_VERSIONS = {"2.1.239", "2.1.241"}
 
 
 def _claude_runtime_inbox_dir(state_dir: Optional[str] = None) -> Path:
@@ -5407,7 +5407,7 @@ def build_parser() -> argparse.ArgumentParser:
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
 
-            Live v0.5.0 commands:
+            Live v0.5.1 commands:
               service, health, trends, service-status, guardian, calibrate,
               insights, policy, preflight, handoff, signals, explain, integration
             """

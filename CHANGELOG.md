@@ -2,6 +2,18 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [0.5.1] - 2026-08-23
+
+### Fixed
+
+- Explicitly empirically qualified Claude Code 2.1.241 for `EXACT` live
+  runtime telemetry. It reproduces the structurally complete all-zero
+  post-`/compact` transition observed on 2.1.239, so it is included in both
+  the exact-qualification set and the zero-transition compatibility guard.
+  Claude Code 2.1.240 remains unqualified because it has not completed the
+  controlled empirical qualification sequence. No schema, parser, or runtime
+  format changes were made.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added
