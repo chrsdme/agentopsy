@@ -49,9 +49,9 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 PARSER_VERSION = 1
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 IDENTITY_TTL_SECONDS = 15 * 60
 
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -2721,7 +2721,7 @@ class StateStore:
             self.db.commit()
 
     def _migration_steps(self) -> tuple[tuple[int, Any], ...]:
-        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3), (4, self._migration_v4), (5, self._migration_v5))
+        return ((1, self._migration_v1), (2, self._migration_v2), (3, self._migration_v3), (4, self._migration_v4), (5, self._migration_v5), (6, self._migration_v6))
 
     def _migration_v1(self) -> None:
         self.db.executescript("""
@@ -2840,6 +2840,45 @@ class StateStore:
         self.db.execute("DELETE FROM service_meta WHERE key IN ('calibration_profile','last_successful_scan')")
         if getattr(self, "_migration_origin_version", 0) >= 4:
             self.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES('v5_rebuild_state','required')")
+
+    def _migration_v6(self) -> None:
+        """Privacy-safe Claude runtime semantic aggregates; never raw samples."""
+        self.db.executescript("""
+            CREATE TABLE claude_runtime_semantic_evidence (
+              provider TEXT NOT NULL, claude_code_version TEXT NOT NULL,
+              model_id TEXT NOT NULL, model_context_window_tokens INTEGER NOT NULL,
+              first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+              samples_total INTEGER NOT NULL DEFAULT 0, stream_cursor_epochs_seen INTEGER NOT NULL DEFAULT 0,
+              complete_nonzero_count INTEGER NOT NULL DEFAULT 0, complete_all_zero_count INTEGER NOT NULL DEFAULT 0,
+              current_usage_null_count INTEGER NOT NULL DEFAULT 0, current_usage_missing_count INTEGER NOT NULL DEFAULT 0,
+              partial_usage_count INTEGER NOT NULL DEFAULT 0, invalid_count INTEGER NOT NULL DEFAULT 0,
+              counter_identity_testable INTEGER NOT NULL DEFAULT 0, counter_identity_pass INTEGER NOT NULL DEFAULT 0, counter_identity_fail INTEGER NOT NULL DEFAULT 0,
+              window_present_count INTEGER NOT NULL DEFAULT 0, window_missing_count INTEGER NOT NULL DEFAULT 0, window_invalid_count INTEGER NOT NULL DEFAULT 0,
+              numeric_valid_count INTEGER NOT NULL DEFAULT 0, numeric_invalid_count INTEGER NOT NULL DEFAULT 0,
+              percentage_present_count INTEGER NOT NULL DEFAULT 0, percentage_missing_count INTEGER NOT NULL DEFAULT 0,
+              percentage_valid_type_count INTEGER NOT NULL DEFAULT 0, percentage_invalid_type_count INTEGER NOT NULL DEFAULT 0,
+              unknown_field_occurrence_count INTEGER NOT NULL DEFAULT 0, contradiction_count INTEGER NOT NULL DEFAULT 0,
+              normal_to_zero INTEGER NOT NULL DEFAULT 0, normal_to_null INTEGER NOT NULL DEFAULT 0,
+              zero_to_normal INTEGER NOT NULL DEFAULT 0, null_to_normal INTEGER NOT NULL DEFAULT 0,
+              zero_to_zero INTEGER NOT NULL DEFAULT 0, null_to_null INTEGER NOT NULL DEFAULT 0,
+              transition_without_recovery INTEGER NOT NULL DEFAULT 0,
+              recovery_le_5s INTEGER NOT NULL DEFAULT 0, recovery_le_30s INTEGER NOT NULL DEFAULT 0,
+              recovery_le_2m INTEGER NOT NULL DEFAULT 0, recovery_gt_2m INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(provider,claude_code_version,model_id,model_context_window_tokens)
+            );
+            CREATE TABLE claude_runtime_semantic_fingerprints (
+              provider TEXT NOT NULL, claude_code_version TEXT NOT NULL, model_id TEXT NOT NULL, model_context_window_tokens INTEGER NOT NULL,
+              context_window_fingerprint TEXT NOT NULL, current_usage_fingerprint TEXT NOT NULL,
+              context_window_fields TEXT NOT NULL, current_usage_fields TEXT NOT NULL, unknown_fields_present INTEGER NOT NULL,
+              count INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+              PRIMARY KEY(provider,claude_code_version,model_id,model_context_window_tokens,context_window_fingerprint,current_usage_fingerprint)
+            );
+            CREATE TABLE claude_runtime_semantic_streams (
+              stream_hash TEXT PRIMARY KEY, previous_state TEXT NOT NULL, previous_receipt_ns INTEGER NOT NULL,
+              provider TEXT NOT NULL, claude_code_version TEXT NOT NULL, model_id TEXT NOT NULL, model_context_window_tokens INTEGER NOT NULL,
+              last_seen TEXT NOT NULL
+            );
+        """)
 
     def record_identity_lifecycle(self, provider: str, native_session_id: str, event: str, source: str = "") -> None:
         if provider != "codex" or not native_session_id or event not in {"SessionStart", "PreCompact", "PostCompact"}:
@@ -3505,6 +3544,11 @@ def _claude_runtime_bounded_percentage(value: Any) -> Optional[int]:
     return value if 0 <= value <= 100 else None
 
 
+def _claude_runtime_name_fingerprint(names: Iterable[str]) -> str:
+    """Opaque structural discriminator: names are hashed before the inbox."""
+    return hashlib.sha256("\x00".join(sorted(set(names))).encode("utf-8")).hexdigest()
+
+
 def _claude_statusline_extract(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Whitelist bounded runtime telemetry only. No prompts/transcripts/tool output/source code."""
     if not isinstance(payload, dict):
@@ -3522,6 +3566,18 @@ def _claude_statusline_extract(payload: dict[str, Any]) -> Optional[dict[str, An
     model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
     ctx = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
     current_usage = ctx.get("current_usage") if isinstance(ctx.get("current_usage"), dict) else {}
+    # Names only: this is structural evidence, not payload retention.  The
+    # bounded bridge inbox carries these names so ingestion can fingerprint a
+    # provider shape after the original statusLine has been discarded.
+    # Do not retain unknown provider *names*: a field name itself can be
+    # sensitive. Keep only the fixed relevant names and one boolean proving a
+    # structural extension occurred.
+    ctx_fields = sorted(k for k in ctx if k in _CLAUDE_RUNTIME_CONTEXT_FIELDS)
+    usage_fields = sorted(k for k in current_usage if k in _CLAUDE_RUNTIME_USAGE_FIELDS)
+    unknown_context_names = set(ctx) - _CLAUDE_RUNTIME_CONTEXT_FIELDS
+    unknown_usage_names = set(current_usage) - _CLAUDE_RUNTIME_USAGE_FIELDS
+    unknown_fields_present = bool(unknown_context_names or unknown_usage_names)
+    usage_kind = "object" if isinstance(ctx.get("current_usage"), dict) else "null" if ctx.get("current_usage") is None and "current_usage" in ctx else "missing" if "current_usage" not in ctx else "other"
     _bounded_int = _claude_runtime_bounded_int
 
     # A present-but-invalid used_percentage is nulled out here, not treated as
@@ -3549,6 +3605,12 @@ def _claude_statusline_extract(payload: dict[str, Any]) -> Optional[dict[str, An
             "cache_creation_input_tokens": _bounded_int(current_usage.get("cache_creation_input_tokens")),
             "cache_read_input_tokens": _bounded_int(current_usage.get("cache_read_input_tokens")),
         } if current_usage else None,
+        "context_window_fields": ctx_fields,
+        "current_usage_fields": usage_fields,
+        "current_usage_kind": usage_kind,
+        "semantic_unknown_fields_present": unknown_fields_present,
+        "semantic_unknown_context_fingerprint": _claude_runtime_name_fingerprint(unknown_context_names),
+        "semantic_unknown_usage_fingerprint": _claude_runtime_name_fingerprint(unknown_usage_names),
         # Retained only as an untrusted display hint; latest-wins ordering must
         # never depend on this -- see receipt_ns, generated locally below.
         "observed_at": _identity_now().isoformat(),
@@ -3646,6 +3708,19 @@ def _claude_runtime_inbox_extract(payload: Any, *, max_receipt_ns: Optional[int]
     # whole observation; CR3-01's EXACT gate already requires a directly-
     # valid, reconciling used_percentage.
     used_percentage = _claude_runtime_bounded_percentage(payload.get("used_percentage"))
+    def safe_names(value: Any) -> list[str]:
+        if not isinstance(value, list) or len(value) > 32 or not all(isinstance(x, str) and 0 < len(x) <= 128 for x in value):
+            return []
+        return sorted(set(value))
+    context_window_fields = safe_names(payload.get("context_window_fields"))
+    current_usage_fields = safe_names(payload.get("current_usage_fields"))
+    usage_kind = payload.get("current_usage_kind")
+    if usage_kind not in {"object", "null", "missing", "other"}:
+        usage_kind = "object" if isinstance(current_usage, dict) else "null"
+    unknown_fields_present = payload.get("semantic_unknown_fields_present")
+    if type(unknown_fields_present) is not bool: unknown_fields_present = False
+    def safe_fingerprint(value: Any) -> str:
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else _claude_runtime_name_fingerprint(())
 
     return {
         "format_version": CLAUDE_RUNTIME_FORMAT_VERSION,
@@ -3665,6 +3740,12 @@ def _claude_runtime_inbox_extract(payload: Any, *, max_receipt_ns: Optional[int]
             "cache_creation_input_tokens": _bounded_int(current_usage.get("cache_creation_input_tokens")),
             "cache_read_input_tokens": _bounded_int(current_usage.get("cache_read_input_tokens")),
         } if isinstance(current_usage, dict) else None,
+        "context_window_fields": context_window_fields,
+        "current_usage_fields": current_usage_fields,
+        "current_usage_kind": usage_kind,
+        "semantic_unknown_fields_present": unknown_fields_present,
+        "semantic_unknown_context_fingerprint": safe_fingerprint(payload.get("semantic_unknown_context_fingerprint")),
+        "semantic_unknown_usage_fingerprint": safe_fingerprint(payload.get("semantic_unknown_usage_fingerprint")),
         # Untrusted display hint only -- never used for ordering.
         "observed_at": str(payload.get("observed_at") or "")[:64] or None,
     }
@@ -4247,7 +4328,7 @@ def _parse_claude_runtime_snapshot(raw_value: Optional[str]) -> dict[str, Any]:
     return value
 
 
-def store_claude_runtime_sample(store: StateStore, row: sqlite3.Row, sample: dict[str, Any], *, receipt_ns: Optional[int] = None) -> None:
+def store_claude_runtime_sample(store: StateStore, row: sqlite3.Row, sample: dict[str, Any], *, receipt_ns: Optional[int] = None) -> bool:
     """Merge one resolved runtime sample into the bounded per-stream service_meta
     snapshot. Latest-observation-wins uses the caller-supplied trusted receipt
     (never the incoming payload's own observed_at). Peak fields only advance
@@ -4266,12 +4347,12 @@ def store_claude_runtime_sample(store: StateStore, row: sqlite3.Row, sample: dic
     # (CR2-03) -- a caller-supplied bool/float/string/negative/future receipt
     # must never be persisted or participate in ordering.
     if type(receipt_ns) is not int or receipt_ns < 0:
-        return
+        return False
     max_receipt_ns = time.time_ns() + CLAUDE_RUNTIME_INBOX_MAX_FUTURE_SKEW_SECONDS * 1_000_000_000
     if receipt_ns > max_receipt_ns:
-        return
-    if isinstance(existing.get("receipt_ns"), int) and receipt_ns < existing["receipt_ns"]:
-        return  # an older receipt cannot replace a newer current snapshot
+        return False
+    if isinstance(existing.get("receipt_ns"), int) and receipt_ns <= existing["receipt_ns"]:
+        return False  # equal receipt is an inbox crash replay, not new evidence
     derived = _claude_runtime_derive(sample)
     regime = [sample.get("model_id"), derived.get("model_context_window_tokens")]
     existing_regime = existing.get("regime")
@@ -4332,9 +4413,99 @@ def store_claude_runtime_sample(store: StateStore, row: sqlite3.Row, sample: dic
         ],
     }
     store.db.execute("INSERT OR REPLACE INTO service_meta(key,value) VALUES(?,?)", (key, json.dumps(snapshot, sort_keys=True)))
+    return True
 
 
 CLAUDE_RUNTIME_INBOX_UNRESOLVED_MAX_AGE_SECONDS = 30 * 60
+CLAUDE_RUNTIME_SEMANTIC_MAX_FINGERPRINTS_PER_PROFILE = 16
+CLAUDE_RUNTIME_SEMANTIC_STREAM_TTL_SECONDS = 30 * 24 * 60 * 60
+CLAUDE_RUNTIME_SEMANTIC_MAX_STREAMS = 2048
+_CLAUDE_RUNTIME_CONTEXT_FIELDS = frozenset({"context_window_size", "current_usage", "total_input_tokens", "total_output_tokens", "used_percentage"})
+_CLAUDE_RUNTIME_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"})
+
+
+def _claude_runtime_semantic_profile(sample: dict[str, Any]) -> tuple[str, str, str, int]:
+    window = sample.get("context_window_size")
+    return ("claude", str(sample.get("claude_code_version") or "")[:64], str(sample.get("model_id") or "")[:128], window if _claude_runtime_bounded_int(window) is not None else -1)
+
+
+def _claude_runtime_semantic_fingerprint(names: list[str], unknown_fingerprint: str) -> tuple[str, str]:
+    canonical = ",".join(sorted(set(names)))
+    # The opaque unknown-name digest distinguishes provider shapes without
+    # persisting those names. It is part of the digest input, never the list.
+    return hashlib.sha256((canonical + "\x00unknown:" + unknown_fingerprint).encode("utf-8")).hexdigest(), canonical
+
+
+def _claude_runtime_semantic_facts(sample: dict[str, Any]) -> dict[str, Any]:
+    """Classify orthogonal facts. Invalidity wins only its own counters; it
+    does not erase independently useful null/missing/field-shape evidence."""
+    raw_ctx_names = sample.get("context_window_fields") if isinstance(sample.get("context_window_fields"), list) else []
+    raw_usage_names = sample.get("current_usage_fields") if isinstance(sample.get("current_usage_fields"), list) else []
+    ctx_unknown_names = set(raw_ctx_names) - _CLAUDE_RUNTIME_CONTEXT_FIELDS
+    usage_unknown_names = set(raw_usage_names) - _CLAUDE_RUNTIME_USAGE_FIELDS
+    ctx_names = sorted(set(raw_ctx_names) & _CLAUDE_RUNTIME_CONTEXT_FIELDS)
+    usage_names = sorted(set(raw_usage_names) & _CLAUDE_RUNTIME_USAGE_FIELDS)
+    kind = sample.get("current_usage_kind") if sample.get("current_usage_kind") in {"object", "null", "missing", "other"} else ("object" if isinstance(sample.get("current_usage"), dict) else "null")
+    usage = sample.get("current_usage") if isinstance(sample.get("current_usage"), dict) else {}
+    required = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    usage_complete = kind == "object" and all(_claude_runtime_bounded_int(usage.get(k)) is not None for k in required)
+    all_zero = usage_complete and all(usage[k] == 0 for k in required) and sample.get("total_input_tokens") == 0
+    nonzero = usage_complete and not all_zero
+    window_field_present = "context_window_size" in ctx_names or (not ctx_names and sample.get("context_window_size") is not None)
+    window_valid = _claude_runtime_bounded_int(sample.get("context_window_size")) is not None
+    numeric_keys = ("context_window_size", "total_input_tokens", "total_output_tokens")
+    numeric_invalid = any(k in ctx_names and _claude_runtime_bounded_int(sample.get(k)) is None for k in numeric_keys) or any(k in usage_names and _claude_runtime_bounded_int(usage.get(k)) is None for k in required)
+    percentage_present = "used_percentage" in ctx_names or (not ctx_names and sample.get("used_percentage") is not None)
+    percentage_valid = _claude_runtime_bounded_percentage(sample.get("used_percentage")) is not None
+    operands = (sample.get("total_input_tokens"), usage.get("input_tokens"), usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"))
+    identity_testable = all(_claude_runtime_bounded_int(v) is not None for v in operands)
+    identity_pass = identity_testable and operands[0] == operands[1] + operands[2] + operands[3]
+    ctx_unknown_fp = sample.get("semantic_unknown_context_fingerprint") if isinstance(sample.get("semantic_unknown_context_fingerprint"), str) else _claude_runtime_name_fingerprint(ctx_unknown_names)
+    usage_unknown_fp = sample.get("semantic_unknown_usage_fingerprint") if isinstance(sample.get("semantic_unknown_usage_fingerprint"), str) else _claude_runtime_name_fingerprint(usage_unknown_names)
+    unknown = bool(sample.get("semantic_unknown_fields_present")) or bool(ctx_unknown_names or usage_unknown_names)
+    state = "NORMAL" if nonzero else "ZERO" if all_zero else "NULL" if kind == "null" else "OTHER"
+    return {"complete_nonzero": nonzero, "complete_all_zero": all_zero, "usage_null": kind == "null", "usage_missing": kind == "missing", "partial": kind == "object" and not usage_complete,
+            "invalid": numeric_invalid or kind == "other", "identity_testable": identity_testable, "identity_pass": identity_pass,
+            "window_present": window_valid, "window_missing": not window_field_present, "window_invalid": window_field_present and not window_valid,
+            "numeric_valid": not numeric_invalid, "numeric_invalid": numeric_invalid, "percentage_present": percentage_present,
+            "percentage_valid": percentage_valid, "unknown": unknown, "state": state, "ctx_names": ctx_names, "usage_names": usage_names, "ctx_unknown_fp": ctx_unknown_fp, "usage_unknown_fp": usage_unknown_fp,
+            "contradiction": (identity_testable and not identity_pass) or numeric_invalid or kind == "other"}
+
+
+def record_claude_runtime_semantic_evidence(store: StateStore, row: sqlite3.Row, sample: dict[str, Any], receipt_ns: int) -> None:
+    """Update durable aggregate evidence. This function has no return value and
+    is deliberately never consulted by runtime derivation or qualification."""
+    profile = _claude_runtime_semantic_profile(sample); facts = _claude_runtime_semantic_facts(sample)
+    now = dt.datetime.fromtimestamp(receipt_ns / 1_000_000_000, dt.timezone.utc).isoformat()
+    cols = ("complete_nonzero_count", "complete_all_zero_count", "current_usage_null_count", "current_usage_missing_count", "partial_usage_count", "invalid_count", "counter_identity_testable", "counter_identity_pass", "counter_identity_fail", "window_present_count", "window_missing_count", "window_invalid_count", "numeric_valid_count", "numeric_invalid_count", "percentage_present_count", "percentage_missing_count", "percentage_valid_type_count", "percentage_invalid_type_count", "unknown_field_occurrence_count", "contradiction_count")
+    inc = dict.fromkeys(cols, 0)
+    inc.update(complete_nonzero_count=int(facts["complete_nonzero"]), complete_all_zero_count=int(facts["complete_all_zero"]), current_usage_null_count=int(facts["usage_null"]), current_usage_missing_count=int(facts["usage_missing"]), partial_usage_count=int(facts["partial"]), invalid_count=int(facts["invalid"]), counter_identity_testable=int(facts["identity_testable"]), counter_identity_pass=int(facts["identity_pass"]), counter_identity_fail=int(facts["identity_testable"] and not facts["identity_pass"]), window_present_count=int(facts["window_present"]), window_missing_count=int(facts["window_missing"]), window_invalid_count=int(facts["window_invalid"]), numeric_valid_count=int(facts["numeric_valid"]), numeric_invalid_count=int(facts["numeric_invalid"]), percentage_present_count=int(facts["percentage_present"]), percentage_missing_count=int(not facts["percentage_present"]), percentage_valid_type_count=int(facts["percentage_present"] and facts["percentage_valid"]), percentage_invalid_type_count=int(facts["percentage_present"] and not facts["percentage_valid"]), unknown_field_occurrence_count=int(facts["unknown"]), contradiction_count=int(facts["contradiction"]))
+    names = ["provider", "claude_code_version", "model_id", "model_context_window_tokens", "first_seen", "last_seen", "samples_total"] + list(inc)
+    values = list(profile) + [now, now, 1] + [inc[n] for n in inc]
+    store.db.execute(f"INSERT INTO claude_runtime_semantic_evidence({','.join(names)}) VALUES({','.join('?' for _ in names)}) ON CONFLICT(provider,claude_code_version,model_id,model_context_window_tokens) DO UPDATE SET last_seen=excluded.last_seen,samples_total=samples_total+1," + ",".join(f"{k}={k}+excluded.{k}" for k in inc), values)
+    ctx_fp, ctx_list = _claude_runtime_semantic_fingerprint(facts["ctx_names"], facts["ctx_unknown_fp"]); usage_fp, usage_list = _claude_runtime_semantic_fingerprint(facts["usage_names"], facts["usage_unknown_fp"])
+    fp_key = profile + (ctx_fp, usage_fp)
+    fp = store.db.execute("SELECT 1 FROM claude_runtime_semantic_fingerprints WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=? AND context_window_fingerprint=? AND current_usage_fingerprint=?", fp_key).fetchone()
+    if fp or store.db.execute("SELECT count(*) FROM claude_runtime_semantic_fingerprints WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", profile).fetchone()[0] < CLAUDE_RUNTIME_SEMANTIC_MAX_FINGERPRINTS_PER_PROFILE:
+        store.db.execute("INSERT INTO claude_runtime_semantic_fingerprints(provider,claude_code_version,model_id,model_context_window_tokens,context_window_fingerprint,current_usage_fingerprint,context_window_fields,current_usage_fields,unknown_fields_present,count,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,claude_code_version,model_id,model_context_window_tokens,context_window_fingerprint,current_usage_fingerprint) DO UPDATE SET count=count+1,last_seen=excluded.last_seen", fp_key + (ctx_list, usage_list, int(facts["unknown"]), 1, now, now))
+    stream_hash = hashlib.sha256(str(row["stream_id"]).encode("utf-8")).hexdigest()
+    prior = store.db.execute("SELECT previous_state,previous_receipt_ns,provider,claude_code_version,model_id,model_context_window_tokens FROM claude_runtime_semantic_streams WHERE stream_hash=?", (stream_hash,)).fetchone()
+    if prior is None or tuple(prior[k] for k in ("provider", "claude_code_version", "model_id", "model_context_window_tokens")) != profile:
+        store.db.execute("UPDATE claude_runtime_semantic_evidence SET stream_cursor_epochs_seen=stream_cursor_epochs_seen+1 WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", profile)
+    else:
+        transition = {("NORMAL", "ZERO"): "normal_to_zero", ("NORMAL", "NULL"): "normal_to_null", ("ZERO", "NORMAL"): "zero_to_normal", ("NULL", "NORMAL"): "null_to_normal", ("ZERO", "ZERO"): "zero_to_zero", ("NULL", "NULL"): "null_to_null"}.get((prior["previous_state"], facts["state"]))
+        if transition:
+            store.db.execute(f"UPDATE claude_runtime_semantic_evidence SET {transition}={transition}+1 WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", profile)
+            if transition in {"normal_to_zero", "normal_to_null"}: store.db.execute("UPDATE claude_runtime_semantic_evidence SET transition_without_recovery=transition_without_recovery+1 WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", profile)
+            if transition in {"zero_to_normal", "null_to_normal"}:
+                prior_profile = tuple(prior[k] for k in ("provider", "claude_code_version", "model_id", "model_context_window_tokens"))
+                store.db.execute("UPDATE claude_runtime_semantic_evidence SET transition_without_recovery=MAX(0,transition_without_recovery-1) WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", prior_profile)
+                elapsed = max(0, receipt_ns - prior["previous_receipt_ns"]) / 1_000_000_000; bucket = "recovery_le_5s" if elapsed <= 5 else "recovery_le_30s" if elapsed <= 30 else "recovery_le_2m" if elapsed <= 120 else "recovery_gt_2m"
+                store.db.execute(f"UPDATE claude_runtime_semantic_evidence SET {bucket}={bucket}+1 WHERE provider=? AND claude_code_version=? AND model_id=? AND model_context_window_tokens=?", profile)
+    store.db.execute("INSERT INTO claude_runtime_semantic_streams(stream_hash,previous_state,previous_receipt_ns,provider,claude_code_version,model_id,model_context_window_tokens,last_seen) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stream_hash) DO UPDATE SET previous_state=excluded.previous_state,previous_receipt_ns=excluded.previous_receipt_ns,provider=excluded.provider,claude_code_version=excluded.claude_code_version,model_id=excluded.model_id,model_context_window_tokens=excluded.model_context_window_tokens,last_seen=excluded.last_seen", (stream_hash, facts["state"], receipt_ns, *profile, now))
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=CLAUDE_RUNTIME_SEMANTIC_STREAM_TTL_SECONDS)).isoformat()
+    store.db.execute("DELETE FROM claude_runtime_semantic_streams WHERE last_seen < ?", (cutoff,))
+    store.db.execute("DELETE FROM claude_runtime_semantic_streams WHERE stream_hash IN (SELECT stream_hash FROM claude_runtime_semantic_streams ORDER BY last_seen DESC LIMIT -1 OFFSET ?)", (CLAUDE_RUNTIME_SEMANTIC_MAX_STREAMS,))
 
 
 def ingest_claude_runtime_inbox(store: StateStore, state_dir: Optional[str] = None) -> dict[str, int]:
@@ -4356,6 +4527,9 @@ def ingest_claude_runtime_inbox(store: StateStore, state_dir: Optional[str] = No
     now_ns = time.time_ns()
     stale_ns = CLAUDE_RUNTIME_INBOX_UNRESOLVED_MAX_AGE_SECONDS * 1_000_000_000
     with store.db:
+        # Reserve the writer before observing any prior aggregate/cursor state;
+        # concurrent service processes serialize deterministically.
+        store.db.execute("BEGIN IMMEDIATE")
         for entry, sample in _read_claude_runtime_inbox(state_dir):
             metrics["samples_read"] += 1
             row, reason = resolve_claude_runtime_sample(store, sample)
@@ -4365,11 +4539,33 @@ def ingest_claude_runtime_inbox(store: StateStore, state_dir: Optional[str] = No
                     try: entry.unlink()
                     except OSError: pass
                 continue
-            store_claude_runtime_sample(store, row, sample, receipt_ns=sample["receipt_ns"])
+            accepted = store_claude_runtime_sample(store, row, sample, receipt_ns=sample["receipt_ns"])
+            # Semantic evidence is durable before the source mailbox entry is
+            # removed. It is aggregate-only and cannot influence the snapshot.
+            if accepted:
+                record_claude_runtime_semantic_evidence(store, row, sample, sample["receipt_ns"])
             metrics["resolved"] += 1
             try: entry.unlink()
             except OSError: pass
     return metrics
+
+
+def claude_runtime_semantic_evidence(store: StateStore, version: str = "", model: str = "") -> dict[str, Any]:
+    where, args = ["provider='claude'"], []
+    if version: where.append("claude_code_version=?"); args.append(version)
+    if model: where.append("model_id=?"); args.append(model)
+    rows = [dict(r) for r in store.db.execute("SELECT * FROM claude_runtime_semantic_evidence WHERE " + " AND ".join(where) + " ORDER BY claude_code_version,model_id,model_context_window_tokens", args).fetchall()]
+    return {"provider": "claude", "evidence_only": True, "profiles": rows,
+            "limitations": ["Observed semantic evidence does not qualify a version.", "Explicit Claude runtime version qualification remains authoritative.", "No compact association is implemented: no trustworthy structured compact marker is available at ingestion."]}
+
+
+def render_claude_runtime_semantic_evidence(payload: dict[str, Any]) -> str:
+    lines = ["Claude runtime semantic evidence (observed; not a compatibility verdict)", "", "Version  Model  Window  Samples  Cursor epochs  Normal  Zero  Null  Identity"]
+    for r in payload["profiles"]:
+        window = "unavailable" if r["model_context_window_tokens"] < 0 else str(r["model_context_window_tokens"])
+        lines.append(f"{r['claude_code_version'] or '-'}  {r['model_id'] or '-'}  {window}  {r['samples_total']}  {r['stream_cursor_epochs_seen']}  {r['complete_nonzero_count']}  {r['complete_all_zero_count']}  {r['current_usage_null_count']}  {r['counter_identity_pass']}/{r['counter_identity_testable']}")
+    if not payload["profiles"]: lines.append("(no semantic evidence recorded)")
+    return "\n".join(lines)
 
 
 HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Files Changed", "Verification", "Open Problems", "Do Not Repeat", "Exact Next Action", "Relevant References")
@@ -5294,7 +5490,14 @@ def live_cli(argv: list[str]) -> Optional[int]:
                     snapshots.append(snap if snap else {"key": r["key"], "status": "INVALID"})
                 print(json.dumps(snapshots, indent=2)); return 0
             finally: store.close()
-        raise ValueError("usage: agentopsy runtime bridge claude | agentopsy runtime status")
+        if len(argv) >= 3 and argv[1] == "evidence" and argv[2] == "claude":
+            parser = argparse.ArgumentParser(prog="agentopsy runtime evidence claude"); parser.add_argument("--state-dir"); parser.add_argument("--version", default=""); parser.add_argument("--model", default=""); parser.add_argument("--json", action="store_true")
+            args = parser.parse_args(argv[3:]); store = StateStore(args.state_dir)
+            try:
+                payload = claude_runtime_semantic_evidence(store, args.version, args.model)
+                print(json.dumps(payload, indent=2) if args.json else render_claude_runtime_semantic_evidence(payload)); return 0
+            finally: store.close()
+        raise ValueError("usage: agentopsy runtime bridge claude | agentopsy runtime status | agentopsy runtime evidence claude")
     if argv[0] == "signals":
         if argv[1:] == ["--help"]:
             print("usage: agentopsy signals\n\nList the local signal registry."); return 0
@@ -5407,7 +5610,7 @@ def build_parser() -> argparse.ArgumentParser:
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
 
-            Live v0.5.1 commands:
+            Live v0.6.0 commands:
               service, health, trends, service-status, guardian, calibrate,
               insights, policy, preflight, handoff, signals, explain, integration
             """
