@@ -35,17 +35,38 @@ match. Missing or ambiguous evidence fails closed. Claude automatic control,
 automatic `/new`, `/clear`, reset, and rotation are unavailable. `full` mode
 does not make unsupported rotation actions available.
 
-## v0.5 — Comparative Optimizer
+### v0.5 — Claude runtime telemetry
 
-The next planned release is a local comparative optimizer built on the compact
-historical aggregates already collected by Context Guardian. Its scope will be
-set by evidence and must preserve the project’s privacy and fail-closed control
-properties.
+Released 2026-08-22. The optional Claude status-line bridge adds exact
+MAIN-session identity resolution and preserves the distinction between model
+capacity, current input-context occupancy, and auto-compact operational window.
+Qualification is evidence-gated and fail-closed.
 
-Candidate work includes comparing policy/calibration outcomes across a user’s
-own local sessions, surfacing repeatable workflow improvements with confidence,
-and making recommendations reviewable before adoption. It will not imply raw
-transcript retention, hosted telemetry, universal provider control, or
+### v0.5.1 — Claude 2.1.241 compatibility
+
+Released 2026-08-23. Empirical compatibility qualification covers the
+version-specific post-compact all-zero status-line behavior without treating it
+as a universal zero-token rule.
+
+### v0.6 — Semantic evidence journal
+
+Released 2026-08-23. Privacy-safe aggregate semantic evidence, bounded
+transition observations, and opaque structural field fingerprints are stored
+under schema version 6.
+
+### v0.6.1 — Release hardening
+
+Released 2026-08-25. This release improves CI baseline/tag handling, Claude
+`remaining_percentage` structural recognition, and StateStore failure-path
+resource cleanup.
+
+## Future directions
+
+A local comparative optimizer remains a candidate, not a committed versioned
+release. Evidence-driven work may compare a user's own policy/calibration
+outcomes and surface reviewable workflow improvements while preserving privacy
+and fail-closed control boundaries. It will not imply raw-transcript retention,
+hosted telemetry, universal provider control, automatic Claude control, or
 automatic rotation.
 
 ## Provider support

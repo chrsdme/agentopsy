@@ -731,6 +731,8 @@ agentopsy/
 ├── docs/
 │   ├── LIVE_SERVICE_DESIGN.md
 │   └── agentopsyd.service
+├── .github/workflows/
+│   └── test.yml
 ├── LICENSE
 ├── pyproject.toml
 ├── install.sh
@@ -738,7 +740,7 @@ agentopsy/
 ├── contrib/
 │   └── agentopsy-watch.service.example
 └── tests/
-    └── test_agentopsy.py
+    ├── test_agentopsy.py
 ```
 
 ---
@@ -771,15 +773,11 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.6.0` is the current feature release. It includes the
-incremental service, live health scoring and causal risk, calibration,
-historical insights, policy management, deterministic replay, notifications,
-and the narrowly verified Codex compact control path described above.
-
-Post-v0.6.0 development work is not part of that release. It includes
-documented Claude `remaining_percentage` recognition, StateStore
-initialization-failure SQLite cleanup. See [CHANGELOG.md](CHANGELOG.md) for
-the unreleased development record.
+`v0.6.1` is the current maintenance and hardening release. It retains v0.6.0's
+semantic-evidence functionality and adds documented Claude
+`remaining_percentage` structural recognition, StateStore initialization-failure
+SQLite cleanup, and CI/tag-resolution hardening. Schema version 6, parser
+version 1, and Claude runtime interchange format 2 are unchanged.
 
 Incremental state uses a provider-neutral execution stream: the native
 conversation/session ID, rollout ID, role (`MAIN`, `SUBAGENT`, `GUARDIAN`, or

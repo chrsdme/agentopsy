@@ -4,16 +4,27 @@ All notable changes to Agentopsy are documented here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-25
+
 ### Changed
 
 - Recognised Claude's documented `remaining_percentage` as a structural
-  context field while preserving the existing capability and fail-closed
-  semantics.
+  context field without changing occupancy arithmetic or capability semantics.
+- GitHub Actions now uses a full, tag-aware checkout for semantic baseline
+  resolution, current Node-24-native checkout/setup-python actions, and a
+  Python 3.10–3.14 compatibility matrix.
 
 ### Fixed
 
 - Closed the SQLite connection when StateStore initialization fails after the
   connection has been opened, without changing migration rollback semantics.
+- Fixed CI baseline resolution when tags are absent from a shallow checkout.
+
+### Compatibility
+
+- Schema version: 6 — unchanged. Parser version: 1 — unchanged. Claude runtime
+  interchange format: 2 — unchanged. No database migration is required from
+  v0.6.0 to v0.6.1.
 
 ### Known limitation
 
