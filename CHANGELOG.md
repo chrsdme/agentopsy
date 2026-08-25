@@ -2,6 +2,25 @@
 
 All notable changes to Agentopsy are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Recognised Claude's documented `remaining_percentage` as a structural
+  context field while preserving the existing capability and fail-closed
+  semantics.
+
+### Fixed
+
+- Closed the SQLite connection when StateStore initialization fails after the
+  connection has been opened, without changing migration rollback semantics.
+
+### Known limitation
+
+- **EVPROV-001** remains an expected XFAIL: schema-6 semantic-evidence
+  aggregate identity does not include the Agentopsy semantic-classifier
+  revision, so different revisions may share a profile.
+
 ## [0.6.0] - 2026-08-23
 
 ### Added

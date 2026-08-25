@@ -776,6 +776,11 @@ incremental service, live health scoring and causal risk, calibration,
 historical insights, policy management, deterministic replay, notifications,
 and the narrowly verified Codex compact control path described above.
 
+Post-v0.6.0 development work is not part of that release. It includes
+documented Claude `remaining_percentage` recognition, StateStore
+initialization-failure SQLite cleanup. See [CHANGELOG.md](CHANGELOG.md) for
+the unreleased development record.
+
 Incremental state uses a provider-neutral execution stream: the native
 conversation/session ID, rollout ID, role (`MAIN`, `SUBAGENT`, `GUARDIAN`, or
 `APPROVAL_REVIEW`),
@@ -801,6 +806,10 @@ Agentopsy is an independent open-source project. It is not affiliated with, endo
 - Codex cumulative token totals and last-turn/context values are intentionally treated differently.
 - Health thresholds are heuristics intended for investigation and calibration, not universal limits.
 - A resumed-session flag proves that one transcript became active again after an idle gap. It does not, by itself, identify the UI setting or human action that caused the resume.
+- **EVPROV-001:** schema-6 Claude runtime semantic-evidence aggregates do not
+  encode the Agentopsy semantic-classifier revision. Evidence from different
+  classifier revisions can therefore share a profile; this remains a known
+  XFAIL rather than a claim of schema 7.
 
 # Upstream documentation
 
