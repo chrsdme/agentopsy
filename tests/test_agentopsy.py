@@ -75,13 +75,37 @@ class SchemaMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             state = Path(td) / "state"
             self.make_v1_state(state)
-            with self.assertRaisesRegex(sqlite3.OperationalError, "injected migration failure"):
-                FailingV2Store(str(state))
+            connections = []
+            original_connect = asa.sqlite3.connect
+            class TrackingConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs); self.closed_for_test = False; connections.append(self)
+                def close(self):
+                    self.closed_for_test = True
+                    return super().close()
+            def tracked_connect(*args, **kwargs):
+                kwargs["factory"] = TrackingConnection
+                return original_connect(*args, **kwargs)
+            asa.sqlite3.connect = tracked_connect
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "injected migration failure"):
+                    FailingV2Store(str(state))
+            finally:
+                asa.sqlite3.connect = original_connect
+            self.assertEqual(len(connections), 1)
+            self.assertTrue(connections[0].closed_for_test)
             db = sqlite3.connect(state / "agentopsy.db")
             self.assertEqual(db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()[0], "1")
             self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='failed_migration_marker'").fetchone())
             self.assertEqual(db.execute("SELECT session_id FROM sessions").fetchone()[0], "old-session")
             db.close()
+
+    def test_successful_state_store_initialization_remains_usable_and_closable(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            self.assertEqual(store.db.execute("SELECT 1").fetchone()[0], 1)
+            store.close()
+            store.close()
 
     def test_guardian_dimensions_are_independent_and_evidence_is_transcript_free(self):
         event = asa.GuardianEvent("CONTEXT_HIGH", asa.Severity.CRITICAL, (asa.ImpactLane.CONTEXT_PRESSURE, asa.ImpactLane.TOOL_OUTPUT), asa.ActionSafety.ADVISE_ONLY, {"context_pct": 0.91})
@@ -1192,6 +1216,7 @@ class V041RegressionTests(unittest.TestCase):
     def test_health_renders_latest_context_separately_from_peak(self):
         with tempfile.TemporaryDirectory() as td:
             store = asa.StateStore(str(Path(td) / "state"))
+            self.addCleanup(store.close)
             with store.db:
                 store.apply_record("codex", Path("/tmp/current.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:00:00Z", "peak_context_tokens": 90, "peak_context_pct": .9})
                 store.apply_record("codex", Path("/tmp/current.jsonl"), {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-21T10:01:00Z", "peak_context_tokens": 20, "peak_context_pct": .2})

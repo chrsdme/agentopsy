@@ -2690,11 +2690,16 @@ class StateStore:
         self.db = sqlite3.connect(self.path)
         try: os.chmod(self.path, 0o600)
         except OSError: pass
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self._migrate()
+        try:
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            self._migrate()
+        except BaseException:
+            try: self.db.close()
+            except BaseException: pass
+            raise
 
     def close(self) -> None: self.db.close()
 
