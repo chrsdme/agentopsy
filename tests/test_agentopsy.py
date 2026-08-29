@@ -1164,6 +1164,44 @@ class SelectionAndOutputTests(unittest.TestCase):
         selected = asa.select_sessions(sessions, [], 1)
         self.assertEqual({s.session_id for s in selected}, {"c-new", "x-new"})
 
+    def test_last_json_keeps_distinct_codex_streams_with_one_native_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, report = Path(td) / "sessions", Path(td) / "last.json"
+            root.mkdir()
+            parent = {"type": "session_meta", "timestamp": "2026-08-29T10:00:00Z", "payload": {"session_id": "native", "id": "parent-stream"}}
+            child = {"type": "session_meta", "timestamp": "2026-08-29T10:01:00Z", "payload": {"session_id": "native", "id": "child-stream", "thread_source": "subagent", "parent_thread_id": "native"}}
+            (root / "parent.jsonl").write_text(json.dumps(parent) + "\n")
+            (root / "child.jsonl").write_text(json.dumps(child) + "\n")
+            self.assertEqual(asa.main(["--source", str(root), "--provider", "codex", "--last", "2", "--json", str(report)]), 0)
+            payload = json.loads(report.read_text())
+            rows = payload["sessions"]
+            self.assertEqual([row["session_id"] for row in rows], ["native", "native"])
+            self.assertEqual([row["stream_id"] for row in rows], ["child-stream", "parent-stream"])
+            self.assertEqual([row["role"] for row in rows], ["SUBAGENT", "MAIN"])
+
+    def test_last_one_json_keeps_newest_stream_identity(self):
+        sessions = [
+            self.make_summary("codex", "native", "2026-08-29T10:00:00+00:00"),
+            self.make_summary("codex", "native", "2026-08-29T10:01:00+00:00"),
+        ]
+        sessions[0].stream_id, sessions[1].stream_id = "older-stream", "newer-stream"
+        selected = asa.select_sessions(sessions, [], 1)
+        self.assertEqual([item.stream_id for item in selected], ["newer-stream"])
+
+    def test_json_stream_identity_defaults_to_native_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "report.json"
+            sessions = [
+                self.make_summary("codex", "native-one", "2026-08-29T10:00:00+00:00"),
+                self.make_summary("codex", "native-two", "2026-08-29T10:01:00+00:00"),
+            ]
+            asa.write_json_report(report, sessions, [])
+            rows = json.loads(report.read_text())["sessions"]
+            self.assertEqual([(row["session_id"], row["stream_id"]) for row in rows], [
+                ("native-one", "native-one"),
+                ("native-two", "native-two"),
+            ])
+
     def test_session_accepts_unique_prefix(self):
         sessions = [
             self.make_summary("claude", "abcdef01-1111", "2026-01-01T00:00:00+00:00"),

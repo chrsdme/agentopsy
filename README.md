@@ -290,6 +290,12 @@ agentopsy --provider codex --last --summary
 
 `--session` and `--last` are intentionally mutually exclusive.
 
+For JSON exports, `session_id` remains the provider-native session identifier.
+Each returned session also includes `stream_id`, the Agentopsy execution-stream
+identifier; use `provider` plus `stream_id` to distinguish rows when one native
+session contains multiple streams. `role` records the stream's observed role.
+These fields are additive and do not change `--last` selection order.
+
 ---
 
 # Export switches

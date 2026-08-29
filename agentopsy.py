@@ -651,6 +651,11 @@ class SessionSummary:
     session_id: str
     path: str
     source: str
+    # `session_id` is provider-native.  A provider can legitimately expose
+    # multiple execution streams for one native session, so structured reports
+    # retain the provider-neutral stream discriminator separately.
+    stream_id: str = ""
+    role: str = "MAIN"
     project: str = ""
     cwd: str = ""
     title: str = ""
@@ -731,6 +736,7 @@ class SessionSummary:
 
     def to_dict(self) -> dict[str, Any]:
         d = dataclasses.asdict(self)
+        d["stream_id"] = self.stream_id or self.session_id
         d["tool_stats"] = {k: v.to_dict() if isinstance(v, ToolStat) else v for k, v in self.tool_stats.items()}
         d["bursts"] = [b.to_dict() if isinstance(b, Burst) else b for b in self.bursts]
         d["defects"] = [x.to_dict() if isinstance(x, Defect) else x for x in self.defects]
@@ -1573,6 +1579,12 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
                 sid = payload.get("session_id") or payload.get("id")
                 if sid:
                     summary.session_id = str(sid)
+                summary.stream_id = str(payload.get("id") or summary.session_id)
+                source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+                subagent = source.get("subagent") if isinstance(source.get("subagent"), dict) else {}
+                kind = str(subagent.get("other") or "").lower()
+                thread_source = str(payload.get("thread_source") or "")
+                summary.role = "GUARDIAN" if kind == "guardian" else "APPROVAL_REVIEW" if kind in {"approval_review", "auto_review", "reviewer"} else "SUBAGENT" if thread_source == "subagent" or subagent else "MAIN"
                 summary.cwd = str(payload.get("cwd") or "")
                 summary.project = summary.cwd
                 summary.version = str(payload.get("cli_version") or "")
