@@ -570,6 +570,9 @@ agentopsyd run --foreground --interval 20 --auto-act observe
 agentopsy health
 agentopsy health --all
 agentopsy health --provider claude
+
+# inspect the optional agentopsyd user-service operation state
+agentopsy service-status
 agentopsy trends --days 7
 agentopsy trends --json
 agentopsy handoff /path/to/project
@@ -583,6 +586,9 @@ metadata—not transcript bodies by default. A sample user service is
 installs and enables that user service when user systemd is available;
 `--no-service` leaves service setup disabled, and `--update` restarts an
 already-active service after updating the binaries.
+`agentopsy health` reports derived session health; `agentopsy service-status`
+reports the separate operational state of the optional `agentopsyd.service`
+user unit.
 
 The live policy defaults are deliberately provisional: watch at 50%, checkpoint
 at 65%, and rotation recommendation at 80%, with recovery below 45%. Codex

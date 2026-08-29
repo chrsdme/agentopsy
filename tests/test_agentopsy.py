@@ -847,6 +847,51 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class IncrementalServiceTests(unittest.TestCase):
+    def test_service_status_reports_user_service_states_without_opening_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            original_which, original_run = asa.shutil.which, asa.subprocess.run
+            responses = iter([
+                subprocess.CompletedProcess([], 0, "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\n", ""),
+                subprocess.CompletedProcess([], 0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n", ""),
+                subprocess.CompletedProcess([], 0, "LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\n", ""),
+                subprocess.CompletedProcess([], 0, "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\n", ""),
+                subprocess.CompletedProcess([], 1, "", "unavailable"),
+                subprocess.CompletedProcess([], 0, "unexpected output\n", ""),
+            ])
+            asa.shutil.which = lambda name: "/usr/bin/systemctl" if name == "systemctl" else None
+            asa.subprocess.run = lambda *args, **kwargs: next(responses)
+            try:
+                for expected in ("ACTIVE", "INACTIVE", "NOT_INSTALLED", "FAILED", "UNKNOWN", "UNKNOWN"):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(asa.main(["service-status", "--state-dir", str(state)]), 0)
+                    self.assertIn(f"Service status: {expected}", output.getvalue())
+                self.assertFalse(state.exists())
+            finally:
+                asa.shutil.which, asa.subprocess.run = original_which, original_run
+
+    def test_service_status_is_operational_not_health_and_handles_no_manager(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            health = io.StringIO()
+            with contextlib.redirect_stdout(health):
+                self.assertEqual(asa.main(["health", "--state-dir", str(state)]), 0)
+            original_which = asa.shutil.which
+            asa.shutil.which = lambda _name: None
+            try:
+                service_status = io.StringIO()
+                with contextlib.redirect_stdout(service_status):
+                    self.assertEqual(asa.main(["service-status", "--state-dir", str(state)]), 0)
+                self.assertIn("Service status: UNAVAILABLE", service_status.getvalue())
+                self.assertNotEqual(service_status.getvalue(), health.getvalue())
+                daemon_status = io.StringIO()
+                with contextlib.redirect_stdout(daemon_status):
+                    self.assertEqual(asa.service_main(["status", "--state-dir", str(state)]), 0)
+                self.assertIn("Service status: UNAVAILABLE", daemon_status.getvalue())
+            finally:
+                asa.shutil.which = original_which
+
     def test_agentopsyd_symlink_dispatches_to_service_cli(self):
         """Exercise argv[0]-based service dispatch through a real executable."""
         with tempfile.TemporaryDirectory() as td:

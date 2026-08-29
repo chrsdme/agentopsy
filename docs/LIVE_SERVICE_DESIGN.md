@@ -61,6 +61,7 @@ agentopsyd run --foreground --interval 20 --auto-act observe
 
 # inspect or configure derived local state
 agentopsy health
+agentopsy service-status
 agentopsy trends --days 7
 agentopsy calibrate status
 agentopsy policy show
@@ -71,6 +72,10 @@ agentopsy guardian replay
 unit when user systemd is available. `--no-service` leaves service setup off;
 `--update` restarts an already-active user service after updating binaries.
 The supplied unit explicitly uses `--auto-act observe`.
+
+`health` reports derived session/database health. `service-status` is separate:
+it queries the optional `agentopsyd.service` user unit and reports its
+operational state without opening or changing the Agentopsy state database.
 
 Notifications are local terminal output plus `notify-send` when available.
 They can be disabled with `--no-notify` or policy/environment configuration;

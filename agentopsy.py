@@ -4871,6 +4871,45 @@ def service_once(state_dir: Optional[str], provider: str = "all", roots: Optiona
     finally: store.close()
 
 
+def service_status_payload() -> dict[str, str]:
+    """Report the optional user-systemd unit without reading Agentopsy state."""
+    unit = "agentopsyd.service"
+    if not shutil.which("systemctl"):
+        return {"status": "UNAVAILABLE", "manager": "systemd --user", "unit": unit,
+                "detail": "systemctl is not available"}
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "UNKNOWN", "manager": "systemd --user", "unit": unit,
+                "detail": "unable to query the user service manager"}
+    fields = {key: value for line in result.stdout.splitlines() if "=" in line
+              for key, value in [line.split("=", 1)]
+              if key in {"LoadState", "ActiveState", "SubState", "Result"}}
+    load, active = fields.get("LoadState", ""), fields.get("ActiveState", "")
+    if load == "not-found": status = "NOT_INSTALLED"
+    elif active == "active": status = "ACTIVE"
+    elif active == "inactive": status = "INACTIVE"
+    elif active == "failed": status = "FAILED"
+    else: status = "UNKNOWN"
+    payload = {"status": status, "manager": "systemd --user", "unit": unit}
+    payload.update({key: value for key, value in fields.items()})
+    if result.returncode and status == "UNKNOWN":
+        payload["detail"] = "user service manager query failed"
+    return payload
+
+
+def render_service_status(payload: dict[str, str]) -> str:
+    labels = (("manager", "Manager"), ("unit", "Unit"), ("LoadState", "Load state"),
+              ("ActiveState", "Active state"), ("SubState", "Substate"),
+              ("Result", "Result"), ("detail", "Detail"))
+    lines = [f"Service status: {payload['status']}"]
+    lines.extend(f"{label}: {payload[key]}" for key, label in labels if payload.get(key))
+    return "\n".join(lines)
+
+
 def service_main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="agentopsyd", description="Passive local Agentopsy session-health service.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4879,10 +4918,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
     status = sub.add_parser("status"); status.add_argument("--state-dir")
     args = parser.parse_args(argv)
     if args.command == "status":
-        store = StateStore(args.state_dir)
-        try:
-            print(render_health(store.sessions())); return 0
-        finally: store.close()
+        print(render_service_status(service_status_payload())); return 0
     if args.command == "once":
         m = service_once(args.state_dir, args.provider, notify=not args.no_notify, auto_act=AutoActMode(args.auto_act))
         # touched_sessions is an internal notification-gating detail (raw
@@ -5544,6 +5580,13 @@ def live_cli(argv: list[str]) -> Optional[int]:
         print(explain_signal(argv[1]))
         return 0
     if argv[0] == "service": return service_main(argv[1:])
+    if argv[0] == "service-status":
+        parser = argparse.ArgumentParser(prog="agentopsy service-status")
+        # Retain the former option for invocation compatibility; operational
+        # service state is intentionally independent of the SQLite state path.
+        parser.add_argument("--state-dir")
+        parser.parse_args(argv[1:])
+        print(render_service_status(service_status_payload())); return 0
     if argv[0] == "calibrate":
         parser = argparse.ArgumentParser(prog="agentopsy calibrate"); parser.add_argument("action", choices=["status", "build", "recommend", "adopt", "reset"]); parser.add_argument("--state-dir")
         args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
@@ -5601,7 +5644,7 @@ def live_cli(argv: list[str]) -> Optional[int]:
     if argv[0] == "handoff": parser.add_argument("project")
     args = parser.parse_args(argv[1:]); store = StateStore(args.state_dir)
     try:
-        if argv[0] in {"health", "service-status"}: print(render_health(store.sessions(args.provider, args.session)))
+        if argv[0] == "health": print(render_health(store.sessions(args.provider, args.session)))
         elif argv[0] == "trends":
             payload = trend_payload(store, args.days, args.provider, args.session); print(json.dumps(payload, indent=2) if args.json else "\n".join(f"{p.title()}: sessions={v['sessions']} median peak context={v['median_peak_context_pct']} repeated-read sessions={v['repeated_read_sessions']}" for p,v in payload['providers'].items()))
         else: print(json.dumps(validate_handoff(args.project), indent=2))
