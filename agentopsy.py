@@ -2704,6 +2704,18 @@ class StateStore:
     def close(self) -> None: self.db.close()
 
     def _migrate(self) -> None:
+        # A routine collector opening an already-current database should not
+        # contend for a writer lock merely to restate metadata.  This read-only
+        # fast path is also important for a daemon and CLI briefly overlapping.
+        try:
+            version = self.db.execute("SELECT value FROM service_meta WHERE key='schema_version'").fetchone()
+            parser = self.db.execute("SELECT value FROM service_meta WHERE key='parser_version'").fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+        else:
+            if version and int(version[0]) == SCHEMA_VERSION and parser and int(parser[0]) == PARSER_VERSION:
+                return
         self.db.execute("CREATE TABLE IF NOT EXISTS service_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -2964,6 +2976,13 @@ class StateStore:
         sid = str(data.get("session_id") or path.stem)
         stream = str(data.get("stream_id") or sid)
         ts = str(data.get("timestamp") or "")
+        # A transcript may be replayed from an earlier offset after a crash or
+        # conservative cursor recovery.  Its physical record position is a
+        # stable, privacy-safe identity: it distinguishes equal commands on
+        # separate lines while preventing their derived effects from doubling.
+        record_key = str(data.get("record_key") or "")
+        if record_key and not self.mark_unique(provider, stream, "transcript_record", record_key, sid):
+            return stream
         row = self.db.execute("SELECT * FROM sessions WHERE stream_id=? AND provider=?", (stream, provider)).fetchone()
         if row is None:
             # INSERT OR IGNORE: a concurrent scan (daemon + CLI) may race to create
@@ -3306,10 +3325,15 @@ class IncrementalIngestor:
         if lines and not lines[-1].endswith(("\n", "\r")): trailing = lines.pop()
         adapter = ADAPTERS[candidate.provider]; stream_id = "" if reset else str(old["stream_id"] if old else "")
         native_sid = "" if reset else str(old["session_id"] if old else "")
+        line_offset = offset - len(partial.encode("utf-8"))
         for line in lines:
-            if not line.strip(): continue
+            next_offset = line_offset + len(line.encode("utf-8"))
+            if not line.strip():
+                line_offset = next_offset
+                continue
             try:
                 data = adapter.parse_record(json.loads(line), path)
+                data["record_key"] = f"{path}:{line_offset}"
                 if candidate.provider == "claude":
                     data.update({"role": "SUBAGENT" if candidate.is_subagent else "MAIN", "parent_session_id": candidate.parent_session_id if candidate.is_subagent else ""})
                 # Codex metadata normally carries the native session ID only once.
@@ -3344,7 +3368,9 @@ class IncrementalIngestor:
                 metrics.parse_errors += 1
                 # Before metadata identifies a session, retain the error in scan
                 # metrics rather than inventing a path-derived session row.
-                if stream_id: self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id}, malformed=True)
+                if stream_id: self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id, "record_key": f"{path}:{line_offset}"}, malformed=True)
+            finally:
+                line_offset = next_offset
         self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=native_sid or (old["session_id"] if old else path.stem),stream_id=stream_id or (old["stream_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1
         if stream_id:

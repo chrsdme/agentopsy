@@ -107,6 +107,18 @@ class SchemaMigrationTests(unittest.TestCase):
             store.close()
             store.close()
 
+    def test_current_state_store_opens_while_another_writer_is_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            initial = asa.StateStore(str(state)); initial.close()
+            holder = sqlite3.connect(state / "agentopsy.db")
+            try:
+                holder.execute("BEGIN IMMEDIATE")
+                contender = asa.StateStore(str(state))
+                contender.close()
+            finally:
+                holder.rollback(); holder.close()
+
     def test_guardian_dimensions_are_independent_and_evidence_is_transcript_free(self):
         event = asa.GuardianEvent("CONTEXT_HIGH", asa.Severity.CRITICAL, (asa.ImpactLane.CONTEXT_PRESSURE, asa.ImpactLane.TOOL_OUTPUT), asa.ActionSafety.ADVISE_ONLY, {"context_pct": 0.91})
         self.assertEqual(event.action_safety, asa.ActionSafety.ADVISE_ONLY)
@@ -371,6 +383,28 @@ class ReplayTests(unittest.TestCase):
             self.assertIn("WOULD_ROTATE", first[0]["states"])
             self.assertNotIn("RAPID_REFILL", first[0]["states"])
             store.close()
+
+    def test_replaying_seen_file_offsets_does_not_duplicate_command_effects(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"; root.mkdir()
+            command = {"type": "response_item", "timestamp": "2026-08-27T12:00:01Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": '{"cmd":"echo repeat"}'}}
+            records = [
+                {"type": "session_meta", "timestamp": "2026-08-27T12:00:00Z", "payload": {"session_id": "native", "id": "stream"}},
+                command, command,
+            ]
+            path = root / "rollout.jsonl"; path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            store = asa.StateStore(str(state)); ingestor = asa.IncrementalIngestor(store, [(root, "test")])
+            try:
+                ingestor.scan()
+                store.db.execute("UPDATE files SET size=0,last_offset=0 WHERE path=?", (str(path),)); store.db.commit()
+                ingestor.scan()
+                self.assertEqual(store.sessions("codex")[0]["repeated_commands"], 2)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(command) + "\n")
+                ingestor.scan()
+                self.assertEqual(store.sessions("codex")[0]["repeated_commands"], 3)
+            finally:
+                store.close()
 
 
 class ControlModeTests(unittest.TestCase):
