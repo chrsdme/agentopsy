@@ -847,6 +847,75 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class IncrementalServiceTests(unittest.TestCase):
+    def test_codex_token_count_numeric_contract_rejects_hostile_values(self):
+        invalid_cases = {
+            "negative": ({"input_tokens": -1}, {"total_tokens": -1}, 100),
+            "integral-float": ({"input_tokens": 1.0}, {"total_tokens": 1.0}, 100),
+            "fractional": ({"input_tokens": 1.5}, {"total_tokens": 1.5}, 100),
+            "string": ({"input_tokens": "1"}, {"total_tokens": "1"}, 100),
+            "empty-string": ({"input_tokens": ""}, {"total_tokens": ""}, 100),
+            "null": ({"input_tokens": None}, {"total_tokens": None}, 100),
+            "true": ({"input_tokens": True}, {"total_tokens": True}, 100),
+            "false": ({"input_tokens": False}, {"total_tokens": False}, 100),
+            "nan": ({"input_tokens": float("nan")}, {"total_tokens": float("nan")}, 100),
+            "infinity": ({"input_tokens": float("inf")}, {"total_tokens": float("inf")}, 100),
+            "negative-infinity": ({"input_tokens": -float("inf")}, {"total_tokens": -float("inf")}, 100),
+            "int64-overflow": ({"input_tokens": asa.SQLITE_INT64_MAX + 1}, {"total_tokens": 1}, 100),
+            "zero-window": ({"input_tokens": 1}, {"total_tokens": 1}, 0),
+            "negative-window": ({"input_tokens": 1}, {"total_tokens": 1}, -1),
+            "context-exceeds-window": ({"input_tokens": 1}, {"total_tokens": 101}, 100),
+        }
+        for name, (total, last, window) in invalid_cases.items():
+            with self.subTest(name=name):
+                record = {
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "total_token_usage": total, "last_token_usage": last, "model_context_window": window,
+                    }},
+                }
+                with self.assertRaises(asa.NumericSemanticError):
+                    asa.CodexAdapter().extract_usage(record)
+
+    def test_sqlite_integer_bounds_are_explicit(self):
+        self.assertEqual(asa.require_int(asa.SQLITE_INT64_MIN, "storage"), asa.SQLITE_INT64_MIN)
+        self.assertEqual(asa.require_int(asa.SQLITE_INT64_MAX, "storage"), asa.SQLITE_INT64_MAX)
+        for value in (asa.SQLITE_INT64_MIN - 1, asa.SQLITE_INT64_MAX + 1):
+            with self.subTest(value=value):
+                with self.assertRaises(asa.NumericSemanticError):
+                    asa.require_int(value, "storage")
+
+    def test_incremental_ingestion_rejects_invalid_numeric_record_without_poisoning(self):
+        invalid = {"type": "event_msg", "timestamp": "2026-08-27T12:00:01Z", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": asa.SQLITE_INT64_MAX + 1},
+            "last_token_usage": {"total_tokens": 1}, "model_context_window": 100,
+        }}}
+        valid = {"type": "event_msg", "timestamp": "2026-08-27T12:00:02Z", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 10, "total_tokens": 10},
+            "last_token_usage": {"total_tokens": 10}, "model_context_window": 100,
+        }}}
+        meta = {"type": "session_meta", "timestamp": "2026-08-27T12:00:00Z", "payload": {"session_id": "native", "id": "stream"}}
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"
+            root.mkdir(); path = root / "rollout.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in (meta, invalid, valid)) + "\n")
+            summary = asa.parse_codex(asa.Candidate("codex", path, path.name, "test"), 30)
+            self.assertEqual((summary.malformed_lines, summary.input_tokens, summary.peak_context_tokens), (1, 10, 10))
+            store = asa.StateStore(str(state))
+            try:
+                first = asa.IncrementalIngestor(store, [(root, "test")]).scan()
+                self.assertEqual(first.parse_errors, 1)
+                self.assertEqual(store.sessions("codex")[0]["input_tokens"], 10)
+                self.assertEqual([row[0] for row in store.db.execute("SELECT context_tokens FROM telemetry_samples")], [10])
+                self.assertEqual(asa.IncrementalIngestor(store, [(root, "test")]).scan().files_unchanged, 1)
+            finally:
+                store.close()
+
+    def test_codex_token_count_accepts_sqlite_int64_upper_boundary(self):
+        record = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": asa.SQLITE_INT64_MAX},
+            "last_token_usage": {"total_tokens": 1}, "model_context_window": 100,
+        }}}
+        self.assertEqual(asa.CodexAdapter().extract_usage(record)["input_tokens"], asa.SQLITE_INT64_MAX)
+
     def test_classification_skips_pathological_integer_and_keeps_sibling(self):
         """A hostile JSON literal must not prevent discovery of a good file."""
         with tempfile.TemporaryDirectory() as td:

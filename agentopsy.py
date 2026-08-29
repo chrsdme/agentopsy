@@ -458,6 +458,61 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+SQLITE_INT64_MIN = -(2 ** 63)
+SQLITE_INT64_MAX = 2 ** 63 - 1
+
+
+class NumericSemanticError(ValueError):
+    """A provider record contains a numeric value outside its public domain."""
+
+
+def require_int(value: Any, field: str, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    """Accept only a real JSON integer that is safe for SQLite persistence."""
+    if type(value) is not int:
+        raise NumericSemanticError(f"{field} must be an integer")
+    if not SQLITE_INT64_MIN <= value <= SQLITE_INT64_MAX:
+        raise NumericSemanticError(f"{field} exceeds SQLite INTEGER bounds")
+    if minimum is not None and value < minimum:
+        raise NumericSemanticError(f"{field} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise NumericSemanticError(f"{field} must be at most {maximum}")
+    return value
+
+
+def optional_nonnegative_int(values: dict[str, Any], key: str, field: str) -> int:
+    """Missing provider counters preserve their established zero default."""
+    return 0 if key not in values else require_int(values[key], field, minimum=0)
+
+
+def codex_token_count_values(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate one Codex token-count record before it can reach state/telemetry."""
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+    last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+    values = {
+        "input_tokens": optional_nonnegative_int(total, "input_tokens", "total_token_usage.input_tokens"),
+        "cached_input_tokens": optional_nonnegative_int(total, "cached_input_tokens", "total_token_usage.cached_input_tokens"),
+        "output_tokens": optional_nonnegative_int(total, "output_tokens", "total_token_usage.output_tokens"),
+        "reasoning_tokens": optional_nonnegative_int(total, "reasoning_output_tokens", "total_token_usage.reasoning_output_tokens"),
+        "total_tokens": optional_nonnegative_int(total, "total_tokens", "total_token_usage.total_tokens"),
+        "last_total_tokens": optional_nonnegative_int(last, "total_tokens", "last_token_usage.total_tokens"),
+    }
+    window = 0 if "model_context_window" not in info else require_int(
+        info["model_context_window"], "model_context_window", minimum=1
+    )
+    if window and values["last_total_tokens"] > window:
+        raise NumericSemanticError("last_token_usage.total_tokens exceeds model_context_window")
+    values.update({
+        "context_window_tokens": window,
+        "peak_context_tokens": values["last_total_tokens"],
+        "peak_context_pct": values["last_total_tokens"] / window if window else 0.0,
+        "model_turns": 1,
+        "has_total_usage": bool(total),
+    })
+    return values
+
+
 def json_text(value: Any) -> str:
     if value is None:
         return ""
@@ -867,15 +922,9 @@ class CodexAdapter(ProviderAdapter):
                   "peak_context_pct": 0.0, "model_turns": 0}
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         if record.get("type") != "event_msg" or payload.get("type") != "token_count": return values
-        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-        total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
-        last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
-        window = safe_int(info.get("model_context_window")); current = safe_int(last.get("total_tokens"))
-        values.update({"input_tokens": safe_int(total.get("input_tokens")), "cached_input_tokens": safe_int(total.get("cached_input_tokens")),
-                       "output_tokens": safe_int(total.get("output_tokens")), "reasoning_tokens": safe_int(total.get("reasoning_output_tokens")),
-                       "peak_context_tokens": current, "context_window_tokens": window,
-                       "peak_context_pct": current / window if window else 0.0, "model_turns": 1})
-        values["usage_key"] = json.dumps((safe_int(total.get("input_tokens")), safe_int(total.get("cached_input_tokens")), safe_int(total.get("output_tokens")), safe_int(total.get("reasoning_output_tokens")), safe_int(total.get("total_tokens")), current, window))
+        numeric = codex_token_count_values(record)
+        values.update({key: numeric[key] for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "peak_context_tokens", "context_window_tokens", "peak_context_pct", "model_turns")})
+        values["usage_key"] = json.dumps(tuple(numeric[key] for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "last_total_tokens", "context_window_tokens")))
         return values
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -1625,21 +1674,23 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             elif typ == "event_msg":
                 etype = payload.get("type")
                 if etype == "token_count":
+                    try:
+                        numeric = codex_token_count_values(rec)
+                    except NumericSemanticError:
+                        summary.malformed_lines += 1
+                        continue
                     summary.token_count_events += 1
-                    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-                    total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
-                    last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
-                    window = safe_int(info.get("model_context_window"))
+                    window = numeric["context_window_tokens"]
                     sig = (
-                        safe_int(total.get("input_tokens")), safe_int(total.get("cached_input_tokens")),
-                        safe_int(total.get("output_tokens")), safe_int(total.get("reasoning_output_tokens")),
-                        safe_int(total.get("total_tokens")), safe_int(last.get("total_tokens")), window,
+                        numeric["input_tokens"], numeric["cached_input_tokens"], numeric["output_tokens"],
+                        numeric["reasoning_tokens"], numeric["total_tokens"], numeric["last_total_tokens"], window,
                     )
                     token_signatures[sig] += 1
-                    latest_total_usage = total or latest_total_usage
+                    if numeric["has_total_usage"]:
+                        latest_total_usage = numeric
                     if window:
                         summary.context_window_tokens = max(summary.context_window_tokens, window)
-                    last_total = safe_int(last.get("total_tokens"))
+                    last_total = numeric["last_total_tokens"]
                     if last_total:
                         context_samples.append(last_total)
                         if window:
@@ -1772,7 +1823,7 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
         summary.input_tokens = safe_int(latest_total_usage.get("input_tokens"))
         summary.cached_input_tokens = safe_int(latest_total_usage.get("cached_input_tokens"))
         summary.output_tokens = safe_int(latest_total_usage.get("output_tokens"))
-        summary.reasoning_tokens = safe_int(latest_total_usage.get("reasoning_output_tokens"))
+        summary.reasoning_tokens = safe_int(latest_total_usage.get("reasoning_tokens"))
         summary.logged_processed_tokens = safe_int(latest_total_usage.get("total_tokens"))
     summary.peak_context_tokens = max(context_samples, default=0)
     summary.peak_context_pct = max(context_pct_samples, default=0.0)
@@ -3352,7 +3403,14 @@ class IncrementalIngestor:
                 if stream_id: self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id, "record_key": f"{path}:{line_offset}"}, malformed=True)
                 line_offset = next_offset
                 continue
-            data = adapter.parse_record(record, path)
+            try:
+                data = adapter.parse_record(record, path)
+            except NumericSemanticError:
+                metrics.parse_errors += 1
+                if stream_id:
+                    self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id, "record_key": f"{path}:{line_offset}"}, malformed=True)
+                line_offset = next_offset
+                continue
             data["record_key"] = f"{path}:{line_offset}"
             if candidate.provider == "claude":
                 data.update({"role": "SUBAGENT" if candidate.is_subagent else "MAIN", "parent_session_id": candidate.parent_session_id if candidate.is_subagent else ""})
