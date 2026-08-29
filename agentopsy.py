@@ -846,6 +846,7 @@ class Candidate:
     source_label: str
     is_subagent: bool = False
     parent_session_id: str = ""
+    trusted_root: Optional[Path] = None
 
 
 class ProviderAdapter:
@@ -1061,9 +1062,54 @@ def discover_live_roots() -> list[tuple[Path, str]]:
     return roots
 
 
-def classify_jsonl(path: Path) -> Optional[str]:
+def _is_trusted_transcript(path: Path, trusted_root: Path) -> bool:
+    """Whether *path* is an ordinary transcript inside its scan boundary.
+
+    Transcript discovery is deliberately symlink-free.  This matches the
+    existing security-boundary policy elsewhere in the application and keeps
+    a configured provider directory from becoming an indirect capability to
+    read another directory.
+    """
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
+        root = trusted_root.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        leaf = path.lstat()
+        if stat.S_ISLNK(leaf.st_mode) or not stat.S_ISREG(leaf.st_mode):
+            return False
+        if root.is_dir():
+            resolved.relative_to(root)
+        elif resolved != root:
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _open_transcript(path: Path, trusted_root: Optional[Path] = None, *, binary: bool = False) -> Optional[Any]:
+    """Open an ordinary transcript without ever blocking on special files."""
+    if trusted_root is not None and not _is_trusted_transcript(path, trusted_root):
+        return None
+    try:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        # The lstat above provides the policy decision; O_NOFOLLOW closes the
+        # leaf replacement race on platforms which expose it.
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return os.fdopen(fd, "rb" if binary else "r", encoding=None if binary else "utf-8", errors=None if binary else "replace")
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def classify_jsonl(path: Path, trusted_root: Optional[Path] = None) -> Optional[str]:
+    try:
+        f = _open_transcript(path, trusted_root)
+        if f is None:
+            return None
+        with f:
             for _ in range(12):
                 line = f.readline()
                 if not line:
@@ -1090,16 +1136,15 @@ def collect_candidates(roots: list[tuple[Path, str]], provider_filter: str, clas
     candidates: list[Candidate] = []
     seen: set[Path] = set()
     for root, label in roots:
-        paths = [root] if root.is_file() else root.rglob("*.jsonl")
+        paths = root.rglob("*.jsonl") if root.is_dir() else ([root] if root.suffix == ".jsonl" else [])
         for path in paths:
-            try:
-                rp = path.resolve()
-            except OSError:
-                rp = path
+            if not _is_trusted_transcript(path, root):
+                continue
+            rp = path.resolve()
             if rp in seen:
                 continue
             seen.add(rp)
-            provider = (classifier or classify_jsonl)(path)
+            provider = (classifier or (lambda candidate: classify_jsonl(candidate, root)))(path)
             if provider is None or (provider_filter != "all" and provider_filter != provider):
                 continue
             parts = path.parts
@@ -1115,7 +1160,7 @@ def collect_candidates(roots: list[tuple[Path, str]], provider_filter: str, clas
                 display = str(path.relative_to(root))
             except ValueError:
                 display = str(path)
-            candidates.append(Candidate(provider, path, display, label, is_subagent, parent))
+            candidates.append(Candidate(provider, path, display, label, is_subagent, parent, root))
     return sorted(candidates, key=lambda x: (x.provider, x.display_path))
 
 
@@ -1348,11 +1393,10 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
     cwds = collections.Counter()
     persisted_refs: set[str] = set()
 
-    try:
-        fh = p.open("r", encoding="utf-8", errors="replace")
-    except OSError as e:
-        summary.notes.append(f"cannot open: {e}")
-        add_defect(summary, "critical", "UNREADABLE_SESSION", f"Cannot read transcript: {e}")
+    fh = _open_transcript(p, candidate.trusted_root)
+    if fh is None:
+        summary.notes.append("cannot open transcript safely")
+        add_defect(summary, "critical", "UNREADABLE_SESSION", "Cannot read transcript safely")
         finalise_grade(summary)
         return summary
 
@@ -1643,11 +1687,10 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
     latest_total_usage: dict[str, Any] = {}
     latest_rate: dict[str, Any] = {}
 
-    try:
-        fh = p.open("r", encoding="utf-8", errors="replace")
-    except OSError as e:
-        summary.notes.append(f"cannot open: {e}")
-        add_defect(summary, "critical", "UNREADABLE_SESSION", f"Cannot read transcript: {e}")
+    fh = _open_transcript(p, candidate.trusted_root)
+    if fh is None:
+        summary.notes.append("cannot open transcript safely")
+        add_defect(summary, "critical", "UNREADABLE_SESSION", "Cannot read transcript safely")
         finalise_grade(summary)
         return summary
 
@@ -3438,15 +3481,20 @@ class IncrementalIngestor:
         return metrics
 
     def _ingest(self, candidate: Candidate, metrics: IngestionMetrics) -> None:
-        path = candidate.path; stat = path.stat(); identity = f"{stat.st_dev}:{stat.st_ino}"; old = self.store.file(path)
-        reset = old is not None and (old["identity"] != identity or stat.st_size < old["last_offset"])
-        if old and not reset and stat.st_size == old["size"]:
-            metrics.files_unchanged += 1; self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=old["last_offset"],partial=old["partial_line"],session_id=old["session_id"],stream_id=old["stream_id"],status="ok"); return
-        if reset:
-            self.store.reset_file_session(old); offset, partial = 0, ""; metrics.files_rescanned += 1
-        else: offset, partial = (int(old["last_offset"]), str(old["partial_line"])) if old else (0, "")
-        with path.open("rb") as f:
-            f.seek(offset); chunk = f.read()
+        path = candidate.path
+        fh = _open_transcript(path, candidate.trusted_root, binary=True)
+        if fh is None:
+            return
+        with fh:
+            stat = os.fstat(fh.fileno())
+            identity = f"{stat.st_dev}:{stat.st_ino}"; old = self.store.file(path)
+            reset = old is not None and (old["identity"] != identity or stat.st_size < old["last_offset"])
+            if old and not reset and stat.st_size == old["size"]:
+                metrics.files_unchanged += 1; self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=old["last_offset"],partial=old["partial_line"],session_id=old["session_id"],stream_id=old["stream_id"],status="ok"); return
+            if reset:
+                self.store.reset_file_session(old); offset, partial = 0, ""; metrics.files_rescanned += 1
+            else: offset, partial = (int(old["last_offset"]), str(old["partial_line"])) if old else (0, "")
+            fh.seek(offset); chunk = fh.read()
         metrics.bytes_examined += len(chunk); metrics.bytes_newly_parsed += len(chunk)
         text = partial + chunk.decode("utf-8", errors="replace")
         lines = text.splitlines(keepends=True); trailing = ""

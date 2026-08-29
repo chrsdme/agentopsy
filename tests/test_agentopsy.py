@@ -846,6 +846,47 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("CODEX_CONTEXT_CRITICAL", {d.code for d in s.defects})
 
 
+class FilesystemBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _codex_meta(session_id: str) -> str:
+        return json.dumps({"type": "session_meta", "payload": {"session_id": session_id, "id": session_id}}) + "\n"
+
+    def test_discovery_only_accepts_regular_non_symlink_jsonl_within_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); root = base / "root"; outside = base / "root-sibling"; root.mkdir(); outside.mkdir()
+            valid = root / "valid.jsonl"; valid.write_text(self._codex_meta("valid"))
+            (root / "ignored.txt").write_text(self._codex_meta("text"))
+            foreign = outside / "foreign.jsonl"; foreign.write_text(self._codex_meta("foreign"))
+            (root / "outside.jsonl").symlink_to(foreign)
+            (root / "inside.jsonl").symlink_to(valid)
+            (root / "broken.jsonl").symlink_to(root / "missing.jsonl")
+            (root / "loop-a.jsonl").symlink_to(root / "loop-b.jsonl")
+            (root / "loop-b.jsonl").symlink_to(root / "loop-a.jsonl")
+            (root / "directory.jsonl").mkdir()
+
+            candidates = asa.collect_candidates([(root, "test")], "all")
+            self.assertEqual([candidate.path.name for candidate in candidates], ["valid.jsonl"])
+            self.assertFalse(asa._is_trusted_transcript(foreign, root))  # sibling-prefix is not containment
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO support required")
+    def test_fifo_is_skipped_without_blocking_and_valid_neighbor_is_stable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"; root.mkdir()
+            os.mkfifo(root / "pipe.jsonl")
+            valid = root / "valid.jsonl"; valid.write_text(self._codex_meta("valid"))
+            store = asa.StateStore(str(state))
+            try:
+                start = asa.time.monotonic()
+                first = asa.IncrementalIngestor(store, [(root, "test")]).scan()
+                self.assertLess(asa.time.monotonic() - start, 1.0)
+                self.assertEqual(first.files_advanced, 1)
+                self.assertEqual([row["session_id"] for row in store.sessions("codex")], ["valid"])
+                self.assertIsNone(store.file(root / "pipe.jsonl"))
+                self.assertEqual(asa.IncrementalIngestor(store, [(root, "test")]).scan().files_unchanged, 1)
+            finally:
+                store.close()
+
+
 class IncrementalServiceTests(unittest.TestCase):
     def test_provider_timestamp_requires_aware_iso_and_normalizes_to_utc(self):
         reference = asa.dt.datetime(2026, 8, 27, 12, 0, tzinfo=asa.dt.timezone.utc)
