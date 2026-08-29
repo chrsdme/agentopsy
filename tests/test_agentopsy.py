@@ -847,6 +847,58 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class IncrementalServiceTests(unittest.TestCase):
+    def test_provider_timestamp_requires_aware_iso_and_normalizes_to_utc(self):
+        reference = asa.dt.datetime(2026, 8, 27, 12, 0, tzinfo=asa.dt.timezone.utc)
+        self.assertEqual(
+            asa.normalise_provider_timestamp("2026-08-27T13:30:00+01:30", now=reference),
+            "2026-08-27T12:00:00Z",
+        )
+        for value in ("not-a-timestamp", "2026-08-27T12:00:00", 1, 1.0, True, "", float("nan")):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(asa.TemporalSemanticError):
+                    asa.normalise_provider_timestamp(value, now=reference)
+        with self.assertRaises(asa.TemporalSemanticError):
+            asa.normalise_provider_timestamp("2026-08-27T12:01:01Z", now=reference)
+        for adapter in (asa.ClaudeAdapter(), asa.CodexAdapter()):
+            with self.subTest(adapter=adapter.name):
+                with self.assertRaises(asa.TemporalSemanticError):
+                    adapter.parse_record({"timestamp": "not-a-timestamp"}, Path("session.jsonl"))
+
+    def test_incremental_ingestion_rejects_bad_timestamps_and_keeps_neighbors(self):
+        for timestamp in ("not-a-timestamp", "2026-08-27T12:00:01", 1):
+            with self.subTest(timestamp=repr(timestamp)), tempfile.TemporaryDirectory() as td:
+                root, state = Path(td) / "sessions", Path(td) / "state"
+                root.mkdir(); path = root / "rollout.jsonl"
+                meta = {"type": "session_meta", "timestamp": "2026-08-27T12:00:00Z", "payload": {"session_id": "native", "id": "stream"}}
+                bad = {"type": "event_msg", "timestamp": timestamp, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1, "total_tokens": 1}, "last_token_usage": {"total_tokens": 1}, "model_context_window": 100}}}
+                suffix = {"type": "event_msg", "timestamp": "2026-08-27T12:00:02Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2, "total_tokens": 2}, "last_token_usage": {"total_tokens": 2}, "model_context_window": 100}}}
+                path.write_text("\n".join(json.dumps(row) for row in (meta, bad, suffix)) + "\n")
+                summary = asa.parse_codex(asa.Candidate("codex", path, path.name, "test"), 30)
+                self.assertEqual((summary.malformed_lines, summary.input_tokens), (1, 2))
+                store = asa.StateStore(str(state))
+                try:
+                    self.assertEqual(asa.IncrementalIngestor(store, [(root, "test")]).scan().parse_errors, 1)
+                    row = store.sessions("codex")[0]
+                    self.assertEqual((row["started_at"], row["last_activity_at"], row["input_tokens"]), ("2026-08-27T12:00:00Z", "2026-08-27T12:00:02Z", 2))
+                    self.assertEqual(asa.IncrementalIngestor(store, [(root, "test")]).scan().files_unchanged, 1)
+                finally:
+                    store.close()
+
+    def test_state_store_prevents_future_or_late_past_timestamp_poisoning(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = asa.StateStore(str(Path(td) / "state"))
+            try:
+                path = Path(td) / "rollout.jsonl"
+                store.apply_record("codex", path, {"session_id": "s", "stream_id": "s", "timestamp": "2026-08-27T12:00:00Z"})
+                store.apply_record("codex", path, {"session_id": "s", "stream_id": "s", "timestamp": "2000-01-01T00:00:00Z", "input_tokens": 25, "peak_context_tokens": 25})
+                store.apply_record("codex", path, {"session_id": "s", "stream_id": "s", "timestamp": "2999-01-01T00:00:00Z", "input_tokens": 50, "peak_context_tokens": 50})
+                row = store.sessions("codex")[0]
+                self.assertEqual(row["last_activity_at"], "2026-08-27T12:00:00Z")
+                self.assertEqual((row["input_tokens"], row["peak_context_tokens"]), (25, 0))
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM telemetry_samples").fetchone()[0], 0)
+            finally:
+                store.close()
+
     def test_codex_token_count_numeric_contract_rejects_hostile_values(self):
         invalid_cases = {
             "negative": ({"input_tokens": -1}, {"total_tokens": -1}, 100),

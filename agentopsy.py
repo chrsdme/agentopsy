@@ -451,6 +451,42 @@ def iso_to_dt(value: Any) -> Optional[dt.datetime]:
         return None
 
 
+PROVIDER_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS = 60
+
+
+class TemporalSemanticError(ValueError):
+    """A supplied provider timestamp cannot safely participate in chronology."""
+
+
+def normalise_provider_timestamp(value: Any, *, now: Optional[dt.datetime] = None) -> str:
+    """Validate one supplied provider timestamp and return canonical UTC text.
+
+    Provider transcripts may legitimately omit a timestamp, but a supplied one
+    must be an aware ISO-8601 string.  The one-minute skew matches the
+    project's existing trusted runtime-receipt bound while avoiding acceptance
+    of a future value that would poison durable ordering and telemetry.
+    """
+    if type(value) is not str or not value:
+        raise TemporalSemanticError("timestamp must be a non-empty ISO-8601 string")
+    stamp = iso_to_dt(value)
+    if stamp is None:
+        raise TemporalSemanticError("timestamp is malformed")
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise TemporalSemanticError("timestamp must include a timezone offset")
+    stamp = stamp.astimezone(dt.timezone.utc)
+    reference = now or dt.datetime.now(dt.timezone.utc)
+    if stamp > reference + dt.timedelta(seconds=PROVIDER_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS):
+        raise TemporalSemanticError("timestamp exceeds the permitted future clock skew")
+    return stamp.isoformat().replace("+00:00", "Z")
+
+
+def optional_provider_timestamp(value: Any, *, now: Optional[dt.datetime] = None) -> str:
+    """Keep an omitted provider timestamp distinct from a malformed supplied one."""
+    if value is None:
+        return ""
+    return normalise_provider_timestamp(value, now=now)
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value or 0)
@@ -827,7 +863,7 @@ class ProviderAdapter:
         return path.stem
 
     def extract_timestamp(self, record: dict[str, Any]) -> str:
-        return str(record.get("timestamp") or "")
+        return optional_provider_timestamp(record.get("timestamp"))
 
     def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
         return {}
@@ -1328,7 +1364,12 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             except ValueError:
                 summary.malformed_lines += 1
                 continue
-            ts = iso_to_dt(rec.get("timestamp"))
+            try:
+                timestamp = optional_provider_timestamp(rec.get("timestamp"))
+            except TemporalSemanticError:
+                summary.malformed_lines += 1
+                continue
+            ts = iso_to_dt(timestamp)
             if ts:
                 timestamps.append(ts)
             typ = rec.get("type")
@@ -1618,7 +1659,12 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             except ValueError:
                 summary.malformed_lines += 1
                 continue
-            ts = iso_to_dt(rec.get("timestamp"))
+            try:
+                timestamp = optional_provider_timestamp(rec.get("timestamp"))
+            except TemporalSemanticError:
+                summary.malformed_lines += 1
+                continue
+            ts = iso_to_dt(timestamp)
             if ts:
                 timestamps.append(ts)
             typ = rec.get("type")
@@ -3038,7 +3084,17 @@ class StateStore:
     def apply_record(self, provider: str, path: Path, data: dict[str, Any], malformed: bool = False) -> str:
         sid = str(data.get("session_id") or path.stem)
         stream = str(data.get("stream_id") or sid)
-        ts = str(data.get("timestamp") or "")
+        try:
+            # Adapters represent a legitimately omitted source timestamp as
+            # an empty internal value; raw supplied empties are rejected by
+            # the adapter before this durable boundary is reached.
+            ts = "" if data.get("timestamp") == "" else optional_provider_timestamp(data.get("timestamp"))
+        except TemporalSemanticError:
+            # This direct persistence boundary is also used by focused callers.
+            # Do not let an invalid time retain any record-derived telemetry.
+            malformed = True
+            ts = ""
+            data = {"session_id": sid, "stream_id": stream, "record_key": data.get("record_key", "")}
         # A transcript may be replayed from an earlier offset after a crash or
         # conservative cursor recovery.  Its physical record position is a
         # stable, privacy-safe identity: it distinguishes equal commands on
@@ -3056,12 +3112,20 @@ class StateStore:
         set_parts, args = [], []
         for field in ("project", "model", "effort", "version", "role", "parent_session_id", "parent_stream_id", "thread_source"):
             if data.get(field): set_parts.append(f"{field}=?"); args.append(str(data[field]))
-        if ts:
+        prior_activity = iso_to_dt(row["last_activity_at"]) if row else None
+        if prior_activity is not None and (prior_activity.tzinfo is None or prior_activity.utcoffset() is None):
+            prior_activity = None
+        current_activity = iso_to_dt(ts)
+        # Equal provider timestamps are common for a metadata record and its
+        # first event; only an earlier timestamp is stale for chronology.
+        stale_timestamp = bool(ts and prior_activity is not None and (current_activity is None or current_activity < prior_activity))
+        if ts and not stale_timestamp:
             set_parts.append("last_activity_at=?"); args.append(ts)
             set_parts.append("started_at=CASE WHEN started_at='' THEN ? ELSE started_at END"); args.append(ts)
-        for field in ("peak_context_tokens", "context_window_tokens", "peak_context_pct", "max_tool_result_chars"):
-            val = data.get(field)
-            if val not in (None, "", 0, 0.0): set_parts.append(f"{field}=MAX({field},?)"); args.append(val)
+        if not stale_timestamp:
+            for field in ("peak_context_tokens", "context_window_tokens", "peak_context_pct", "max_tool_result_chars"):
+                val = data.get(field)
+                if val not in (None, "", 0, 0.0): set_parts.append(f"{field}=MAX({field},?)"); args.append(val)
         for field in ("model_turns", "tool_calls", "tool_result_chars", "cache_creation_tokens", "compactions"):
             val = safe_int(data.get(field));
             if val: set_parts.append(f"{field}={field}+?"); args.append(val)
@@ -3077,7 +3141,8 @@ class StateStore:
                 digest = sha1_text(str(key)); self.db.execute("INSERT INTO occurrences(session_id,provider,stream_id,kind,key_hash,count) VALUES(?,?,?,?,?,1) ON CONFLICT(provider,stream_id,kind,key_hash) DO UPDATE SET count=count+1", (sid, provider, stream, kind, digest))
                 col = "repeated_reads" if kind == "read" else "repeated_commands"
                 self.db.execute(f"UPDATE sessions SET {col}=(SELECT COALESCE(MAX(count),0) FROM occurrences WHERE stream_id=? AND provider=? AND kind=?) WHERE stream_id=? AND provider=?", (stream, provider, kind, stream, provider))
-        self.record_telemetry(provider, sid, stream, ts, data)
+        if not stale_timestamp:
+            self.record_telemetry(provider, sid, stream, ts, data)
         return stream
 
     def record_telemetry(self, provider: str, sid: str, stream: str, timestamp: str, data: dict[str, Any]) -> None:
@@ -3405,7 +3470,7 @@ class IncrementalIngestor:
                 continue
             try:
                 data = adapter.parse_record(record, path)
-            except NumericSemanticError:
+            except (NumericSemanticError, TemporalSemanticError):
                 metrics.parse_errors += 1
                 if stream_id:
                     self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id, "record_key": f"{path}:{line_offset}"}, malformed=True)
