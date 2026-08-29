@@ -847,6 +847,74 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class IncrementalServiceTests(unittest.TestCase):
+    def test_classification_skips_pathological_integer_and_keeps_sibling(self):
+        """A hostile JSON literal must not prevent discovery of a good file."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "bad.jsonl").write_text(
+                '{"type":"session_meta","payload":{"n":' + "9" * 10_000 + "}}\n"
+            )
+            (root / "good.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "good"}}) + "\n"
+            )
+            candidates = asa.collect_candidates([(root, "test")], "all")
+            self.assertEqual([(candidate.provider, candidate.path.name) for candidate in candidates], [("codex", "good.jsonl")])
+
+    def test_classification_preserves_ordinary_integer_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, integer in (("small", "42"), ("bounded", "9" * 1_000)):
+                with self.subTest(name=name):
+                    path = root / f"{name}.jsonl"
+                    path.write_text(
+                        '{"type":"session_meta","payload":{"session_id":"s","n":' + integer + "}}\n"
+                    )
+                    self.assertEqual(asa.classify_jsonl(path), "codex")
+
+    def test_incremental_ingestion_skips_pathological_integer_and_keeps_neighbors(self):
+        with tempfile.TemporaryDirectory() as td:
+            for provider in ("claude", "codex"):
+                with self.subTest(provider=provider):
+                    root, state = Path(td) / provider, Path(td) / f"{provider}-state"
+                    root.mkdir()
+                    if provider == "claude":
+                        prefix = {
+                            "type": "assistant", "timestamp": "2026-08-27T12:00:00Z", "sessionId": "claude-native",
+                            "message": {"usage": {"input_tokens": 1, "output_tokens": 1}},
+                        }
+                        suffix = {
+                            "type": "assistant", "timestamp": "2026-08-27T12:00:02Z", "sessionId": "claude-native",
+                            "message": {"usage": {"input_tokens": 2, "output_tokens": 1}},
+                        }
+                    else:
+                        prefix = {"type": "session_meta", "timestamp": "2026-08-27T12:00:00Z", "payload": {"session_id": "codex-native", "cwd": "/project"}}
+                        suffix = {
+                            "type": "event_msg", "timestamp": "2026-08-27T12:00:02Z",
+                            "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 2, "total_tokens": 2}, "last_token_usage": {"total_tokens": 2}, "model_context_window": 100}},
+                        }
+                    path = root / f"{provider}.jsonl"
+                    path.write_text(
+                        json.dumps(prefix) + "\n" + '{"type":"late","n":' + "9" * 10_000 + "}\n" + json.dumps(suffix) + "\n"
+                    )
+                    candidate = asa.Candidate(provider, path, path.name, "test")
+                    summary = (asa.parse_claude if provider == "claude" else asa.parse_codex)(candidate, 30)
+                    self.assertEqual(summary.malformed_lines, 1)
+                    self.assertEqual(summary.end, "2026-08-27T12:00:02+00:00")
+                    store = asa.StateStore(str(state))
+                    try:
+                        ingestor = asa.IncrementalIngestor(store, [(root, "test")])
+                        first = ingestor.scan()
+                        self.assertEqual(first.parse_errors, 1)
+                        row = store.sessions(provider)[0]
+                        self.assertEqual(row["started_at"], "2026-08-27T12:00:00Z")
+                        self.assertEqual(row["last_activity_at"], "2026-08-27T12:00:02Z")
+                        self.assertEqual(store.file(path)["last_offset"], path.stat().st_size)
+                        second = ingestor.scan()
+                        self.assertEqual(second.files_unchanged, 1)
+                        self.assertEqual(store.sessions(provider)[0]["last_activity_at"], "2026-08-27T12:00:02Z")
+                    finally:
+                        store.close()
+
     def test_service_status_reports_user_service_states_without_opening_state(self):
         with tempfile.TemporaryDirectory() as td:
             state = Path(td) / "state"

@@ -985,7 +985,7 @@ def classify_jsonl(path: Path) -> Optional[str]:
                     break
                 try:
                     rec = json.loads(line)
-                except json.JSONDecodeError:
+                except ValueError:
                     continue
                 typ = rec.get("type")
                 if typ == "session_meta" and isinstance(rec.get("payload"), dict):
@@ -1276,7 +1276,7 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             summary.event_count += 1
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
                 summary.malformed_lines += 1
                 continue
             ts = iso_to_dt(rec.get("timestamp"))
@@ -1495,7 +1495,7 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
                     for line in sf:
                         try:
                             r = json.loads(line)
-                        except json.JSONDecodeError:
+                        except ValueError:
                             continue
                         if r.get("type") != "assistant":
                             continue
@@ -1566,7 +1566,7 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             summary.event_count += 1
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
                 summary.malformed_lines += 1
                 continue
             ts = iso_to_dt(rec.get("timestamp"))
@@ -1811,7 +1811,7 @@ def parse_codex(candidate: Candidate, gap_minutes: float) -> SessionSummary:
                 for line in f:
                     try:
                         r = json.loads(line)
-                    except json.JSONDecodeError:
+                    except ValueError:
                         continue
                     if r.get("type") == "compacted":
                         t = iso_to_dt(r.get("timestamp"))
@@ -3344,45 +3344,47 @@ class IncrementalIngestor:
                 line_offset = next_offset
                 continue
             try:
-                data = adapter.parse_record(json.loads(line), path)
-                data["record_key"] = f"{path}:{line_offset}"
-                if candidate.provider == "claude":
-                    data.update({"role": "SUBAGENT" if candidate.is_subagent else "MAIN", "parent_session_id": candidate.parent_session_id if candidate.is_subagent else ""})
-                # Codex metadata normally carries the native session ID only once.
-                # Later records must stay attached to that file's established ID,
-                # rather than falling back to a filename-derived placeholder.
-                if stream_id and str(data.get("stream_id") or "") == path.stem:
-                    data["stream_id"] = stream_id
-                    data["session_id"] = native_sid or str(data.get("session_id") or path.stem)
-                native_sid = str(data.get("session_id") or native_sid or path.stem)
-                stream_id = str(data.get("stream_id") or stream_id or native_sid)
-                data["session_id"], data["stream_id"] = native_sid, stream_id
-                if candidate.provider == "claude":
-                    target_sid = stream_id
-                    usage_key = str(data.pop("usage_key", ""))
-                    if usage_key and not self.store.mark_unique(candidate.provider, target_sid, "assistant_usage", usage_key, native_sid):
-                        for field in ("input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens", "reasoning_tokens", "model_turns", "peak_context_tokens"):
-                            data[field] = 0
-                    calls = data.pop("tool_call_items", [])
-                    if calls:
-                        data["tool_calls"] = sum(self.store.mark_unique(candidate.provider, target_sid, "tool_call", str(item), native_sid) for item in calls)
-                    results = data.pop("tool_result_items", [])
-                    if results:
-                        fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item), native_sid)]
-                        data["tool_result_chars"] = sum(fresh)
-                        data["max_tool_result_chars"] = max(fresh, default=0)
-                elif candidate.provider == "codex":
-                    usage_key = str(data.pop("usage_key", ""))
-                    if usage_key and not self.store.mark_unique(candidate.provider, stream_id, "token_snapshot", usage_key, native_sid):
-                        data["model_turns"] = 0
-                stream_id = self.store.apply_record(candidate.provider, path, data)
-            except json.JSONDecodeError:
+                record = json.loads(line)
+            except ValueError:
                 metrics.parse_errors += 1
                 # Before metadata identifies a session, retain the error in scan
                 # metrics rather than inventing a path-derived session row.
                 if stream_id: self.store.apply_record(candidate.provider, path, {"session_id": native_sid, "stream_id": stream_id, "record_key": f"{path}:{line_offset}"}, malformed=True)
-            finally:
                 line_offset = next_offset
+                continue
+            data = adapter.parse_record(record, path)
+            data["record_key"] = f"{path}:{line_offset}"
+            if candidate.provider == "claude":
+                data.update({"role": "SUBAGENT" if candidate.is_subagent else "MAIN", "parent_session_id": candidate.parent_session_id if candidate.is_subagent else ""})
+            # Codex metadata normally carries the native session ID only once.
+            # Later records must stay attached to that file's established ID,
+            # rather than falling back to a filename-derived placeholder.
+            if stream_id and str(data.get("stream_id") or "") == path.stem:
+                data["stream_id"] = stream_id
+                data["session_id"] = native_sid or str(data.get("session_id") or path.stem)
+            native_sid = str(data.get("session_id") or native_sid or path.stem)
+            stream_id = str(data.get("stream_id") or stream_id or native_sid)
+            data["session_id"], data["stream_id"] = native_sid, stream_id
+            if candidate.provider == "claude":
+                target_sid = stream_id
+                usage_key = str(data.pop("usage_key", ""))
+                if usage_key and not self.store.mark_unique(candidate.provider, target_sid, "assistant_usage", usage_key, native_sid):
+                    for field in ("input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens", "reasoning_tokens", "model_turns", "peak_context_tokens"):
+                        data[field] = 0
+                calls = data.pop("tool_call_items", [])
+                if calls:
+                    data["tool_calls"] = sum(self.store.mark_unique(candidate.provider, target_sid, "tool_call", str(item), native_sid) for item in calls)
+                results = data.pop("tool_result_items", [])
+                if results:
+                    fresh = [chars for item, chars in results if self.store.mark_unique(candidate.provider, target_sid, "tool_result", str(item), native_sid)]
+                    data["tool_result_chars"] = sum(fresh)
+                    data["max_tool_result_chars"] = max(fresh, default=0)
+            elif candidate.provider == "codex":
+                usage_key = str(data.pop("usage_key", ""))
+                if usage_key and not self.store.mark_unique(candidate.provider, stream_id, "token_snapshot", usage_key, native_sid):
+                    data["model_turns"] = 0
+            stream_id = self.store.apply_record(candidate.provider, path, data)
+            line_offset = next_offset
         self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=native_sid or (old["session_id"] if old else path.stem),stream_id=stream_id or (old["stream_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1
         if stream_id:
