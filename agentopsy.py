@@ -5851,6 +5851,18 @@ def live_cli(argv: list[str]) -> Optional[int]:
         payload = integration_status(home) if args.action == "status" else integration_install_codex(home, args.state_dir) if args.action == "install" else integration_remove_codex(home)
         print(json.dumps(payload, indent=2)); return 0
     if argv[0] == "runtime":
+        if argv[1:] in (['--help'], ['-h']):
+            print(textwrap.dedent("""\
+                usage: agentopsy runtime [-h] {bridge claude,status,evidence claude}
+
+                Inspect or receive local Claude runtime telemetry.
+
+                commands:
+                  bridge claude   Receive one Claude status-line observation from stdin.
+                  status          Show stored Claude runtime snapshots.
+                  evidence claude Show aggregate Claude runtime semantic evidence.
+                """))
+            return 0
         if len(argv) >= 3 and argv[1] == "bridge" and argv[2] == "claude":
             parser = argparse.ArgumentParser(prog="agentopsy runtime bridge claude"); parser.add_argument("--state-dir")
             args = parser.parse_args(argv[3:])
@@ -5996,7 +6008,7 @@ def build_parser() -> argparse.ArgumentParser:
 
             Live v0.6.1 commands:
               service, health, trends, service-status, guardian, calibrate,
-              insights, policy, preflight, handoff, signals, explain, integration
+              insights, policy, preflight, handoff, signals, explain, integration, runtime
             """
         ),
     )

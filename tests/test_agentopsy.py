@@ -1888,6 +1888,15 @@ class V041RegressionTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()): self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", str(state)]), 2)
 
     def test_help_and_selector_validation(self):
+        root_help = asa.build_parser().format_help()
+        self.assertIn("runtime", root_help)
+        runtime_help = io.StringIO()
+        with contextlib.redirect_stdout(runtime_help):
+            self.assertEqual(asa.main(["runtime", "--help"]), 0)
+        self.assertIn("usage: agentopsy runtime", runtime_help.getvalue())
+        self.assertIn("bridge claude", runtime_help.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(asa.main(["runtime", "definitely-not-a-command"]), 2)
         self.assertEqual(asa.main(["signals", "--help"]), 0)
         self.assertEqual(asa.main(["explain", "--help"]), 0)
         self.assertEqual(asa.main(["--last", "0"]), 2)
