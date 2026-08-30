@@ -833,6 +833,12 @@ class FailSafeTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_packaging_license_metadata_uses_spdx_expression(self):
+        pyproject = (HERE / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertRegex(pyproject, r'(?m)^license\s*=\s*"MIT"$')
+        self.assertNotIn("License :: OSI Approved :: MIT License", pyproject)
+        self.assertIn("MIT License", (HERE / "LICENSE").read_text(encoding="utf-8"))
+
     def test_installer_accepts_required_flags_and_shell_syntax(self):
         script = (HERE / "install.sh").read_text()
         for flag in ("--update", "--service", "--no-service"):
