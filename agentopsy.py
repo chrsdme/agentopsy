@@ -863,6 +863,9 @@ class ProviderAdapter:
     def identify_session(self, record: dict[str, Any], path: Path) -> str:
         return path.stem
 
+    def begin_transcript(self, path: Path) -> None:
+        """Forget any parser-local transcript state before a fresh replay."""
+
     def extract_timestamp(self, record: dict[str, Any]) -> str:
         return optional_provider_timestamp(record.get("timestamp"))
 
@@ -947,6 +950,15 @@ class ClaudeAdapter(ProviderAdapter):
 class CodexAdapter(ProviderAdapter):
     name = "codex"
 
+    def __init__(self) -> None:
+        # session_meta is transcript metadata, not an event stream.  Keep the
+        # first complete identity for each transcript so a repeated or corrupt
+        # later metadata record cannot create a new execution stream.
+        self._authoritative_metadata: dict[Path, dict[str, str]] = {}
+
+    def begin_transcript(self, path: Path) -> None:
+        self._authoritative_metadata.pop(path, None)
+
     def identify_session(self, record: dict[str, Any], path: Path) -> str:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         # `payload.id` on response items is an item/call ID, not a session ID.
@@ -1000,10 +1012,22 @@ class CodexAdapter(ProviderAdapter):
             thread_source = str(payload.get("thread_source") or "")
             subagent_kind = str(subagent.get("other") or "").lower()
             role = "GUARDIAN" if subagent_kind == "guardian" else "APPROVAL_REVIEW" if subagent_kind in {"approval_review", "auto_review", "reviewer"} else "SUBAGENT" if thread_source == "subagent" or subagent else "MAIN"
-            result.update({"session_id": native, "stream_id": stream, "role": role,
-                           "parent_session_id": str(payload.get("parent_thread_id") or ""),
-                           "parent_stream_id": str(payload.get("parent_rollout_id") or ""),
-                           "thread_source": thread_source})
+            identity = {"session_id": native, "stream_id": stream, "role": role,
+                        "parent_session_id": str(payload.get("parent_thread_id") or ""),
+                        "parent_stream_id": str(payload.get("parent_rollout_id") or ""),
+                        "thread_source": thread_source}
+            # A real native or rollout ID makes this metadata authoritative.
+            # Keep the established filename fallback provisional so a later
+            # complete session_meta can still identify the transcript.
+            authoritative = self._authoritative_metadata.get(path)
+            has_native_identity = bool(str(payload.get("session_id") or payload.get("id") or "").strip())
+            if authoritative is None and has_native_identity:
+                self._authoritative_metadata[path] = identity
+            elif authoritative is not None:
+                if any(identity[field] != authoritative[field] for field in identity):
+                    result["metadata_conflict"] = True
+                identity = authoritative
+            result.update(identity)
         result.update({"project": str(payload.get("cwd") or ""), "model": str(payload.get("model") or ""),
                        "effort": str(payload.get("effort") or payload.get("reasoning_effort") or ""),
                        "version": str(payload.get("cli_version") or "")})
@@ -3505,7 +3529,10 @@ class IncrementalIngestor:
         text = partial + chunk.decode("utf-8", errors="replace")
         lines = text.splitlines(keepends=True); trailing = ""
         if lines and not lines[-1].endswith(("\n", "\r")): trailing = lines.pop()
-        adapter = ADAPTERS[candidate.provider]; stream_id = "" if reset else str(old["stream_id"] if old else "")
+        adapter = ADAPTERS[candidate.provider]
+        if reset or old is None:
+            adapter.begin_transcript(path)
+        stream_id = "" if reset else str(old["stream_id"] if old else "")
         native_sid = "" if reset else str(old["session_id"] if old else "")
         line_offset = offset - len(partial.encode("utf-8"))
         for line in lines:
@@ -3539,6 +3566,14 @@ class IncrementalIngestor:
             if stream_id and str(data.get("stream_id") or "") == path.stem:
                 data["stream_id"] = stream_id
                 data["session_id"] = native_sid or str(data.get("session_id") or path.stem)
+            if candidate.provider == "codex" and record.get("type") == "session_meta" and stream_id:
+                # A restarted collector may not retain the adapter's local
+                # metadata cache.  The persisted stream is still authoritative
+                # for an append, so never let later metadata rewrite it.
+                if (str(data.get("session_id") or "") != native_sid
+                        or str(data.get("stream_id") or "") != stream_id):
+                    data["metadata_conflict"] = True
+                data["session_id"], data["stream_id"] = native_sid, stream_id
             native_sid = str(data.get("session_id") or native_sid or path.stem)
             stream_id = str(data.get("stream_id") or stream_id or native_sid)
             data["session_id"], data["stream_id"] = native_sid, stream_id
@@ -3565,7 +3600,7 @@ class IncrementalIngestor:
                 usage_key = str(data.pop("usage_key", ""))
                 if usage_key and not self.store.mark_unique(candidate.provider, stream_id, "token_snapshot", usage_key, native_sid):
                     data["model_turns"] = 0
-            stream_id = self.store.apply_record(candidate.provider, path, data)
+            stream_id = self.store.apply_record(candidate.provider, path, data, malformed=bool(data.pop("metadata_conflict", False)))
             line_offset = next_offset
         self.store.upsert_file(provider=candidate.provider,path=path,identity=identity,size=stat.st_size,mtime_ns=stat.st_mtime_ns,offset=stat.st_size,partial=trailing,session_id=native_sid or (old["session_id"] if old else path.stem),stream_id=stream_id or (old["stream_id"] if old else path.stem),status="ok")
         metrics.files_advanced += 1

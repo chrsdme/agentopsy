@@ -931,6 +931,51 @@ class ClaudeIdentityTests(unittest.TestCase):
                 store.close()
 
 
+class CodexIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _meta(native: str, stream: str, **payload: str) -> dict:
+        return {"type": "session_meta", "timestamp": "2026-08-27T12:00:00Z",
+                "payload": {"session_id": native, "id": stream, **payload}}
+
+    def test_codex_session_meta_keeps_first_identity_across_duplicates_and_conflicts(self):
+        adapter, path = asa.CodexAdapter(), Path("rollout.jsonl")
+        first = adapter.parse_record(self._meta("native", "canonical"), path)
+        duplicate = adapter.parse_record(self._meta("native", "canonical"), path)
+        conflict = adapter.parse_record(self._meta("other-native", "other-stream", thread_source="subagent"), path)
+        self.assertEqual(
+            [(item["session_id"], item["stream_id"], item["role"]) for item in (first, duplicate, conflict)],
+            [("native", "canonical", "MAIN")] * 3,
+        )
+        self.assertNotIn("metadata_conflict", duplicate)
+        self.assertTrue(conflict["metadata_conflict"])
+
+    def test_codex_conflicting_metadata_does_not_split_persisted_stream_or_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "sessions", Path(td) / "state"; root.mkdir()
+            token = {"type": "event_msg", "timestamp": "2026-08-27T12:00:01Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 9, "total_tokens": 9}, "last_token_usage": {"total_tokens": 9}, "model_context_window": 100}}}
+            path = root / "rollout.jsonl"
+            path.write_text(json.dumps(self._meta("native", "canonical")) + "\n")
+            store = asa.StateStore(str(state))
+            try:
+                ingestor = asa.IncrementalIngestor(store, [(root, "test")], "codex")
+                ingestor.scan()
+                with path.open("a", encoding="utf-8") as handle:
+                    for item in (self._meta("native", "canonical"), self._meta("native", "attacker-stream", thread_source="subagent"), self._meta("attacker-native", "canonical"), token):
+                        handle.write(json.dumps(item) + "\n")
+                # A new collector process has no adapter-local metadata cache;
+                # durable file state must still reject the appended conflicts.
+                asa.ADAPTERS["codex"].begin_transcript(path)
+                asa.IncrementalIngestor(store, [(root, "test")], "codex").scan()
+                rows = store.sessions("codex")
+                self.assertEqual([(row["session_id"], row["stream_id"], row["role"]) for row in rows], [("native", "canonical", "MAIN")])
+                self.assertEqual(rows[0]["model_turns"], 1)
+                self.assertEqual(rows[0]["malformed_records"], 2)
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM telemetry_samples WHERE provider='codex' AND stream_id='canonical'").fetchone()[0], 1)
+                self.assertEqual(ingestor.scan().files_unchanged, 1)
+            finally:
+                store.close()
+
+
 class IncrementalServiceTests(unittest.TestCase):
     def test_provider_timestamp_requires_aware_iso_and_normalizes_to_utc(self):
         reference = asa.dt.datetime(2026, 8, 27, 12, 0, tzinfo=asa.dt.timezone.utc)
