@@ -5220,6 +5220,15 @@ def render_service_status(payload: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def state_database_error_message(error: BaseException) -> Optional[str]:
+    """Translate expected unreadable-state failures for normal service CLI use."""
+    if isinstance(error, sqlite3.DatabaseError):
+        return "Agentopsy state database cannot be read; preserve it and restore a known-good state."
+    if isinstance(error, RuntimeError) and str(error) == "state database is newer than this Agentopsy version":
+        return "Agentopsy state database uses a newer unsupported schema; upgrade Agentopsy before using it."
+    return None
+
+
 def service_main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="agentopsyd", description="Passive local Agentopsy session-health service.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -5230,7 +5239,14 @@ def service_main(argv: Optional[list[str]] = None) -> int:
     if args.command == "status":
         print(render_service_status(service_status_payload())); return 0
     if args.command == "once":
-        m = service_once(args.state_dir, args.provider, notify=not args.no_notify, auto_act=AutoActMode(args.auto_act))
+        try:
+            m = service_once(args.state_dir, args.provider, notify=not args.no_notify, auto_act=AutoActMode(args.auto_act))
+        except Exception as error:
+            message = state_database_error_message(error)
+            if message is None:
+                raise
+            print(f"ERROR: {message}", file=sys.stderr)
+            return 2
         # touched_sessions is an internal notification-gating detail (raw
         # session IDs); do not print it in the scan summary.
         summary = {k: v for k, v in dataclasses.asdict(m).items() if k != "touched_sessions"}
@@ -5259,7 +5275,7 @@ def service_main(argv: Optional[list[str]] = None) -> int:
             except Exception as e:
                 # A transient failure (e.g. a concurrent CLI scan racing on the
                 # same state DB) must not take the whole service down.
-                print(f"sessions scan failed: {e}", file=sys.stderr, flush=True)
+                print(f"sessions scan failed: {state_database_error_message(e) or e}", file=sys.stderr, flush=True)
             for _ in range(args.interval * 10):
                 if not running: break
                 time.sleep(.1)

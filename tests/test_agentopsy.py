@@ -119,6 +119,35 @@ class SchemaMigrationTests(unittest.TestCase):
             finally:
                 holder.rollback(); holder.close()
 
+    def assert_agentopsyd_once_rejects_bad_state(self, state: Path, expected_error: str):
+        db = state / "agentopsy.db"
+        before = db.read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            daemon = Path(td) / "agentopsyd"
+            daemon.symlink_to(HERE / "agentopsy.py")
+            result = subprocess.run(
+                [sys.executable, str(daemon), "once", "--state-dir", str(state), "--no-notify"],
+                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(expected_error, result.stderr)
+        self.assertNotIn("Traceback (most recent call last)", result.stdout + result.stderr)
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_agentopsyd_once_rejects_future_schema_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            store = asa.StateStore(str(state)); store.close()
+            db = sqlite3.connect(state / "agentopsy.db")
+            db.execute("UPDATE service_meta SET value='999' WHERE key='schema_version'")
+            db.commit(); db.close()
+            self.assert_agentopsyd_once_rejects_bad_state(state, "newer unsupported schema")
+
+    def test_agentopsyd_once_rejects_corrupt_state_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"; state.mkdir()
+            (state / "agentopsy.db").write_bytes(b"not a sqlite database")
+            self.assert_agentopsyd_once_rejects_bad_state(state, "state database cannot be read")
+
     def test_guardian_dimensions_are_independent_and_evidence_is_transcript_free(self):
         event = asa.GuardianEvent("CONTEXT_HIGH", asa.Severity.CRITICAL, (asa.ImpactLane.CONTEXT_PRESSURE, asa.ImpactLane.TOOL_OUTPUT), asa.ActionSafety.ADVISE_ONLY, {"context_pct": 0.91})
         self.assertEqual(event.action_safety, asa.ActionSafety.ADVISE_ONLY)
