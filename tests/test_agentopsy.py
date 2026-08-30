@@ -931,6 +931,53 @@ class ClaudeIdentityTests(unittest.TestCase):
                 store.close()
 
 
+class ClaudeCompactionCompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _boundary(identifier: str = "one") -> dict:
+        return {"type": "system", "subtype": "compact_boundary", "compactMetadata": {"id": identifier}, "sessionId": "native"}
+
+    @staticmethod
+    def _summary() -> dict:
+        return {"type": "user", "isCompactSummary": True, "sessionId": "native", "message": {"content": "sanitized summary"}}
+
+    def test_claude_compaction_normalizes_legacy_and_current_boundaries_only(self):
+        adapter, path = asa.ClaudeAdapter(), Path("claude.jsonl")
+        legacy = {"type": "compacted", "sessionId": "native"}
+        self.assertTrue(asa.is_claude_compaction_boundary(legacy))
+        self.assertTrue(asa.is_claude_compaction_boundary(self._boundary()))
+        for record in (self._summary(), {"type": "system"}, {"type": "system", "subtype": "compact_boundary"}, {"type": "system", "subtype": "compact_boundary", "compactMetadata": "wrong"}, {"type": "system", "subtype": "other", "compactMetadata": {}}, {"type": "user", "message": {"content": "ordinary /compact discussion"}}):
+            self.assertFalse(asa.is_claude_compaction_boundary(record))
+        self.assertEqual(sum(adapter.parse_record(record, path)["compactions"] for record in (legacy, self._boundary(), self._summary())), 2)
+
+    def test_claude_forensic_summary_counts_boundary_summary_pairs_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in (
+                {"type": "compacted", "sessionId": "native"}, self._boundary("one"), self._summary(), self._boundary("two"), self._summary(),
+            )) + "\n")
+            summary = asa.parse_claude(asa.Candidate("claude", path, path.name, "test"), 30)
+            self.assertEqual((summary.session_id, summary.compactions), ("native", 3))
+
+    def test_claude_incremental_boundary_append_and_rescan_are_exactly_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "projects", Path(td) / "state"; root.mkdir(); path = root / "claude.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in (self._boundary(), self._summary())) + "\n")
+            store = asa.StateStore(str(state))
+            try:
+                ingestor = asa.IncrementalIngestor(store, [(root, "test")], "claude")
+                ingestor.scan()
+                self.assertEqual(store.sessions("claude")[0]["compactions"], 1)
+                with path.open("a", encoding="utf-8") as handle:
+                    for record in (self._boundary("two"), self._summary()):
+                        handle.write(json.dumps(record) + "\n")
+                ingestor.scan()
+                self.assertEqual(store.sessions("claude")[0]["compactions"], 2)
+                self.assertEqual(ingestor.scan().files_unchanged, 1)
+                self.assertEqual(store.sessions("claude")[0]["compactions"], 2)
+            finally:
+                store.close()
+
+
 class CodexIdentityTests(unittest.TestCase):
     @staticmethod
     def _meta(native: str, stream: str, **payload: str) -> dict:

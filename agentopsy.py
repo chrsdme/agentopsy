@@ -880,6 +880,15 @@ class ProviderAdapter:
         return {"session_id": sid, "stream_id": sid, "timestamp": self.extract_timestamp(record)}
 
 
+def is_claude_compaction_boundary(record: dict[str, Any]) -> bool:
+    """Normalize the two observed Claude transcript compaction wire formats."""
+    if record.get("type") == "compacted":
+        return True
+    return (record.get("type") == "system"
+            and record.get("subtype") == "compact_boundary"
+            and isinstance(record.get("compactMetadata"), dict))
+
+
 class ClaudeAdapter(ProviderAdapter):
     name = "claude"
 
@@ -914,7 +923,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def extract_tool_event(self, record: dict[str, Any]) -> dict[str, Any]:
         event = {"tool_calls": 0, "tool_result_chars": 0, "max_tool_result_chars": 0,
-                 "compactions": 0, "read_key": "", "command_key": "", "content_key": "", "tool_call_items": [], "tool_result_items": []}
+                 "compactions": int(is_claude_compaction_boundary(record)), "read_key": "", "command_key": "", "content_key": "", "tool_call_items": [], "tool_result_items": []}
         msg = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = msg.get("content")
         if record.get("type") == "assistant" and isinstance(content, list):
@@ -1443,6 +1452,8 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             if ts:
                 timestamps.append(ts)
             typ = rec.get("type")
+            if is_claude_compaction_boundary(rec):
+                summary.compactions += 1
             native = rec.get("sessionId")
             if not summary.stream_id and isinstance(native, str) and native.strip():
                 summary.session_id = native.strip()
