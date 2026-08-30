@@ -4895,7 +4895,7 @@ def _handoff_substantive_text(lines: list[str]) -> str:
 def validate_handoff(project: str) -> dict[str, Any]:
     path = Path(project) / ".ai" / "state" / "HANDOFF.md"
     result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None,
-              "empty": [], "duplicate_sections": [], "duplicate_content": [], "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.4.1 does not infer agent idle/safe state or automate rotation."}
+              "empty": [], "duplicate_sections": [], "duplicate_content": [], "rotation_ready": False, "rotation_reason": "A valid handoff is necessary, but Agentopsy does not infer agent idle/safe state or automate rotation."}
     if not path.is_file(): return result
     text = path.read_text(encoding="utf-8", errors="replace")
     bodies = _handoff_section_bodies(text)

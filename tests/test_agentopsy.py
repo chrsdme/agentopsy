@@ -1523,6 +1523,10 @@ class IncrementalServiceTests(unittest.TestCase):
     def test_handoff_contract_and_empty_trends(self):
         with tempfile.TemporaryDirectory() as td:
             project = Path(td) / "project"; handoff = project / ".ai" / "state" / "HANDOFF.md"
+            missing = asa.validate_handoff(str(project))
+            self.assertFalse(missing["rotation_ready"])
+            self.assertNotIn("v0.4.1", missing["rotation_reason"])
+            self.assertEqual(missing["rotation_reason"], "A valid handoff is necessary, but Agentopsy does not infer agent idle/safe state or automate rotation.")
             handoff.parent.mkdir(parents=True)
             handoff.write_text("\n\n".join("## " + item + "\n" + ("None." if item == "Open Problems" else item + " recorded.") for item in asa.HANDOFF_SECTIONS))
             self.assertTrue(asa.validate_handoff(str(project))["valid"])
