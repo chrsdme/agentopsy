@@ -274,6 +274,34 @@ class CalibrationTests(unittest.TestCase):
             self.assertFalse(asa.calibration_adoptable(store, fabricated))
             store.close()
 
+    def test_calibration_status_projects_adoption_through_current_compatibility(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = str(Path(td) / "state")
+            store = asa.StateStore(state); self.populate_adoptable_calibration(store)
+            asa.calibration_build(store); store.close()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", state]), 0)
+            store = asa.StateStore(state)
+            self.assertTrue(asa.calibration_status(store)["adopted"])
+
+            stale = asa.calibration_status(store); stale["schema_version"] = asa.SCHEMA_VERSION - 1
+            store.db.execute("UPDATE service_meta SET value=? WHERE key='calibration_profile'", (json.dumps(stale),)); store.db.commit()
+            stored = store.db.execute("SELECT value FROM service_meta WHERE key='calibration_profile'").fetchone()[0]
+            first, second = asa.calibration_status(store), asa.calibration_status(store)
+            self.assertFalse(first["adopted"])
+            self.assertEqual(first, second)
+            self.assertEqual(store.db.execute("SELECT value FROM service_meta WHERE key='calibration_profile'").fetchone()[0], stored)
+            self.assertEqual(json.loads(stored)["adopted"], True)  # historical selection is retained
+            self.assertEqual(asa.calibration_adoption_reason(store, first), "Calibration profile version or timestamp is invalid.")
+            store.close()
+
+            output, errors = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                self.assertEqual(asa.main(["calibrate", "status", "--state-dir", state]), 0)
+                self.assertEqual(asa.main(["calibrate", "adopt", "--state-dir", state]), 2)
+            self.assertFalse(json.loads(output.getvalue())['adopted'])
+            self.assertIn("Calibration profile version or timestamp is invalid.", errors.getvalue())
+
     def test_runtime_and_package_versions_match(self):
         match = re.search(r'^version\s*=\s*"([^"]+)"$', (HERE / "pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE)
         self.assertIsNotNone(match)

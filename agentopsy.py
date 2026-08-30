@@ -4942,7 +4942,17 @@ def calibration_build(store: StateStore) -> dict[str, Any]:
 
 def calibration_status(store: StateStore) -> dict[str, Any]:
     row = store.db.execute("SELECT value FROM service_meta WHERE key='calibration_profile'").fetchone()
-    return json.loads(row[0]) if row else {"status": "INSUFFICIENT", "message": "No calibration built yet."}
+    if row is None:
+        return {"status": "INSUFFICIENT", "message": "No calibration built yet."}
+    payload = json.loads(row[0])
+    # `adopted` in durable storage records the last explicit selection.  It is
+    # only an effective current adoption while the same validation used by the
+    # adopt command still accepts the stored profile.  Preserve the historical
+    # payload in SQLite; status is a read-only current-state projection.
+    if isinstance(payload, dict) and payload.get("adopted") is True and calibration_adoption_reason(store, payload) is not None:
+        payload = dict(payload)
+        payload["adopted"] = False
+    return payload
 
 
 def calibration_adoptable(store: StateStore, payload: dict[str, Any]) -> bool:
