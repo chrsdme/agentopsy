@@ -887,6 +887,50 @@ class FilesystemBoundaryTests(unittest.TestCase):
                 store.close()
 
 
+class ClaudeIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _record(native: str, tokens: int = 1) -> dict:
+        return {"type": "assistant", "sessionId": native, "message": {"usage": {"input_tokens": tokens, "output_tokens": 1}}}
+
+    def test_native_claude_identity_survives_rename_without_replaying_prefix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "projects", Path(td) / "state"; root.mkdir()
+            original, moved = root / "original.jsonl", root / "nested" / "moved.jsonl"
+            original.write_text(json.dumps(self._record("native-a")) + "\n")
+            self.assertEqual(asa.parse_claude(asa.Candidate("claude", original, original.name, "test"), 30).session_id, "native-a")
+            store = asa.StateStore(str(state))
+            try:
+                ingestor = asa.IncrementalIngestor(store, [(root, "test")], "claude")
+                ingestor.scan(); moved.parent.mkdir(); original.rename(moved)
+                with moved.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(self._record("native-a", 2)) + "\n")
+                self.assertEqual(asa.parse_claude(asa.Candidate("claude", moved, moved.name, "test"), 30).session_id, "native-a")
+                ingestor.scan()
+                rows = store.sessions("claude")
+                self.assertEqual([(row["session_id"], row["stream_id"]) for row in rows], [("native-a", "native-a")])
+                self.assertEqual(rows[0]["path"], str(original))  # retain first-observed provenance
+                self.assertEqual(rows[0]["model_turns"], 2)
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM telemetry_samples").fetchone()[0], 2)
+                self.assertEqual(ingestor.scan().files_unchanged, 1)
+            finally:
+                store.close()
+
+    def test_claude_native_ids_remain_distinct_and_missing_ids_keep_filename_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, state = Path(td) / "projects", Path(td) / "state"; root.mkdir()
+            (root / "one.jsonl").write_text(json.dumps(self._record("native-one")) + "\n")
+            (root / "two.jsonl").write_text(json.dumps(self._record("native-two")) + "\n")
+            fallback = {"type": "assistant", "message": {"usage": {"input_tokens": 1}}}
+            (root / "fallback-one.jsonl").write_text(json.dumps(fallback) + "\n")
+            (root / "fallback-two.jsonl").write_text(json.dumps(fallback) + "\n")
+            store = asa.StateStore(str(state))
+            try:
+                asa.IncrementalIngestor(store, [(root, "test")], "claude").scan()
+                self.assertEqual({row["session_id"] for row in store.sessions("claude")}, {"native-one", "native-two", "fallback-one", "fallback-two"})
+            finally:
+                store.close()
+
+
 class IncrementalServiceTests(unittest.TestCase):
     def test_provider_timestamp_requires_aware_iso_and_normalizes_to_utc(self):
         reference = asa.dt.datetime(2026, 8, 27, 12, 0, tzinfo=asa.dt.timezone.utc)

@@ -881,9 +881,11 @@ class ClaudeAdapter(ProviderAdapter):
     name = "claude"
 
     def identify_session(self, record: dict[str, Any], path: Path) -> str:
-        # Claude's transcript filename is the durable session identity used by
-        # the forensic parser. Some record-level IDs are stream/request IDs and
-        # must not split a single transcript into multiple state sessions.
+        native = record.get("sessionId")
+        if isinstance(native, str) and native.strip():
+            return native.strip()
+        # Some Claude records do not carry the transcript-level native ID.
+        # Preserve the established filename fallback for those records.
         return path.stem
 
     def extract_usage(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -1417,6 +1419,10 @@ def parse_claude(candidate: Candidate, gap_minutes: float) -> SessionSummary:
             if ts:
                 timestamps.append(ts)
             typ = rec.get("type")
+            native = rec.get("sessionId")
+            if not summary.stream_id and isinstance(native, str) and native.strip():
+                summary.session_id = native.strip()
+                summary.stream_id = native.strip()
             if rec.get("cwd"):
                 cwds[str(rec["cwd"])] += 1
             if rec.get("version"):
@@ -3536,6 +3542,11 @@ class IncrementalIngestor:
             native_sid = str(data.get("session_id") or native_sid or path.stem)
             stream_id = str(data.get("stream_id") or stream_id or native_sid)
             data["session_id"], data["stream_id"] = native_sid, stream_id
+            if candidate.provider == "claude" and isinstance(record.get("sessionId"), str) and record["sessionId"].strip():
+                # A moved Claude transcript starts scanning from offset zero;
+                # anchor deduplication to its provider-native session identity
+                # so the already-observed prefix is not replayed.
+                data["record_key"] = f"{native_sid}:{line_offset}"
             if candidate.provider == "claude":
                 target_sid = stream_id
                 usage_key = str(data.pop("usage_key", ""))
