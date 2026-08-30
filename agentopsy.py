@@ -4843,14 +4843,69 @@ def render_claude_runtime_semantic_evidence(payload: dict[str, Any]) -> str:
 
 HANDOFF_SECTIONS = ("Objective", "Completed", "Current State", "Decisions", "Files Changed", "Verification", "Open Problems", "Do Not Repeat", "Exact Next Action", "Relevant References")
 
+
+def _handoff_section_bodies(text: str) -> dict[str, list[list[str]]]:
+    """Return each required handoff section's body, without interpreting prose."""
+    bodies: dict[str, list[list[str]]] = {name: [] for name in HANDOFF_SECTIONS}
+    current: Optional[list[str]] = None
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(?:```|~~~)", stripped):
+            in_fence = not in_fence
+            if current is not None:
+                current.append(line)
+            continue
+        if not in_fence and re.match(r"^#{1,6}(?:\s|$)", stripped):
+            name = next((name for name in HANDOFF_SECTIONS if re.fullmatch(rf"#+\s*{re.escape(name)}\s*", stripped)), None)
+            current = [] if name is not None else None
+            if name is not None:
+                bodies[name].append(current)
+            continue
+        if current is not None:
+            current.append(line)
+    return bodies
+
+
+def _handoff_substantive_text(lines: list[str]) -> str:
+    """Normalize section text while discarding Markdown decoration without scoring prose."""
+    content: list[str] = []
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(?:```|~~~)", stripped):
+            in_fence = not in_fence
+            continue
+        if not stripped:
+            continue
+        if in_fence:
+            content.append(stripped)
+            continue
+        stripped = re.sub(r"^>\s*", "", stripped)
+        stripped = re.sub(r"^(?:[-+*]|\d+[.)])\s*", "", stripped)
+        if not stripped or re.fullmatch(r"(?:[-*_]\s*){3,}", stripped):
+            continue
+        content.append(stripped)
+    return "\n".join(content)
+
+
 def validate_handoff(project: str) -> dict[str, Any]:
     path = Path(project) / ".ai" / "state" / "HANDOFF.md"
     result = {"path": str(path), "present": path.is_file(), "valid": False, "missing": list(HANDOFF_SECTIONS), "sha256": "", "freshness_seconds": None,
-              "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.4.1 does not infer agent idle/safe state or automate rotation."}
+              "empty": [], "duplicate_sections": [], "duplicate_content": [], "rotation_ready": False, "rotation_reason": "A valid handoff is necessary but v0.4.1 does not infer agent idle/safe state or automate rotation."}
     if not path.is_file(): return result
     text = path.read_text(encoding="utf-8", errors="replace")
-    result["missing"] = [name for name in HANDOFF_SECTIONS if not re.search(rf"(?mi)^#+\s*{re.escape(name)}\s*$", text)]
-    result["valid"] = not result["missing"]
+    bodies = _handoff_section_bodies(text)
+    result["missing"] = [name for name in HANDOFF_SECTIONS if not bodies[name]]
+    result["duplicate_sections"] = [name for name in HANDOFF_SECTIONS if len(bodies[name]) > 1]
+    normalized = {name: _handoff_substantive_text(bodies[name][0]) for name in HANDOFF_SECTIONS if len(bodies[name]) == 1}
+    result["empty"] = [name for name, body in normalized.items() if not body]
+    groups: dict[str, list[str]] = {}
+    for name, body in normalized.items():
+        if body:
+            groups.setdefault(body, []).append(name)
+    result["duplicate_content"] = [names for names in groups.values() if len(names) == len(HANDOFF_SECTIONS)]
+    result["valid"] = not (result["missing"] or result["empty"] or result["duplicate_sections"] or result["duplicate_content"])
     result["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     result["freshness_seconds"] = max(0, int(time.time() - path.stat().st_mtime))
     return result

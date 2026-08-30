@@ -1524,11 +1524,38 @@ class IncrementalServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             project = Path(td) / "project"; handoff = project / ".ai" / "state" / "HANDOFF.md"
             handoff.parent.mkdir(parents=True)
-            handoff.write_text("\n".join("## " + item for item in asa.HANDOFF_SECTIONS))
+            handoff.write_text("\n\n".join("## " + item + "\n" + ("None." if item == "Open Problems" else item + " recorded.") for item in asa.HANDOFF_SECTIONS))
             self.assertTrue(asa.validate_handoff(str(project))["valid"])
             store = asa.StateStore(str(Path(td) / "state"))
             self.assertEqual(asa.trend_payload(store, 7)["providers"]["claude"]["sessions"], 0)
             store.close()
+
+    def test_handoff_requires_substantive_unique_required_sections(self):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "project"; handoff = project / ".ai" / "state" / "HANDOFF.md"
+            handoff.parent.mkdir(parents=True)
+
+            def write(sections, *, newline="\n"):
+                handoff.write_text((newline * 2).join(f"## {name}{newline}{body}" for name, body in sections) + newline)
+                return asa.validate_handoff(str(project))
+
+            headings_only = write([(name, "") for name in asa.HANDOFF_SECTIONS])
+            self.assertFalse(headings_only["valid"])
+            self.assertEqual(headings_only["empty"], list(asa.HANDOFF_SECTIONS))
+            whitespace = write([(name, " \t") for name in asa.HANDOFF_SECTIONS])
+            self.assertFalse(whitespace["valid"])
+            decoration = write([(name, "---\n-\n>\n```\n```") for name in asa.HANDOFF_SECTIONS])
+            self.assertFalse(decoration["valid"])
+            duplicate = write([(name, "synthetic placeholder") for name in asa.HANDOFF_SECTIONS])
+            self.assertFalse(duplicate["valid"])
+            self.assertEqual(duplicate["duplicate_content"], [list(asa.HANDOFF_SECTIONS)])
+            duplicate_heading = write([(name, f"{name} is complete.") for name in asa.HANDOFF_SECTIONS] + [("Objective", "conflicting replacement")])
+            self.assertFalse(duplicate_heading["valid"])
+            self.assertEqual(duplicate_heading["duplicate_sections"], ["Objective"])
+            valid = write([(name, f"{name}: `main` clean.") for name in asa.HANDOFF_SECTIONS], newline="\r\n")
+            self.assertTrue(valid["valid"])
+            code = write([(name, "```\ncommit abc123\n```" if name == "Verification" else f"{name}: no blockers.") for name in asa.HANDOFF_SECTIONS])
+            self.assertTrue(code["valid"])
 
 
 class SelectionAndOutputTests(unittest.TestCase):
