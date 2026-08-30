@@ -4,6 +4,36 @@ All notable changes to Agentopsy are documented here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-30
+
+### Fixed
+
+- Made concurrent SQLite/state initialization and replay idempotent, with
+  controlled user-facing errors for unreadable or future-version state
+  databases.
+- Improved service and runtime CLI reporting, structured stream identity, and
+  runtime help discovery.
+- Hardened malformed numeric and timestamp input handling, transcript
+  filesystem boundaries, and stable Claude/Codex session identity handling.
+- Added support for current Claude compact-boundary records while preserving
+  legacy compaction handling and avoiding boundary/summary double counting.
+- Aligned calibration status with adoption compatibility checks and strengthened
+  deterministic handoff validation.
+- Redacted raw diagnostic command payloads from ordinary detailed reports while
+  retaining useful analytical metadata such as repetition counts.
+- Modernised MIT package license metadata for warning-free supported builds.
+
+### Compatibility
+
+- Schema version: 6 — unchanged. Parser version: 1 — unchanged. Claude runtime
+  interchange format: 2 — unchanged. No database migration is required from
+  v0.6.1 to v0.6.2.
+
+### Known limitation
+
+- **EVPROV-001** remains deferred: schema-6 semantic-evidence aggregate
+  identity does not include the Agentopsy semantic-classifier revision.
+
 ## [0.6.1] - 2026-08-25
 
 ### Changed

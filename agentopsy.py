@@ -49,7 +49,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 PARSER_VERSION = 1
 SCHEMA_VERSION = 6
 IDENTITY_TTL_SECONDS = 15 * 60
@@ -6022,7 +6022,7 @@ def build_parser() -> argparse.ArgumentParser:
               Codex CLI:   $CODEX_HOME/sessions and $CODEX_HOME/archived_sessions
                            or ~/.codex/...
 
-            Live v0.6.1 commands:
+            Live v0.6.2 commands:
               service, health, trends, service-status, guardian, calibrate,
               insights, policy, preflight, handoff, signals, explain, integration, runtime
             """

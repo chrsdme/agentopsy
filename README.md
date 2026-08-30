@@ -785,10 +785,12 @@ python -m py_compile agentopsy.py
 
 # Status
 
-`v0.6.1` is the current maintenance and hardening release. It retains v0.6.0's
-semantic-evidence functionality and adds documented Claude
-`remaining_percentage` structural recognition, StateStore initialization-failure
-SQLite cleanup, and CI/tag-resolution hardening. Schema version 6, parser
+`v0.6.2` is the current stabilization and hardening release. It improves
+concurrent state safety, runtime/service CLI clarity, transcript input and
+filesystem safeguards, Claude/Codex identity stability, Claude compaction
+compatibility, calibration and handoff validation consistency, and controlled
+state-database errors. Ordinary detailed reports redact raw diagnostic command
+payloads while preserving useful analytical metadata. Schema version 6, parser
 version 1, and Claude runtime interchange format 2 are unchanged.
 
 Incremental state uses a provider-neutral execution stream: the native

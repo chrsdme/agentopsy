@@ -22,11 +22,21 @@ It is a process aid, not a substitute for project-specific release gates.
 
 ## Release notes
 
-State what is available and what is deliberately unavailable. For v0.6.1,
-cover runtime compatibility, StateStore cleanup, and the CI tag/full-history
-fix. State that schema 6, parser 1, and Claude runtime format 2 are unchanged,
-and that EVPROV-001 remains a known XFAIL. Do not include private local session
-identifiers or transcript excerpts.
+### v0.6.2
+
+v0.6.2 is a focused stabilization, correctness, compatibility, and privacy
+hardening release. Highlight safer concurrent state initialization; clearer
+runtime/service help and structured stream reporting; malformed-input and
+filesystem-boundary hardening; stable Claude/Codex identity handling; current
+Claude compaction compatibility; calibration and handoff validation
+consistency; controlled state-database errors; and ordinary-report redaction
+of raw diagnostic command payloads. Mention that supported builds use modern
+MIT license metadata without the prior setuptools deprecation warnings.
+
+State that schema 6, parser 1, and Claude runtime format 2 are unchanged, and
+that EVPROV-001 remains deferred. Do not claim generic secret detection,
+semantic handoff-freshness validation, or live-provider certification. Do not
+include private local session identifiers or transcript excerpts.
 
 Create a release only from an already-pushed verified tag (for GitHub CLI,
 use `gh release create <tag> --verify-tag`). Verify the published title, tag,
