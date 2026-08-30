@@ -549,7 +549,7 @@ However, your **source transcripts are sensitive**. They can contain:
 - error messages;
 - content returned by tools.
 
-Generated reports can also contain paths and selected diagnostic snippets/command labels. **Review a report before posting it publicly.**
+Ordinary terminal, Markdown, and JSON reports redact raw diagnostic command payloads while retaining command-repetition counts. Generated reports can still contain paths and other diagnostic metadata; **review a report before posting it publicly.**
 
 The Git repository should never contain real user session archives or generated personal reports.
 

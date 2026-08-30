@@ -827,6 +827,9 @@ class SessionSummary:
 
     def to_dict(self) -> dict[str, Any]:
         d = dataclasses.asdict(self)
+        # Repeated-command analysis needs the normalized command internally,
+        # but ordinary report exports must not reproduce provider command text.
+        d["repeated_commands"] = [("[redacted command]", count) for _command, count in self.repeated_commands]
         d["stream_id"] = self.stream_id or self.session_id
         d["tool_stats"] = {k: v.to_dict() if isinstance(v, ToolStat) else v for k, v in self.tool_stats.items()}
         d["bursts"] = [b.to_dict() if isinstance(b, Burst) else b for b in self.bursts]
@@ -2373,7 +2376,7 @@ def render_terminal_detail(s: SessionSummary, colour: bool) -> list[str]:
     if s.repeated_reads:
         lines.append(f"  top repeated read: {truncate(s.repeated_reads[0][0], 100)} ×{s.repeated_reads[0][1]}")
     if s.repeated_commands:
-        lines.append(f"  top repeated command: {truncate(s.repeated_commands[0][0], 100)} ×{s.repeated_commands[0][1]}")
+        lines.append(f"  top repeated command: [redacted command] ×{s.repeated_commands[0][1]}")
     if s.persisted_output_files:
         lines.append(f"  sidecar raw outputs: {s.persisted_output_files} files / {human_bytes(s.persisted_output_bytes)} (reported separately; not assumed in context)")
     if not s.defects:
@@ -2513,7 +2516,7 @@ def render_markdown_detail(s: SessionSummary) -> list[str]:
     if s.repeated_reads:
         lines.append(f"- Top repeated read/path: `{md_escape(truncate(s.repeated_reads[0][0], 160))}` ×{s.repeated_reads[0][1]}")
     if s.repeated_commands:
-        lines.append(f"- Top repeated command: `{md_escape(truncate(s.repeated_commands[0][0], 160))}` ×{s.repeated_commands[0][1]}")
+        lines.append(f"- Top repeated command: `[redacted command]` ×{s.repeated_commands[0][1]}")
     if s.persisted_output_files:
         lines.append(f"- Persisted raw-output sidecars: {s.persisted_output_files} files, {human_bytes(s.persisted_output_bytes)}")
     lines += [

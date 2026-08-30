@@ -1557,6 +1557,31 @@ class IncrementalServiceTests(unittest.TestCase):
             code = write([(name, "```\ncommit abc123\n```" if name == "Verification" else f"{name}: no blockers.") for name in asa.HANDOFF_SECTIONS])
             self.assertTrue(code["valid"])
 
+    def test_forensic_reports_redact_repeated_command_payloads_for_both_providers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fixtures = {
+                "codex": [
+                    {"type": "session_meta", "payload": {"session_id": "native", "id": "stream"}},
+                    *({"type": "response_item", "payload": {"type": "function_call", "id": call_id, "name": "exec_command", "arguments": json.dumps({"cmd": "AGENTOPSY_PRIVACY_SENTINEL_DO_NOT_EXPOSE --fake-token"})}} for call_id in ("one", "two")),
+                ],
+                "claude": [
+                    *({"type": "assistant", "sessionId": "native", "message": {"id": call_id, "content": [{"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": "AGENTOPSY_PRIVACY_SENTINEL_DO_NOT_EXPOSE --fake-token"}}]}} for call_id in ("one", "two")),
+                ],
+            }
+            for provider, rows in fixtures.items():
+                path = root / f"{provider}.jsonl"; path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+                parser = asa.parse_codex if provider == "codex" else asa.parse_claude
+                summary = parser(asa.Candidate(provider, path, path.name, "synthetic"), 30)
+                self.assertEqual(summary.repeated_commands[0][1], 2)
+                markdown, report = root / f"{provider}.md", root / f"{provider}.json"
+                asa.write_markdown_export(str(markdown), [summary], [], False, 10)
+                asa.write_json_report(report, [summary], [])
+                outputs = "\n".join(("\n".join(asa.render_terminal_detail(summary, False)), markdown.read_text(), report.read_text()))
+                self.assertNotIn("AGENTOPSY_PRIVACY_SENTINEL_DO_NOT_EXPOSE", outputs)
+                self.assertIn("[redacted command]", outputs)
+                self.assertIn("×2", outputs)
+
 
 class SelectionAndOutputTests(unittest.TestCase):
     def make_summary(self, provider, sid, end, *, start="", turns=0, total=0, cached=0, input_tokens=0, output=0, peak_pct=0.0):
